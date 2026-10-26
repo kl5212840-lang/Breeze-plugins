@@ -98,8 +98,16 @@ test('web playback uses declared official players without changing episode ident
   const value = (await plugin.getItem({id:7})).data;
   const episode = value.lines[0].episodes[0];
   assert.equal(episode.webPlaybackUrls.length, 2);
-  assert.deepEqual(episode.webPlaybackUrls.map(x => new URL(x).hostname), ['www.ikdmjx.com','bofang.ikdmjx.com']);
-  for (const url of episode.webPlaybackUrls) assert.equal(new URL(url).searchParams.get('url'), episode.url);
+  assert.deepEqual(episode.webPlaybackUrls.map(x => new URL(x).hostname), ['bofang.ikundmjx.com','bofang.ikdmjx.com']);
+  assert.equal(episode.webPlaybackUrls[0].split('url=')[1], episode.url);
+  assert.equal(new URL(episode.webPlaybackUrls[1]).searchParams.get('url'), episode.url);
   assert.equal(new URL(episode.watchUrl).hostname, 'www.ikunzy.com');
   assert.equal(value.lines.length,1);
+});
+
+test('the current official player receives the complete signed media query', async () => {
+  rows[0].vod_play_url = '正片$https://cdn.example.test/a.m3u8?token=one&part=two';
+  const episode = (await plugin.getItem({id:7})).data.lines[0].episodes[0];
+  assert.equal(episode.webPlaybackUrls[0].split('url=')[1], episode.url);
+  assert.equal(new URL(episode.webPlaybackUrls[1]).searchParams.get('url'), episode.url);
 });
