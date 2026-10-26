@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 哔咔漫画+ | 0.1.11 | [plugins/bika](plugins/bika) |
 | 禁漫天堂+ | 0.3.4 | [plugins/jm](plugins/jm) |
-| 拷贝漫画 | 0.0.18 | [plugins/copy](plugins/copy) |
+| 拷贝漫画 | 0.1.1 | [plugins/copy](plugins/copy) |
 | Hanime1 | 0.11.4 | [plugins/hanime](plugins/hanime) |
 | iKun 资源 | 0.1.2 | [plugins/ikun](plugins/ikun) |
 

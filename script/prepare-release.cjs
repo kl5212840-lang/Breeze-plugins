@@ -12,6 +12,7 @@ const specs = [
 ];
 (async () => {
   fs.mkdirSync('updates',{recursive:true}); fs.mkdirSync('dist',{recursive:true});
+  for(const file of fs.readdirSync('dist')) if(file.endsWith('.cjs')) fs.unlinkSync(path.join('dist',file));
   const catalog=[], sums=[];
   for (const [key,label,bundle] of specs) {
     const dir=path.resolve('plugins',key), file=path.join(dir,bundle);

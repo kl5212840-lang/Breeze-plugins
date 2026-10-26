@@ -1,12 +1,12 @@
 {
-  "tag_name": "v0.0.18",
-  "name": "拷贝漫画 v0.0.18",
+  "tag_name": "v0.1.1",
+  "name": "拷贝漫画 v0.1.1",
   "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.10.26",
   "assets": [
     {
-      "name": "Copy-v0.0.18.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.10.26/Copy-v0.0.18.cjs",
-      "size": 75017
+      "name": "Copy-v0.1.1.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.10.26/Copy-v0.1.1.cjs",
+      "size": 75016
     }
   ]
 }
