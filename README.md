@@ -8,7 +8,7 @@
 | 禁漫天堂+ | 0.3.4 | [plugins/jm](plugins/jm) |
 | 拷贝漫画 | 0.1.1 | [plugins/copy](plugins/copy) |
 | Hanime1 | 0.11.4 | [plugins/hanime](plugins/hanime) |
-| iKun 资源 | 0.1.2 | [plugins/ikun](plugins/ikun) |
+| iKun 资源 | 0.1.3 | [plugins/ikun](plugins/ikun) |
 
 在 Breeze「插件商店」中安装或更新；也可以从[下载页](https://github.com/kl5212840-lang/Breeze-plugins/releases)获取对应 `.cjs`，通过本地安装导入。已有插件的 UUID、配置键、收藏与记录身份保持不变。更新客户端和更新插件是两项独立操作。
 

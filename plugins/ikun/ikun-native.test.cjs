@@ -93,3 +93,13 @@ test('parent groups merge full leaf streams and keep a cursor across module relo
   assert.equal(third.items.length,20);assert.equal(new Set([...first.items,...second.items,...third.items].map(x=>x.id)).size,60);
   await assert.rejects(plugin.getLibrary({typeId:'4',page:4,cursor:first.nextCursor}),/刷新/);
 });
+
+test('web playback uses declared official players without changing episode identity', async () => {
+  const value = (await plugin.getItem({id:7})).data;
+  const episode = value.lines[0].episodes[0];
+  assert.equal(episode.webPlaybackUrls.length, 2);
+  assert.deepEqual(episode.webPlaybackUrls.map(x => new URL(x).hostname), ['www.ikdmjx.com','bofang.ikdmjx.com']);
+  for (const url of episode.webPlaybackUrls) assert.equal(new URL(url).searchParams.get('url'), episode.url);
+  assert.equal(new URL(episode.watchUrl).hostname, 'www.ikunzy.com');
+  assert.equal(value.lines.length,1);
+});
