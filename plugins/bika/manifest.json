@@ -1,0 +1,103 @@
+{
+  "name": "哔咔漫画+",
+  "uuid": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
+  "iconUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
+  "describe": "独立更新的哔咔漫画插件",
+  "version": "0.1.11",
+  "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/bika.json",
+  "home": "https://github.com/kl5212840-lang/Breeze-plugin-bika-personal",
+  "npmName": "",
+  "breezeExperience": {
+    "searchHotFunction": "hotSearch",
+    "profileTab": true,
+    "profileAvatarFunction": "updateAvatar",
+    "profileBioFunction": "updateProfile",
+    "legacySources": [
+      "0a0e5858-a467-4702-994a-79e608a4589d"
+    ],
+    "searchQuickCategories": [
+      "短篇",
+      "嗶咔漢化",
+      "CG雜圖",
+      "禁書目錄",
+      "生肉",
+      "全彩",
+      "長篇",
+      "同人",
+      "圓神領域",
+      "碧藍幻想",
+      "英語 ENG",
+      "純愛",
+      "百合花園",
+      "後宮閃光",
+      "扶他樂園",
+      "耽美花園",
+      "偽娘哲學",
+      "單行本",
+      "姐姐系",
+      "妹妹系",
+      "性轉換",
+      "SM",
+      "足の恋",
+      "人妻",
+      "NTR",
+      "強暴",
+      "非人類",
+      "艦隊收藏",
+      "Love Live",
+      "SAO 刀劍神域",
+      "Fate",
+      "東方",
+      "WEBTOON",
+      "歐美",
+      "Cosplay",
+      "重口地帶"
+    ]
+  },
+  "function": [
+    {
+      "id": "navigation",
+      "title": "分类",
+      "action": {
+        "type": "openPluginFunction",
+        "payload": {
+          "id": "navigation",
+          "title": "分类",
+          "presentation": "page"
+        }
+      }
+    },
+    {
+      "id": "ranking",
+      "title": "排行榜",
+      "action": {
+        "type": "openComicList",
+        "payload": {
+          "scene": {
+            "title": "哔咔排行榜",
+            "source": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
+            "body": {
+              "type": "pluginPagedComicList",
+              "request": {
+                "fnPath": "getRankingData",
+                "core": {
+                  "days": "H24",
+                  "type": "comic"
+                },
+                "extern": {
+                  "source": "ranking"
+                }
+              }
+            },
+            "filter": {
+              "fnPath": "getRankingFilterBundle",
+              "extern": {
+                "source": "ranking"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

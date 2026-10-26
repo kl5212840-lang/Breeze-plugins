@@ -1,0 +1,102 @@
+{
+  "name": "禁漫天堂+",
+  "uuid": "6886291b-f524-441c-844b-c2efae9899a9",
+  "iconUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-JmComic-change/main/assets/fO.webp",
+  "creator": {
+    "name": "kl5212840-lang · 基于 mumushu0501-boop",
+    "describe": "https://github.com/mumushu0501-boop/Breeze-plugin-JmComic-change"
+  },
+  "describe": "禁漫天堂插件：个人页、收藏、签到与多线路回退",
+  "version": "0.3.4",
+  "home": "https://github.com/kl5212840-lang/Breeze-plugin-JmComic-change",
+  "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/jm.json",
+  "breezeExperience": {
+    "profileTab": true,
+    "profileKind": "jm",
+    "profileCheckinFunction": "checkInToday",
+    "profileNotificationsFunction": "getNotifications",
+    "legacySources": [],
+    "searchQuickCategories": [
+      "同人",
+      "单本",
+      "短篇",
+      "韩漫",
+      "CG图集",
+      "3D",
+      "Cosplay"
+    ]
+  },
+  "function": [
+    {
+      "id": "recommend",
+      "title": "推荐",
+      "action": {
+        "type": "openPluginFunction",
+        "payload": {
+          "id": "recommend",
+          "title": "推荐",
+          "presentation": "page"
+        }
+      }
+    },
+    {
+      "id": "categories",
+      "title": "分类",
+      "action": {
+        "type": "openPluginFunction",
+        "payload": {
+          "id": "categories",
+          "title": "分类",
+          "presentation": "page"
+        }
+      }
+    },
+    {
+      "id": "latest",
+      "title": "最新",
+      "action": {
+        "type": "openComicList",
+        "payload": {
+          "scene": {
+            "title": "最新",
+            "source": "6886291b-f524-441c-844b-c2efae9899a9",
+            "list": {
+              "fnPath": "getLatestData",
+              "core": {},
+              "extern": {
+                "source": "latest"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "ranking",
+      "title": "排行榜",
+      "action": {
+        "type": "openComicList",
+        "payload": {
+          "scene": {
+            "title": "禁漫排行榜",
+            "source": "6886291b-f524-441c-844b-c2efae9899a9",
+            "list": {
+              "fnPath": "getRankingData",
+              "core": {},
+              "extern": {
+                "source": "ranking"
+              }
+            },
+            "filter": {
+              "fnPath": "getRankingFilterBundle",
+              "core": {},
+              "extern": {
+                "source": "ranking"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

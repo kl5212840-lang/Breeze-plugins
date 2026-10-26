@@ -1,0 +1,28 @@
+{
+  "name": "breeze-plugin-jm-comic",
+  "version": "0.3.4",
+  "type": "module",
+  "packageManager": "pnpm@11.10.0",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "pnpm typecheck && node --import tsx build/generate-version.ts && node --import tsx build/generate-manifest.ts && cross-env NODE_OPTIONS=\"--import tsx\" rspack build && node --import tsx build/generate-brotli.ts",
+    "dev": "pnpm dev:serve",
+    "dev:serve": "tsx dev-server.ts"
+  },
+  "dependencies": {
+    "axios": "^1.16.1",
+    "breeze-plugin-kit": "^0.3.0"
+  },
+  "devDependencies": {
+    "@rspack/cli": "^2.0.5",
+    "@rspack/core": "^2.0.5",
+    "@types/node": "^25.9.1",
+    "cross-env": "^10.1.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

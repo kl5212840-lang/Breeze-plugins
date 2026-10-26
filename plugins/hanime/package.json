@@ -1,0 +1,11 @@
+{
+  "name": "breeze-plugin-hanime1-native",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "linkedom": "0.18.12"
+  },
+  "version": "0.11.4"
+}
