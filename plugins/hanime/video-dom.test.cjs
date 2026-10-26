@@ -8,7 +8,7 @@ const { getInfo, getCatalog, getVideoDetail } = require('./hanime1-native.cjs');
 
 // Execute the actual host script, not a duplicate parser. Synthetic fixtures
 // contain no real account, cookie, media URL or copied third-party source code.
-const root = process.env.BREEZE_ROOT || path.resolve(__dirname, '../Breeze');
+const root = process.env.BREEZE_ROOT || process.env.BREEZE_HOST_ROOT || path.resolve(__dirname, '../../../Breeze');
 const selectors = getInfo().function[0].action.payload.selectors;
 const scripts = JSON.parse(execFileSync('dart', ['script/lint/video_dom_scripts.dart', JSON.stringify(selectors)],
   { cwd: root, encoding: 'utf8' }));

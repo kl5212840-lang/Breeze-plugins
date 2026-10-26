@@ -8,7 +8,7 @@ const { getInfo } = require('./hanime1-native.cjs');
 
 const scripts = JSON.parse(execFileSync('dart', ['script/lint/video_dom_scripts.dart',
   JSON.stringify(getInfo().function[0].action.payload.selectors)],
-  { cwd: path.resolve(__dirname, '../Breeze'), encoding: 'utf8' }));
+  { cwd: process.env.BREEZE_HOST_ROOT || path.resolve(__dirname, '../../../Breeze'), encoding: 'utf8' }));
 const home = 'https://hanime1.me';
 const watch = `${home}/watch?v=42`;
 const account = '<a id="user-modal-trigger" href="/user/7">Account</a>';
