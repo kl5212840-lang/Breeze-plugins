@@ -2,6 +2,7 @@ import type { ComicListScene, InfoContract } from "breeze-plugin-kit";
 import { BIKA_SEARCH_CATEGORY_OPTIONS } from "./bika-constants";
 
 export type BikaPluginInfo = InfoContract & {
+  releaseSeries: number;
   breezeExperience: {
     searchHotFunction: string;
     profileTab: boolean;
@@ -70,9 +71,10 @@ export function buildManifestInfo(): BikaPluginInfo {
     iconUrl:
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
     describe: "独立更新的哔咔漫画插件",
-    version: "0.1.11",
+    version: "0.1.0",
+    releaseSeries: 1,
     updateUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/bika.json",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/bika.json",
     home: "https://github.com/kl5212840-lang/Breeze-plugin-bika-personal",
     npmName: "",
     breezeExperience: {

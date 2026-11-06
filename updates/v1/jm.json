@@ -1,0 +1,22 @@
+{
+  "releaseSeries": 1,
+  "scriptSha256": "105f6eefb57f0fe4e85c69a3bf14e1ea21d16cb99ac3cd51f8cb29846f3d2fe6",
+  "migrationFrom": [
+    {
+      "version": "0.3.4",
+      "scriptSha256": "24e285ab16703ed3c5b6b78ad34489a5a9e10f631d977509c913056e8ffd9874"
+    }
+  ],
+  "uuid": "6886291b-f524-441c-844b-c2efae9899a9",
+  "tag_name": "v0.1.0",
+  "name": "禁漫天堂+ v0.1.0",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-v0.1.0",
+  "assets": [
+    {
+      "name": "Jm-v0.1.0.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-v0.1.0/Jm-v0.1.0.cjs",
+      "size": 111715
+    }
+  ],
+  "sha256": "105f6eefb57f0fe4e85c69a3bf14e1ea21d16cb99ac3cd51f8cb29846f3d2fe6"
+}

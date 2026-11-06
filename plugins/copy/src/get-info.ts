@@ -1,7 +1,7 @@
 import type { InfoContract } from "breeze-plugin-kit";
 import { PLUGIN_ID, PLUGIN_VERSION } from "./config";
 
-export function buildPluginInfo(): InfoContract & { websiteUrl: string } {
+export function buildPluginInfo(): InfoContract & { websiteUrl: string; releaseSeries: number } {
   return {
     name: "拷贝漫画",
     uuid: PLUGIN_ID,
@@ -9,10 +9,11 @@ export function buildPluginInfo(): InfoContract & { websiteUrl: string } {
       "https://raw.githubusercontent.com/deretame/Breeze-plugin-copyComic/main/assets/u3.webp",
     describe: "拷贝漫画插件",
     version: PLUGIN_VERSION,
+    releaseSeries: 1,
     home: "https://github.com/kl5212840-lang/Breeze-plugin-copyComic",
     websiteUrl: "https://www.mangacopy.com/",
     updateUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/copy.json",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/copy.json",
     npmName: "",
     function: [
       {

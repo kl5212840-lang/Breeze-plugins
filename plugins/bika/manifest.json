@@ -3,8 +3,9 @@
   "uuid": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
   "iconUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
   "describe": "独立更新的哔咔漫画插件",
-  "version": "0.1.11",
-  "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/bika.json",
+  "version": "0.1.0",
+  "releaseSeries": 1,
+  "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/bika.json",
   "home": "https://github.com/kl5212840-lang/Breeze-plugin-bika-personal",
   "npmName": "",
   "breezeExperience": {
