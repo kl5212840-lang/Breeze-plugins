@@ -19,15 +19,15 @@ export function buildPluginInfo(input: BuildPluginInfoInput) {
     name: "禁漫天堂+",
     uuid: JM_PLUGIN_ID,
     iconUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-JmComic-change/main/assets/fO.webp",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/plugins/jm/assets/fO.webp",
     creator: {
       name: "kl5212840-lang · 基于 mumushu0501-boop",
       describe: "https://github.com/mumushu0501-boop/Breeze-plugin-JmComic-change",
     },
     describe: "禁漫天堂插件：个人页、收藏、签到与多线路回退",
-    version: "0.1.0",
+    version: "0.1.1",
     releaseSeries: 1,
-    home: "https://github.com/kl5212840-lang/Breeze-plugin-JmComic-change",
+    home: "https://github.com/kl5212840-lang/Breeze-plugins/tree/main/plugins/jm",
     updateUrl:
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/jm.json",
     breezeExperience: {

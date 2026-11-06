@@ -69,13 +69,13 @@ export function buildManifestInfo(): BikaPluginInfo {
     name: "哔咔漫画+",
     uuid: BIKA_PLUGIN_ID,
     iconUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/plugins/bika/assets/logo_round.webp",
     describe: "独立更新的哔咔漫画插件",
-    version: "0.1.0",
+    version: "0.1.1",
     releaseSeries: 1,
     updateUrl:
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/bika.json",
-    home: "https://github.com/kl5212840-lang/Breeze-plugin-bika-personal",
+    home: "https://github.com/kl5212840-lang/Breeze-plugins/tree/main/plugins/bika",
     npmName: "",
     breezeExperience: {
       searchHotFunction: "hotSearch",

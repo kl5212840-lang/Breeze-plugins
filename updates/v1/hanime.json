@@ -10,11 +10,11 @@
   "uuid": "1e600cff-8ebe-4517-8aa4-6678aec46424",
   "tag_name": "v0.1.0",
   "name": "Hanime1 v0.1.0",
-  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-v0.1.0",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-v0.1.1",
   "assets": [
     {
       "name": "Hanime1-native-v0.1.0.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-v0.1.0/Hanime1-native-v0.1.0.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-v0.1.1/Hanime1-native-v0.1.0.cjs",
       "size": 166578
     }
   ],

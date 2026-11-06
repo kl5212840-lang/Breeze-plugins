@@ -6,11 +6,11 @@ export function buildPluginInfo(): InfoContract & { websiteUrl: string; releaseS
     name: "拷贝漫画",
     uuid: PLUGIN_ID,
     iconUrl:
-      "https://raw.githubusercontent.com/deretame/Breeze-plugin-copyComic/main/assets/u3.webp",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/plugins/copy/assets/u3.webp",
     describe: "拷贝漫画插件",
     version: PLUGIN_VERSION,
     releaseSeries: 1,
-    home: "https://github.com/kl5212840-lang/Breeze-plugin-copyComic",
+    home: "https://github.com/kl5212840-lang/Breeze-plugins/tree/main/plugins/copy",
     websiteUrl: "https://www.mangacopy.com/",
     updateUrl:
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/copy.json",
