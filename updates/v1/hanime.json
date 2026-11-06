@@ -5,6 +5,10 @@
     {
       "version": "0.11.4",
       "scriptSha256": "175e08090137ff67f65e1150d3bee9f2a8bbf200df81acefcad98a3dd66e132f"
+    },
+    {
+      "version": "0.11.3",
+      "scriptSha256": "5bb2da97f8faffc746a08dcc2fc20621e55cf05efdb1315f435164c6b2158f7f"
     }
   ],
   "uuid": "1e600cff-8ebe-4517-8aa4-6678aec46424",

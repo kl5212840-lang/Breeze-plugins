@@ -13,6 +13,10 @@
     {
       "version": "0.1.3",
       "scriptSha256": "ccc5cf7c89bad12d76282a22d82d26e340728ce2f8e44288fbc7a83dda81b700"
+    },
+    {
+      "version": "0.1.1",
+      "scriptSha256": "d72cf2fa3cf65a1d755fd86b3c6fbbd62cc3210926e812bca4723eed1b617eae"
     }
   ],
   "uuid": "f5387e66-9c58-4b8f-beb7-22a939f79e5d",

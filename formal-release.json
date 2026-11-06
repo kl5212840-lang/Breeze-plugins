@@ -14,7 +14,89 @@
       "version": "0.1.0",
       "releaseSeries": 1,
       "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/bika.json",
-      "legacySha256": "34a55712e103af26a22a31ba8f56c6725003be93f25a427abdacca10e9079ed5"
+      "legacySha256": "34a55712e103af26a22a31ba8f56c6725003be93f25a427abdacca10e9079ed5",
+      "additionalPublished": [
+        {
+          "version": "0.1.10",
+          "file": "bika-legacy-v0.1.10.cjs",
+          "sha256": "c6a98274bf3ed74f7922c229f032d7aba7c9de503257a684801a213548c65836",
+          "scriptSha256": "c6a98274bf3ed74f7922c229f032d7aba7c9de503257a684801a213548c65836",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.10"
+        },
+        {
+          "version": "0.1.8",
+          "file": "bika-legacy-v0.1.8.cjs",
+          "sha256": "b580a6e81ce9fa3901ba0b2187fe965848d14be193ca2ad932c0f3db35b1cc59",
+          "scriptSha256": "b580a6e81ce9fa3901ba0b2187fe965848d14be193ca2ad932c0f3db35b1cc59",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.8"
+        },
+        {
+          "version": "0.1.7",
+          "file": "bika-legacy-v0.1.7.cjs",
+          "sha256": "b0a0565a2b44c455d7ae0a692559fa7c937b9f29ba686072d63163fcf30d0444",
+          "scriptSha256": "b0a0565a2b44c455d7ae0a692559fa7c937b9f29ba686072d63163fcf30d0444",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.7"
+        },
+        {
+          "version": "0.1.6",
+          "file": "bika-legacy-v0.1.6.cjs",
+          "sha256": "aefe01cf978be3c41b8d770f79c01262513c6104c75910f0d7233e58445410a9",
+          "scriptSha256": "aefe01cf978be3c41b8d770f79c01262513c6104c75910f0d7233e58445410a9",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.6"
+        },
+        {
+          "version": "0.1.5",
+          "file": "bika-legacy-v0.1.5.cjs",
+          "sha256": "5922e01b7e512b662889016adddde6b5cd4aa63fc994e9f57d89861c0eef4522",
+          "scriptSha256": "5922e01b7e512b662889016adddde6b5cd4aa63fc994e9f57d89861c0eef4522",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.5"
+        },
+        {
+          "version": "0.1.4",
+          "file": "bika-legacy-v0.1.4.cjs",
+          "sha256": "1fb76f897e808b913f809dd839e193a061164f46ce3d8d4cee04463023269627",
+          "scriptSha256": "1fb76f897e808b913f809dd839e193a061164f46ce3d8d4cee04463023269627",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.4"
+        },
+        {
+          "version": "0.1.3",
+          "file": "bika-legacy-v0.1.3.cjs",
+          "sha256": "3353cbfde0419dce5890551522a0e79a4d1d58f46c0bd01abcde523612d0ea87",
+          "scriptSha256": "3353cbfde0419dce5890551522a0e79a4d1d58f46c0bd01abcde523612d0ea87",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.3"
+        },
+        {
+          "version": "0.1.2",
+          "file": "bika-legacy-v0.1.2.cjs",
+          "sha256": "52fe3bb168f33a68acd5e87cac649fdcc746b9fb3914e5bb0b4a94fbdd751a81",
+          "scriptSha256": "52fe3bb168f33a68acd5e87cac649fdcc746b9fb3914e5bb0b4a94fbdd751a81",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.2"
+        },
+        {
+          "version": "0.1.1",
+          "file": "bika-legacy-v0.1.1.cjs",
+          "sha256": "b91800149c7a2034b503221e295df94752d653153c84c40597bd3c823ad4c0de",
+          "scriptSha256": "b91800149c7a2034b503221e295df94752d653153c84c40597bd3c823ad4c0de",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.1"
+        },
+        {
+          "version": "0.1.0",
+          "file": "bika-legacy-v0.1.0.cjs",
+          "sha256": "55d3fbd5b79d18bc7ef5534852b4776368534553f34a1753782d3338379d4a4e",
+          "scriptSha256": "55d3fbd5b79d18bc7ef5534852b4776368534553f34a1753782d3338379d4a4e",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-bika-personal",
+          "publishedTag": "v0.1.0"
+        }
+      ]
     },
     {
       "key": "copy",
@@ -27,7 +109,17 @@
       "version": "0.1.0",
       "releaseSeries": 1,
       "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/copy.json",
-      "legacySha256": "05c091188a1b0f8525b893a371a9518ae089ccdf0e329a1320ec45408e7d3d74"
+      "legacySha256": "05c091188a1b0f8525b893a371a9518ae089ccdf0e329a1320ec45408e7d3d74",
+      "additionalPublished": [
+        {
+          "version": "0.0.17",
+          "file": "copy-legacy-v0.0.17.cjs",
+          "sha256": "d7ab6e86121793a7a7c92f92ed2f32c73e09bc692fe8fff0649bdf741a176604",
+          "scriptSha256": "d7ab6e86121793a7a7c92f92ed2f32c73e09bc692fe8fff0649bdf741a176604",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-copyComic",
+          "publishedTag": "v0.0.17"
+        }
+      ]
     },
     {
       "key": "hanime",
@@ -40,7 +132,17 @@
       "version": "0.1.0",
       "releaseSeries": 1,
       "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/hanime.json",
-      "legacySha256": "212e65e1f7bf7f988c0498bec0b2393d5ce2ee874ac99c58715d481f76aca2e2"
+      "legacySha256": "212e65e1f7bf7f988c0498bec0b2393d5ce2ee874ac99c58715d481f76aca2e2",
+      "additionalPublished": [
+        {
+          "version": "0.11.3",
+          "file": "hanime-legacy-v0.11.3.cjs",
+          "sha256": "80b797735e4c7ef91a02cd7d92774e3c77b261f07e70ff6ab1e3a2eb23ea840c",
+          "scriptSha256": "5bb2da97f8faffc746a08dcc2fc20621e55cf05efdb1315f435164c6b2158f7f",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-Hanime1-native",
+          "publishedTag": "v0.11.3"
+        }
+      ]
     },
     {
       "key": "jm",
@@ -53,7 +155,41 @@
       "version": "0.1.0",
       "releaseSeries": 1,
       "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/jm.json",
-      "legacySha256": "24e285ab16703ed3c5b6b78ad34489a5a9e10f631d977509c913056e8ffd9874"
+      "legacySha256": "24e285ab16703ed3c5b6b78ad34489a5a9e10f631d977509c913056e8ffd9874",
+      "additionalPublished": [
+        {
+          "version": "0.3.3",
+          "file": "jm-legacy-v0.3.3.cjs",
+          "sha256": "35eb93ee767b0adbd7d96d10d951d96009073645bdc4f241276e8beba976afd1",
+          "scriptSha256": "35eb93ee767b0adbd7d96d10d951d96009073645bdc4f241276e8beba976afd1",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-JmComic-change",
+          "publishedTag": "v0.3.3"
+        },
+        {
+          "version": "0.3.2",
+          "file": "jm-legacy-v0.3.2.cjs",
+          "sha256": "fa3c828b40089025b941e7048e2bc131d2ad531ed6a0a8378dcfc3b5b0955d2d",
+          "scriptSha256": "fa3c828b40089025b941e7048e2bc131d2ad531ed6a0a8378dcfc3b5b0955d2d",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-JmComic-change",
+          "publishedTag": "v0.3.2"
+        },
+        {
+          "version": "0.3.1",
+          "file": "jm-legacy-v0.3.1.cjs",
+          "sha256": "e0c4c3e6f511efcfce13f039295f35f02bd13336cadd5bda1aaa6f2a654729c6",
+          "scriptSha256": "e0c4c3e6f511efcfce13f039295f35f02bd13336cadd5bda1aaa6f2a654729c6",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-JmComic-change",
+          "publishedTag": "v0.3.1"
+        },
+        {
+          "version": "0.3.0",
+          "file": "jm-legacy-v0.3.0.cjs",
+          "sha256": "cdc829ac11704732a394509fc682d3e3cc13e760758144f9db64184b9e6a64fb",
+          "scriptSha256": "cdc829ac11704732a394509fc682d3e3cc13e760758144f9db64184b9e6a64fb",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-JmComic-change",
+          "publishedTag": "v0.3.0"
+        }
+      ]
     },
     {
       "key": "ikun",
@@ -79,6 +215,14 @@
           "file": "iKun-native-v0.1.3.cjs",
           "sha256": "64695f884cfd56d43f767118ecc16ca97c82888498168ca872af6aaaf0af0c71",
           "scriptSha256": "ccc5cf7c89bad12d76282a22d82d26e340728ce2f8e44288fbc7a83dda81b700"
+        },
+        {
+          "version": "0.1.1",
+          "file": "ikun-legacy-v0.1.1.cjs",
+          "sha256": "8e3c6b2773d1e69d6a0ab886a08f7937cdc94c4a1357702f516e4c4abc404f96",
+          "scriptSha256": "d72cf2fa3cf65a1d755fd86b3c6fbbd62cc3210926e812bca4723eed1b617eae",
+          "publishedRepo": "kl5212840-lang/Breeze-plugin-iKun-native",
+          "publishedTag": "v0.1.1"
         }
       ]
     }

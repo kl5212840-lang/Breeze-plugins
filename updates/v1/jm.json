@@ -5,6 +5,22 @@
     {
       "version": "0.3.4",
       "scriptSha256": "24e285ab16703ed3c5b6b78ad34489a5a9e10f631d977509c913056e8ffd9874"
+    },
+    {
+      "version": "0.3.3",
+      "scriptSha256": "35eb93ee767b0adbd7d96d10d951d96009073645bdc4f241276e8beba976afd1"
+    },
+    {
+      "version": "0.3.2",
+      "scriptSha256": "fa3c828b40089025b941e7048e2bc131d2ad531ed6a0a8378dcfc3b5b0955d2d"
+    },
+    {
+      "version": "0.3.1",
+      "scriptSha256": "e0c4c3e6f511efcfce13f039295f35f02bd13336cadd5bda1aaa6f2a654729c6"
+    },
+    {
+      "version": "0.3.0",
+      "scriptSha256": "cdc829ac11704732a394509fc682d3e3cc13e760758144f9db64184b9e6a64fb"
     }
   ],
   "uuid": "6886291b-f524-441c-844b-c2efae9899a9",
