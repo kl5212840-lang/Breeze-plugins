@@ -455,7 +455,7 @@ test('BK full favorites use strict paging and the same proven sort path without 
   end.set('auth.authorization', 'fixture-account-session');
   assert.equal((await end.plugin.getFavoriteData({ page: 2 })).data.paging.hasReachedMax, true);
   const original = await fixture({ original: true, respond: () => ({ code: 200, data: {} }) });
-  assert.deepEqual(plain((await original.plugin.getFavoriteData()).data.items), []);
+  await assert.rejects(original.plugin.getFavoriteData(), /收藏资料读取不完整/);
 });
 
 test('game download destinations come only from the proven platform arrays and remain web links', async () => {
