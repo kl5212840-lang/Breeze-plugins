@@ -3,13 +3,6 @@
   "tag": "plugins-2026.11.08",
   "plugins": [
     {
-      "key": "bika-classic",
-      "label": "Bika-classic",
-      "version": "0.1.0",
-      "inputSha256": "ae13a6b081fae1ad25436654f4b03251733d304cb8c0cd80e700b495292fe511",
-      "developmentVersion": "0.1.4"
-    },
-    {
       "key": "bika",
       "label": "Bika",
       "version": "0.1.2",

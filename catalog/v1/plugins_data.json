@@ -2,23 +2,6 @@
   {
     "repo": "kl5212840-lang/Breeze-plugins",
     "manifest": {
-      "name": "哔咔漫画",
-      "uuid": "97b8ebb1-9f1f-423c-9847-acd7b0ccd31f",
-      "iconUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
-      "describe": "社区适配的哔咔阅读体验，独立保存本机资料",
-      "version": "0.1.0",
-      "home": "https://github.com/kl5212840-lang/Breeze-plugins",
-      "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/bika-classic.json",
-      "releaseSeries": 1,
-      "scriptSha256": "cdc7d036a00258f6fb0b3f6a85901c0359d60b97be68f0c769d6b8d008ca0afc",
-      "migrationFrom": [],
-      "npmName": "",
-      "breeze-plugin-github-repository": "https://github.com/kl5212840-lang/Breeze-plugins"
-    }
-  },
-  {
-    "repo": "kl5212840-lang/Breeze-plugins",
-    "manifest": {
       "name": "哔咔漫画+",
       "uuid": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
       "iconUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",

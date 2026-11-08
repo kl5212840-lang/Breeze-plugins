@@ -29,6 +29,6 @@ const load=s=>{const module={exports:{}};vm.runInNewContext(s,{module,exports:mo
   const pp=`plugins/${spec.key}/package.json`;if(fs.existsSync(pp)){const pkg=JSON.parse(fs.readFileSync(pp));pkg.version=spec.version;fs.writeFileSync(pp,JSON.stringify(pkg,null,2)+'\n');}
   evidence.push({key:spec.key,name:info.name,version:spec.version,uuid:info.uuid,file:name,sha256:sha(bytes),inputSha256:sha(raw),businessExportsUnchanged:true});
  }
- assert.equal(catalog.length,8);assert.equal(new Set(catalog.map(x=>x.manifest.uuid)).size,8);
+ assert.equal(catalog.length,7);assert.equal(new Set(catalog.map(x=>x.manifest.uuid)).size,7);
  fs.mkdirSync('catalog/v1',{recursive:true});fs.writeFileSync('catalog/v1/plugins_data.json',JSON.stringify(catalog,null,2)+'\n');fs.writeFileSync('dist/current/SHA256SUMS.txt',sums.join('\n')+'\n');fs.writeFileSync('dist/current/verification.json',JSON.stringify(evidence,null,2)+'\n');console.log(evidence.map(x=>`${x.key}: ${x.version}`).join('\n'));
 })().catch(e=>{console.error(e);process.exitCode=1;});
