@@ -55,7 +55,7 @@ test('declares a native catalog action', () => {
   assert.equal(info.function[0].action.type, 'openVideoCatalog');
   assert.deepEqual(manifest, info);
   assert.equal(info.uuid, '1e600cff-8ebe-4517-8aa4-6678aec46424');
-  assert.equal(info.version, '0.11.4');
+  assert.equal(info.version, '0.11.5');
   assert.equal(info.updateUrl, 'https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/hanime.json');
   assert.deepEqual(info.function[0].action.payload.tabs.map((item) => item.title),
     ['推荐', '排行', '订阅', '我的']);

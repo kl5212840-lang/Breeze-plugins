@@ -1,6 +1,6 @@
 {
   "releaseSeries": 1,
-  "scriptSha256": "7dbde5f0ea8869b8cd7be16ea70a5b82d283fef10afc221e2a22335ff38196d4",
+  "scriptSha256": "3bb4e8639f150efae94ba2567057151524e8481ad8b189cbf19644a5ee1ec488",
   "migrationFrom": [
     {
       "version": "0.1.4",
@@ -20,15 +20,15 @@
     }
   ],
   "uuid": "f5387e66-9c58-4b8f-beb7-22a939f79e5d",
-  "tag_name": "v0.1.1",
-  "name": "iKun 资源 v0.1.1",
-  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-v0.1.1",
+  "tag_name": "v0.1.2",
+  "name": "iKun 资源 v0.1.2",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.08",
   "assets": [
     {
-      "name": "iKun-native-v0.1.1.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-v0.1.1/iKun-native-v0.1.1.cjs",
-      "size": 154554
+      "name": "iKun-native-v0.1.2.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.08/iKun-native-v0.1.2.cjs",
+      "size": 155030
     }
   ],
-  "sha256": "5e32ed0c764e59d4d8867c32e87b547cbcd6675ec3cf1ba5e40e08229230f684"
+  "sha256": "242972e018545f5c4d85ec124a6a2ddb04590a09d8d6d21d5c0a1d07761946d6"
 }

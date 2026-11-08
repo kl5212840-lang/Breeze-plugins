@@ -1,3 +1,7 @@
+import { getBikaAccessLineState, checkBikaAccessLines, cancelBikaAccessLineCheck,
+  selectBikaAccessLine as commitBikaAccessLine } from "./bika-access-lines";
+import { getBikaVideoCatalog, getBikaVideoDetail, getBikaVideoPlayback } from "./bika-video";
+import { checkInToday, getCheckinStatus } from "./bika-checkin";
 import { getChapter, getComicDetail, getReadSnapshot } from "./bika-comic-detail";
 import {
   getFavoriteData,
@@ -42,12 +46,25 @@ async function getInfo(): Promise<BikaPluginInfo> {
 }
 
 export default {
+  getBikaAccessLineState,
+  checkBikaAccessLines,
+  cancelBikaAccessLineCheck,
+  selectBikaAccessLine: async (payload: Parameters<typeof commitBikaAccessLine>[0]) => {
+    const result = await commitBikaAccessLine(payload);
+    if (result.ok) await init();
+    return result;
+  },
+  getBikaVideoCatalog,
+  getBikaVideoDetail,
+  getBikaVideoPlayback,
   init,
   bikaRequest,
   getComicDetail,
   getSettingsBundle,
   saveSettings,
   getUserInfoBundle,
+  checkInToday,
+  getCheckinStatus,
   updateAvatar,
   updateProfile,
   updatePassword,

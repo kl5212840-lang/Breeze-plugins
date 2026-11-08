@@ -8,3 +8,12 @@ test("source website is separate from the plugin project home", () => {
   assert.equal(info.home, "https://github.com/kl5212840-lang/Breeze-plugin-copyComic");
   assert.notEqual(new URL(info.websiteUrl).host, new URL(info.home!).host);
 });
+
+
+test("personal tab replaces standalone cloud favorites and declares the real feed", () => {
+  const info = buildPluginInfo();
+  assert.equal(info.breezeExperience.profileTab, true);
+  assert.equal(info.breezeExperience.profileKind, "generic");
+  assert.equal(info.breezeExperience.profileCloudFavoriteFunction, "getCloudFavoriteData");
+  assert.deepEqual(info.function?.map(item => item.id), ["recommend", "newest", "discover", "rank"]);
+});

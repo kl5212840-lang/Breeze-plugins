@@ -612,7 +612,7 @@ test('episode preparation reads a detached exact-identity document without navig
  assert.equal(env.window.__breezeEpisodeReads['episode-test'].status,'failed');
 });
 
-test('personal preview reads only the observed owner history and returns three public cards', async () => {
+test('personal preview reads only the observed owner history and returns four public cards', async () => {
   const { DOMParser } = require('linkedom');
   const html = `<a id="user-modal-trigger" href="/user/42"></a><nav class="user-nav-bar"></nav><input name="email" value="private@example.test">` +
     Array.from({length:5}, (_,i) => `<div class="user-tab-item-wrapper"><a class="video-link" href="/watch?v=${i+1}"><img src="https://image.example.test/${i}.jpg"><span class="title">Video ${i+1}</span></a></div>`).join('');
@@ -622,8 +622,8 @@ test('personal preview reads only the observed owner history and returns three p
     fetch: async (url, options) => { requests++; assert.equal(url,'https://hanime1.me/user/42/histories'); assert.equal(options.credentials,'same-origin'); assert.equal(options.redirect,'error');
       return {ok:true,url,text:async()=>html}; }};
   const value = await vm.runInNewContext(scripts.personalRecent,context);
-  assert.equal(value.status,'ok');assert.equal(value.snapshot.cards.length,3);assert.equal(requests,1);
-  assert.deepEqual(Array.from(value.snapshot.cards, c=>c.href), ['https://hanime1.me/watch?v=1','https://hanime1.me/watch?v=2','https://hanime1.me/watch?v=3']);
+  assert.equal(value.status,'ok');assert.equal(value.snapshot.cards.length,4);assert.equal(requests,1);
+  assert.deepEqual(Array.from(value.snapshot.cards, c=>c.href), ['https://hanime1.me/watch?v=1','https://hanime1.me/watch?v=2','https://hanime1.me/watch?v=3','https://hanime1.me/watch?v=4']);
   assert.doesNotMatch(JSON.stringify(value),/private@example|email|Cookie/);
   context.fetch = async url => ({ok:true,url,text:async()=>html.replace('/user/42','/user/99')});
   assert.equal((await vm.runInNewContext(scripts.personalRecent,context)).status,'unavailable');
@@ -634,4 +634,22 @@ test('personal preview reads only the observed owner history and returns three p
   assert.equal((await vm.runInNewContext(scripts.personalRecent,context)).status,'ok');
   context.location = new URL('https://foreign.example.test/');
   assert.equal((await vm.runInNewContext(scripts.personalRecent,context)).status,'unsupported');
+});
+
+for (const kind of ['saves','likes','playlists']) test(`owner ${kind} preview uses its exact URL and bounded public fields`, async () => {
+  const { DOMParser } = require('linkedom');
+  const header = '<a id="user-modal-trigger" href="/user/42"></a><nav class="user-nav-bar"></nav>';
+  const cards = Array.from({length:6}, (_,i) => kind === 'playlists'
+    ? `<div class="playlist-card"><a href="/playlist?list=list${i}"><img src="https://image.example/${i}.jpg"><span class="title">List ${i}</span></a></div>`
+    : `<div class="user-tab-item-wrapper"><a class="video-link" href="/watch?v=${i+1}"><span class="title">Video ${i}</span></a></div>`).join('');
+  const env = documentFor('', 'https://hanime1.me/user/42');
+  const context = {...env, DOMParser, AbortController, setTimeout, clearTimeout,
+    fetch: async (url, options) => { assert.equal(url,`https://hanime1.me/user/42/${kind}`); assert.equal(options.credentials,'same-origin');
+      return {ok:true,url,text:async()=>header+cards}; }};
+  const value = await vm.runInNewContext(scripts['personal-'+kind], context);
+  assert.equal(value.status,'ok');
+  assert.equal(kind === 'playlists' ? value.snapshot.playlists.length : value.snapshot.cards.length, 4);
+  assert.doesNotMatch(JSON.stringify(value), /password|Cookie|email/);
+  context.fetch = async url => ({ok:true,url,text:async()=>header.replace('/user/42','/user/99')+cards});
+  assert.equal((await vm.runInNewContext(scripts['personal-'+kind],context)).status,'unavailable');
 });

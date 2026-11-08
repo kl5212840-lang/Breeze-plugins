@@ -1,26 +1,34 @@
-import { toNum } from "./bika-utils";
-import { loadPluginSetting } from "./plugin-config";
+import { loadAppChannel } from "./bika-network";
+import { loadBikaImageQuality, type BikaImageQuality } from "./bika-image-quality";
 
 export async function buildBikaImageUrl(
   fileServer: unknown,
   pathValue: unknown,
   pictureType: "cover" | "creator" | "favourite" | "comic" | "else" = "cover",
+  qualitySnapshot?: BikaImageQuality,
 ) {
-  const imageQuality = await loadPluginSetting("image.quality", "original");
-  const proxy = toNum(await loadPluginSetting("network.proxy", "3"));
+  const imageQuality = qualitySnapshot ?? await loadBikaImageQuality();
+  const proxy = await loadAppChannel();
   let url = String(fileServer).trim();
   let path = String(pathValue).trim();
+
+  // The official client consumes the fileServer/path returned for its selected
+  // image-quality header. No invented CDN query or host represents a quality tier.
+  // Preserve existing original-quality mirror/channel compatibility below.
+  if (pictureType === "comic" && imageQuality !== "original") {
+    return `${url.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+  }
 
   if (url == "https://storage1.picacomic.com") {
     if (pictureType == "cover") {
       url = "https://img.picacomic.com";
     } else if (pictureType == "creator" || pictureType == "favourite") {
-      url = proxy == 1 ? "https://storage.diwodiwo.xyz" : "https://s3.picacomic.com";
+      url = proxy === "1" ? "https://storage.diwodiwo.xyz" : "https://s3.picacomic.com";
     } else {
       if (imageQuality != "original") {
         url = "https://img.picacomic.com";
       } else {
-        url = proxy == 1 ? "https://storage.diwodiwo.xyz" : "https://s3.picacomic.com";
+        url = proxy === "1" ? "https://storage.diwodiwo.xyz" : "https://s3.picacomic.com";
       }
     }
   } else if (url == "https://storage-b.picacomic.com") {
@@ -30,13 +38,13 @@ export async function buildBikaImageUrl(
       url = "https://img.picacomic.com";
     } else if (imageQuality == "original") {
       url = "https://storage-b.diwodiwo.xyz";
-    } else if (imageQuality != "original") {
+    } else {
       url = "https://img.picacomic.com";
     }
   }
 
   if (path.includes("picacomic-paint.jpg") || path.includes("picacomic-gift.jpg")) {
-    url = proxy == 1 ? "https://storage.diwodiwo.xyz/static" : "https://s3.picacomic.com/static";
+    url = proxy === "1" ? "https://storage.diwodiwo.xyz/static" : "https://s3.picacomic.com/static";
   }
 
   if (path.includes("tobeimg/")) {

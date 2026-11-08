@@ -1,18 +1,78 @@
 {
   "name": "哔咔漫画+",
   "uuid": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
-  "iconUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/plugins/bika/assets/logo_round.webp",
+  "iconUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
   "describe": "独立更新的哔咔漫画插件",
-  "version": "0.1.1",
-  "releaseSeries": 1,
+  "version": "0.1.2",
   "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/bika.json",
-  "home": "https://github.com/kl5212840-lang/Breeze-plugins/tree/main/plugins/bika",
+  "home": "https://github.com/kl5212840-lang/Breeze-plugin-bika-personal",
   "npmName": "",
+  "breezeVideoModules": [
+    {
+      "type": "openVideoLibrary",
+      "payload": {
+        "source": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
+        "title": "小電影",
+        "tabTitle": "电影",
+        "url": "https://adult-movie.bidobido.xyz/",
+        "protocol": 2,
+        "nativeSearch": true,
+        "catalogFnPath": "getBikaVideoCatalog",
+        "detailFnPath": "getBikaVideoDetail",
+        "playbackFnPath": "getBikaVideoPlayback",
+        "capabilities": {
+          "search": "full",
+          "year": false,
+          "recent": false,
+          "sourceSort": false,
+          "filtersOnSearch": false,
+          "detailFromSnapshot": true,
+          "itemNamespace": "movie"
+        }
+      }
+    },
+    {
+      "type": "openVideoLibrary",
+      "payload": {
+        "source": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
+        "title": "小里番",
+        "tabTitle": "里番",
+        "url": "https://adult-animate.bidobido.xyz/",
+        "protocol": 2,
+        "nativeSearch": false,
+        "catalogFnPath": "getBikaVideoCatalog",
+        "detailFnPath": "getBikaVideoDetail",
+        "playbackFnPath": "getBikaVideoPlayback",
+        "capabilities": {
+          "search": "none",
+          "year": false,
+          "recent": false,
+          "sourceSort": false,
+          "filtersOnSearch": false,
+          "detailFromSnapshot": true,
+          "itemNamespace": "animate",
+          "posterAspectRatio": 1.3333333333333333
+        }
+      }
+    }
+  ],
   "breezeExperience": {
+    "aggregateMedia": "comic",
     "searchHotFunction": "hotSearch",
     "profileTab": true,
+    "bikaExperience": {
+      "version": 1,
+      "appearanceKey": "ui.experienceStyle",
+      "loadingArtwork": "bikaIos2585",
+      "accessLinesVersion": 1,
+      "imageQualityVersion": 1
+    },
     "profileAvatarFunction": "updateAvatar",
     "profileBioFunction": "updateProfile",
+    "profileCheckinFunction": "checkInToday",
+    "profileCheckinStatusFunction": "getCheckinStatus",
+    "profileCheckinDateBasis": "observedUtc8",
+    "profileCheckinStatusSource": "serverProfile",
     "legacySources": [
       "0a0e5858-a467-4702-994a-79e608a4589d"
     ],
@@ -100,5 +160,6 @@
         }
       }
     }
-  ]
+  ],
+  "releaseSeries": 1
 }

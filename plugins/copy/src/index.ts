@@ -1,3 +1,7 @@
+import { COPY_SPEED_KEY, CopyLineSpeedTest, probeCopyRoute } from "./line-speed";
+import { CopyAvatarSubmittedError, createCopyAvatarHelper, type CopyEditableProfile } from "./profile-avatar";
+import { copyProfileTransport, prepareCopyAvatarJpeg } from "./profile-avatar-runtime";
+import { readAccountCredentials, saveAccountCredentials } from "./account-credentials";
 import type {
   AdvancedSearchContract,
   CapabilitiesBundleContract,
@@ -37,6 +41,7 @@ import {
   runtime,
 } from "breeze-plugin-kit";
 import ky from "ky";
+import { safeCopyLoginReason } from "./login-error";
 import {
   NOT_FOUND_IMAGE_URL,
   SettingsBundleContract,
@@ -173,6 +178,39 @@ const API_DOMAIN_BASE_MAP: Record<string, string> = {
   热辣漫画线路7: "https://mapi.fgjfghkkcenter.club/api/v3",
 };
 
+// Every route already offered by this plugin is tested anonymously on demand.
+const lineSpeedTest = new CopyLineSpeedTest({
+  bases: API_DOMAIN_BASE_MAP,
+  store: {
+    load: () => pluginConfig.load(COPY_SPEED_KEY, ""),
+    save: async (value) => { await pluginConfig.save(COPY_SPEED_KEY, value); },
+  },
+  context: async () => {
+    // Read the explicit settings only. Calling the legacy resolving helpers
+    // here could repair their caches and write configuration during a test.
+    const [rawChoice, rawPlatform] = await Promise.all([
+      pluginConfig.load(API_DOMAIN_CONFIG_KEY, DEFAULT_API_DOMAIN_CHOICE),
+      pluginConfig.load(PLATFORM_CONFIG_KEY, DEFAULT_PLATFORM_VALUE),
+    ]);
+    const choice = String(unwrapStoredValue(rawChoice) ?? "").trim();
+    const platform = String(unwrapStoredValue(rawPlatform) ?? "");
+    if (!API_DOMAIN_BASE_MAP[choice]) throw new Error("当前线路不在已声明的测试范围内，请手动选择线路。");
+    if (!PLATFORM_OPTIONS.some((item) => item.value === platform)) throw new Error("请求标识无效，请重新选择。");
+    return { choice, platform };
+  },
+  probe: (choice, base, platform) => probeCopyRoute(choice, base, platform,
+    { headers: getApiHeadersForBase(base, platform) }),
+});
+
+async function readLineSpeeds() {
+  try { return await lineSpeedTest.snapshot(); } catch { return null; }
+}
+async function testLineSpeeds() {
+  const result = await lineSpeedTest.measure();
+  return { source: PLUGIN_ID, ok: true, message: result.message,
+    data: { ...result, ok: true, anyAvailable: result.ok } };
+}
+
 function isValidApiBase(value: unknown): value is string {
   const text = String(value ?? "").trim();
   if (!text) return false;
@@ -217,6 +255,7 @@ function unwrapStoredValue(raw: unknown) {
 }
 
 async function saveApiDomainChoice(choice: string) {
+  lineSpeedTest.invalidate();
   const normalized = String(choice ?? "").trim();
   if (!API_DOMAIN_BASE_MAP[normalized]) {
     console.log(`[settings] saveApiDomainChoice ignored invalid choice="${normalized}"`);
@@ -232,6 +271,7 @@ async function saveApiDomainChoice(choice: string) {
 }
 
 async function savePlatformValue(platform: string) {
+  lineSpeedTest.invalidate();
   const next = String(platform ?? "");
   await Promise.allSettled([
     pluginConfig.save(PLATFORM_CONFIG_KEY, next),
@@ -322,8 +362,9 @@ async function getInfo(): Promise<ReturnType<typeof buildPluginInfo>> {
 }
 
 async function getApiHeaders() {
-  const apiBase = await resolveApiBase();
-  const platform = await resolvePlatformValue();
+  return getApiHeadersForBase(await resolveApiBase(), await resolvePlatformValue());
+}
+function getApiHeadersForBase(apiBase: string, platform: string) {
   const isHotMangaApi = isHotMangaApiBase(apiBase);
   const requestVersion = isHotMangaApi ? "2025.02.12" : "2025.05.09";
 
@@ -518,8 +559,12 @@ async function loadAuthUsername(): Promise<string> {
   }
 }
 
+async function getAccountApiHeaders(): Promise<Record<string, string>> {
+  return { ...(await getApiHeaders()), "User-Agent": APP_FALLBACK_UA };
+}
+
 async function getAuthedHeaders(): Promise<Record<string, string>> {
-  const headers = await getApiHeaders();
+  const headers = await getAccountApiHeaders();
   const token = await loadAuthToken();
   if (!token) {
     throw buildUnauthorizedError(PLUGIN_ID, "请先登录后再使用收藏功能");
@@ -587,7 +632,10 @@ async function addCopyFavorite(comicId: string): Promise<void> {
   try {
     resp = (await ky
       .post(`${apiBase}/member/collect/comic?platform=1`, {
-        headers,
+        headers: {
+          ...headers,
+          "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+        },
         body,
       })
       .json()) as CopyApiResponse<null>;
@@ -676,6 +724,10 @@ function buildCopyCloudFavoriteScene(): ComicListScene {
         core: {},
         extern: { source: "cloudFavorite" },
       },
+    },
+    filter: {
+      fnPath: "getCloudFavoriteFilterBundle",
+      extern: { source: "cloudFavorite" },
     },
   };
 }
@@ -1862,7 +1914,9 @@ async function getComicDetail(payload: ComicDetailPayload = {}): Promise<ComicDe
     allowLike: false,
     allowCollected: true,
     allowDownload: true,
-    extern: {},
+    extern: {
+      metricAvailability: { totalViews: false, totalLikes: false },
+    },
   };
 
   const scheme = {
@@ -2245,24 +2299,41 @@ async function submitCopyLogin(
     password: encrypted,
     salt: "1729",
   }).toString();
-  const resp = (await ky
-    .post(`${apiBase}/login`, {
+  let response: Response;
+  try {
+    response = await ky.post(`${apiBase}/login`, {
       headers: {
-        ...(await getApiHeaders()),
+        ...(await getAccountApiHeaders()),
         "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
       },
       body,
-    })
-    .json()) as CopyApiResponse<MemberInfoResult & { token?: string }>;
-  if (Number(resp.code ?? 0) !== 200) {
-    throw new Error(resp.message || "登录失败");
+      throwHttpErrors: false,
+      retry: 0,
+    });
+  } catch (error) {
+    throw new Error((error as { name?: string })?.name === "TimeoutError"
+      ? "连接服务器超时" : "网络连接失败，请检查网络后重试");
+  }
+  let resp: CopyApiResponse<MemberInfoResult & { token?: string }>;
+  try {
+    resp = await response.json() as typeof resp;
+  } catch {
+    throw new Error(`服务器响应异常 (HTTP ${response.status})`);
+  }
+  if (!resp || typeof resp !== "object" || Array.isArray(resp)) {
+    throw new Error(`服务器响应异常 (HTTP ${response.status})`);
+  }
+  if (!response.ok || Number(resp.code ?? 0) !== 200) {
+    const reason = safeCopyLoginReason(resp, [username, password, encrypted]);
+    throw new Error(reason || (!response.ok ? `服务器响应异常 (HTTP ${response.status})` : "登录未完成，网站未提供原因"));
   }
   const resultsMap = toStringMap(resp.results);
   const token = "token" in resultsMap ? String(resultsMap.token ?? "").trim() : "";
   if (!token) {
     throw new Error("登录成功但未返回 token");
   }
-  await Promise.allSettled([
+  await saveAccountCredentials(pluginConfig, username, password, new URL(apiBase).origin);
+  await Promise.all([
     authConfig.save(AUTH_TOKEN_CONFIG_KEY, token),
     authConfig.save(AUTH_USERNAME_CONFIG_KEY, username),
   ]);
@@ -2270,7 +2341,8 @@ async function submitCopyLogin(
 }
 
 async function getLoginBundle(): Promise<LoginBundleContract> {
-  const username = await loadAuthUsername();
+  const credentials = await readAccountCredentials(pluginConfig);
+  const username = credentials?.account ?? await loadAuthUsername();
   const bundle = buildLoginBundle(PLUGIN_ID, {
     title: "拷贝漫画登录",
     fields: [
@@ -2279,7 +2351,7 @@ async function getLoginBundle(): Promise<LoginBundleContract> {
     ],
     submitFnPath: "loginWithPassword",
     submitText: "登录",
-    values: { username },
+    values: { username, password: credentials?.password ?? "" },
   });
   return {
     ...bundle,
@@ -2313,23 +2385,64 @@ async function loginWithPassword(payload: LoginSubmitPayload = {}): Promise<Logi
   };
 }
 
+export async function updateAvatar(payload: Record<string, unknown> = {}) {
+  if (payload.cancelled === true) return { ok: false, cancelled: true };
+  const image = prepareCopyAvatarJpeg(payload.jpegBase64);
+  const token = await loadAuthToken();
+  if (!token) throw new Error("请先登录后再更换头像");
+  try {
+    const confirmed = await createCopyAvatarHelper(copyProfileTransport, token).update(image);
+    if (!confirmed) throw new Error("头像未保存");
+    try {
+      // Preserve the independently observed avatar all the way to the view.
+      // The app member endpoint may still contain the old avatar after a web edit.
+      const profile = await readCopyUserInfoBundle(confirmed, token);
+      return { ok: true, confirmed: true, message: "头像已更新", profile };
+    } catch {
+      throw new CopyAvatarSubmittedError("头像已提交，暂时无法确认个人页资料，请刷新查看");
+    }
+  } catch (error) {
+    if (error instanceof CopyAvatarSubmittedError) {
+      return { ok: false, submitted: true, message: error.message };
+    }
+    throw error;
+  }
+}
+
 async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
+  return readCopyUserInfoBundle();
+}
+
+async function readCopyUserInfoBundle(
+  confirmed?: CopyEditableProfile,
+  expectedToken?: string,
+): Promise<UserInfoBundleContract> {
+  const token = await loadAuthToken();
+  if (expectedToken && token !== expectedToken) throw new Error("账号已改变，请刷新资料");
   const apiBase = await resolveApiBase();
   const storedUsername = await loadAuthUsername();
-  let infoMap: Record<string, unknown> = {};
-  try {
-    const info = await fetchCopyAuthedApi<MemberInfoResult>(`${apiBase}/member/info?platform=1`);
-    infoMap = toStringMap(info.results);
-  } catch {
-    infoMap = {};
-  }
+  const info = await fetchCopyAuthedApi<MemberInfoResult>(`${apiBase}/member/info?platform=1`);
+  const infoMap = toStringMap(info.results);
   const username =
     String(
       ("nickname" in infoMap ? infoMap.nickname : "") ??
         ("username" in infoMap ? infoMap.username : "") ??
         "",
     ).trim() || storedUsername;
-  const avatarUrl = String("avatar" in infoMap ? (infoMap.avatar ?? "") : "").trim();
+  let avatarUrl = String("avatar" in infoMap ? (infoMap.avatar ?? "") : "").trim();
+  let profile = confirmed;
+  if (!profile && token) {
+    try {
+      profile = await createCopyAvatarHelper(copyProfileTransport, token).read();
+    } catch {
+      // Sites without this optional web capability keep their app profile.
+    }
+  }
+  const memberUsername = String(infoMap.username ?? storedUsername).trim();
+  const sameAccount = token === await loadAuthToken() &&
+    (!memberUsername || memberUsername === profile?.username);
+  if (confirmed && !sameAccount) throw new Error("账号已改变，请刷新资料");
+  if (profile && sameAccount) avatarUrl = profile.avatar.trim();
   const userId = String("user_id" in infoMap ? (infoMap.user_id ?? "") : "").trim();
   return {
     source: PLUGIN_ID,
@@ -2340,11 +2453,13 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
         id: userId || "me",
         url: avatarUrl,
         name: avatarUrl ? `${userId || "me"}.jpg` : "",
-        path: avatarUrl ? `user/${userId || "me"}.jpg` : "",
+        // Image identity includes the observed URL, so both disk and resized
+        // Flutter image caches cannot reuse a previous avatar under user/me.jpg.
+        path: avatarUrl ? `user/${userId || "me"}/avatar/${encodeURIComponent(avatarUrl)}.jpg` : "",
         extern: {},
       },
       lines: [username || "拷贝漫画用户", userId ? `ID: ${userId}` : ""],
-      extern: { userId, username },
+      extern: { userId, username, avatarChangeNotice: "头像每30天可更换一次" },
     },
   };
 }
@@ -2620,32 +2735,47 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
     // ignore config read errors
   }
 
+  const speed = await readLineSpeeds();
+  const date = speed ? new Date(speed.measuredAt) : null;
+  const time = date ? `${date.getMonth() + 1}-${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}` : "";
+  const speedOptions = API_DOMAIN_OPTIONS.map((option) => {
+    const result = speed?.results.find((row) => row.choice === option.value);
+    const name = option.label.replace("大陆专线新站", "大陆新").replace("大陆专线", "大陆")
+      .replace("国际服", "国际").replace("热辣漫画线路", "热辣");
+    const status = result ? (result.ok ? `${result.ms}ms` : "失败") : "未测";
+    return { ...option, label: `${name} · ${status}${result && speed?.stale ? "·旧" : ""}` };
+  });
+  const networkFields = [
+    {
+      key: API_DOMAIN_CONFIG_KEY,
+      kind: "select" as const,
+      label: "访问线路",
+      fnPath: "saveSettings",
+      options: speedOptions,
+    },
+    {
+      key: PLATFORM_CONFIG_KEY,
+      kind: "select" as const,
+      label: "请求标识",
+      description: "用于站点识别客户端，通常保持默认值。",
+      fnPath: "saveSettings",
+      options: PLATFORM_OPTIONS,
+    },
+  ];
+
+  const networkSection = {
+    id: "network", title: "网络", fields: networkFields,
+    headerAction: { key: "line-speed", title: "测速", fnPath: "testLineSpeeds" },
+    ...(time ? { footer: `上次测速 ${time}${speed?.stale ? " · 旧结果" : ""}` } : {}),
+  };
+
   return {
     source: PLUGIN_ID,
     scheme: {
       version: "1.0.0",
       type: "settings",
       sections: [
-        {
-          id: "network",
-          title: "网络",
-          fields: [
-            {
-              key: API_DOMAIN_CONFIG_KEY,
-              kind: "select",
-              label: "接口域名（不可用可尝试更换）",
-              fnPath: "saveSettings",
-              options: API_DOMAIN_OPTIONS,
-            },
-            {
-              key: PLATFORM_CONFIG_KEY,
-              kind: "select",
-              label: "platform",
-              fnPath: "saveSettings",
-              options: PLATFORM_OPTIONS,
-            },
-          ],
-        },
+        networkSection,
       ],
     },
     data: {
@@ -2687,9 +2817,9 @@ export async function getCapabilitiesBundle(): Promise<CapabilitiesBundleContrac
     scheme: {
       version: "1.0.0" as const,
       type: "capabilities" as const,
-      actions: [],
+      actions: [{ key: "line-speed", title: "测试线路速度", fnPath: "testLineSpeeds" }],
     },
-    data: {},
+    data: { actions: ["line-speed"] },
   };
 }
 
@@ -2709,6 +2839,7 @@ export default {
   getComicDetail,
   getCommentFeed,
   getCommentReplies,
+  loadCommentReplies: getCommentReplies,
   getChapter,
   getReadSnapshot,
   fetchImageBytes,
@@ -2716,9 +2847,11 @@ export default {
   getSettingsBundle,
   saveSettings,
   getCapabilitiesBundle,
+  testLineSpeeds,
   getLoginBundle,
   loginWithPassword,
   getUserInfoBundle,
+  updateAvatar,
   startFavoriteAction,
   continueFavoriteAction,
   getCloudFavoriteData,

@@ -1,0 +1,17 @@
+{
+  "releaseSeries": 1,
+  "scriptSha256": "cdc7d036a00258f6fb0b3f6a85901c0359d60b97be68f0c769d6b8d008ca0afc",
+  "migrationFrom": [],
+  "uuid": "97b8ebb1-9f1f-423c-9847-acd7b0ccd31f",
+  "tag_name": "v0.1.0",
+  "name": "哔咔漫画 v0.1.0",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.08",
+  "assets": [
+    {
+      "name": "Bika-classic-v0.1.0.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.08/Bika-classic-v0.1.0.cjs",
+      "size": 106533
+    }
+  ],
+  "sha256": "a57be249bfc3e1b6a2a4f0deb5de14164939b5bdc0272281e25618cfcfe2c2bb"
+}

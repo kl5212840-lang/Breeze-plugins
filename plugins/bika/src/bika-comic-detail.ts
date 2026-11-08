@@ -15,6 +15,7 @@ import {
   toComicListItem,
 } from "./bika-comic-shared";
 import { buildBikaImageUrl } from "./bika-image";
+import { assertBikaImageQuality, loadBikaImageQuality } from "./bika-image-quality";
 import { bikaRequest } from "./bika-request";
 import type { BikaChapterPayload, BikaReadSnapshotPayload, ComicDetailPayload } from "./bika-types";
 import { toBool, toNum, toStringMap } from "./bika-utils";
@@ -226,6 +227,7 @@ export async function getChapter(
 ): Promise<ChapterContentContract> {
   const apiBase = await getApiBase();
   void (await loadPluginSetting("network.proxy", "3"));
+  const imageQuality = await loadBikaImageQuality();
   const comicId = String(payload.comicId ?? "").trim();
   const chapterId = toNum(payload.chapterId, 0);
   if (!comicId) {
@@ -246,6 +248,7 @@ export async function getChapter(
       url: `${apiBase}comics/${comicId}/order/${chapterId}/pages?page=${page}`,
       method: "GET",
       cache: true,
+      imageQuality,
     })) as StringMap;
     const data = toStringMap(result.data);
     const pagesData = toStringMap(data.pages);
@@ -263,7 +266,7 @@ export async function getChapter(
       docs.push({
         name: String(media.originalName ?? ""),
         path: String(media.path ?? ""),
-        url: await buildBikaImageUrl(media.fileServer, media.path, "comic"),
+        url: await buildBikaImageUrl(media.fileServer, media.path, "comic", imageQuality),
         id: String(doc.id ?? ""),
         extern: {} as StringMap,
       });
@@ -272,6 +275,7 @@ export async function getChapter(
     page += 1;
   }
 
+  await assertBikaImageQuality(imageQuality);
   const chapter = {
     id: epId,
     requestId: "",

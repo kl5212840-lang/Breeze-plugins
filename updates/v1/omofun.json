@@ -1,0 +1,23 @@
+{
+  "releaseSeries": 1,
+  "scriptSha256": "26527fac97aabc1987cc41b60dc245f6c979b3aa49e0d8442696f1ed09fa1f39",
+  "migrationFrom": [],
+  "requirements": {
+    "version": 1,
+    "capabilities": {
+      "videoLibraryProtocol": 2
+    }
+  },
+  "uuid": "ccc2fe17-c0a8-4fd8-a596-835772686404",
+  "tag_name": "v0.1.0",
+  "name": "OmoFun 动漫 v0.1.0",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.08",
+  "assets": [
+    {
+      "name": "OmoFun-native-v0.1.0.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.08/OmoFun-native-v0.1.0.cjs",
+      "size": 54327
+    }
+  ],
+  "sha256": "87424f4801b2e4a3c6602f6c37e402028ad18ee0c4ab862488053c0d2729f373"
+}

@@ -1,20 +1,33 @@
 import type { InfoContract } from "breeze-plugin-kit";
 import { PLUGIN_ID, PLUGIN_VERSION } from "./config";
 
-export function buildPluginInfo(): InfoContract & { websiteUrl: string; releaseSeries: number } {
+export function buildPluginInfo(): InfoContract & {
+  websiteUrl: string;
+  breezeExperience: {
+    profileTab: boolean;
+    profileKind: string;
+    profileCloudFavoriteFunction: string;
+    profileAvatarFunction: string;
+  };
+} {
   return {
     name: "拷贝漫画",
     uuid: PLUGIN_ID,
     iconUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/plugins/copy/assets/u3.webp",
+      "https://raw.githubusercontent.com/deretame/Breeze-plugin-copyComic/main/assets/u3.webp",
     describe: "拷贝漫画插件",
     version: PLUGIN_VERSION,
-    releaseSeries: 1,
-    home: "https://github.com/kl5212840-lang/Breeze-plugins/tree/main/plugins/copy",
+    home: "https://github.com/kl5212840-lang/Breeze-plugin-copyComic",
     websiteUrl: "https://www.mangacopy.com/",
     updateUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/copy.json",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/copy.json",
     npmName: "",
+    breezeExperience: {
+      profileTab: true,
+      profileKind: "generic",
+      profileCloudFavoriteFunction: "getCloudFavoriteData",
+      profileAvatarFunction: "updateAvatar",
+    },
     function: [
       {
         id: "recommend",
@@ -110,32 +123,7 @@ export function buildPluginInfo(): InfoContract & { websiteUrl: string; releaseS
           },
         },
       },
-      {
-        id: "cloudFavorite",
-        title: "云端收藏",
-        action: {
-          type: "openComicList",
-          payload: {
-            scene: {
-              title: "云端收藏",
-              source: PLUGIN_ID,
-              body: {
-                type: "pluginPagedComicList",
-                request: {
-                  fnPath: "getCloudFavoriteData",
-                  core: {},
-                  extern: { source: "cloudFavorite" },
-                },
-              },
-              filter: {
-                fnPath: "getCloudFavoriteFilterBundle",
-                core: {},
-                extern: { source: "cloudFavorite" },
-              },
-            },
-          },
-        },
-      },
+
     ],
   };
 }

@@ -18,6 +18,8 @@ import {
   toSortKeyword,
 } from "./bika-comic-shared";
 import { buildBikaImageUrl } from "./bika-image";
+import { resolveBikaCategoryArtwork } from "./bika-category-art";
+import { isBikaNativeVideoShortcut } from "./bika-navigation";
 import { bikaRequest } from "./bika-request";
 import type {
   BikaFavoriteFolderPayload,
@@ -196,12 +198,19 @@ async function getNavigationItems() {
       const thumb = toStringMap(item.thumb);
       const fileServer = String(thumb.fileServer ?? "").trim();
       const path = String(thumb.path ?? "").trim();
-      return toActionItem({
-        title: String(item.title ?? ""),
-        coverUrl: fileServer && path ? await buildBikaImageUrl(fileServer, path, "else") : "",
-        coverPath: path,
-        action: await buildHomeAction(item, authorization),
+      const artwork = resolveBikaCategoryArtwork(item, {
+        url: fileServer && path ? await buildBikaImageUrl(fileServer, path, "else") : "",
+        path,
       });
+      return {
+        ...toActionItem({
+          title: String(item.title ?? ""),
+          coverUrl: artwork.url,
+          coverPath: artwork.path,
+          action: await buildHomeAction(item, authorization),
+        }),
+        ...(artwork.icon ? { icon: artwork.icon } : {}),
+      };
     }),
   );
 
@@ -247,7 +256,7 @@ export async function getHomeData(_payload: BikaHomePayload = {}): Promise<Funct
         type: "list" as const,
         children: [
           { type: "chip-list" as const, key: "keywords" },
-          { type: "action-grid" as const, key: "navItems" },
+          { type: "action-grid" as const, key: "navItems", bikaCategoryGrid: true },
         ],
       },
     } as unknown as FunctionPageContract["scheme"],
@@ -277,6 +286,13 @@ export async function getFavoriteData(
   const favDocs: StringMap[] = (Array.isArray(comics.docs) ? comics.docs : []).filter(
     (item): item is StringMap => !!item && typeof item === "object" && !Array.isArray(item),
   );
+  // A loaded page is not the whole collection; malformed totals are not success.
+  const rawTotal = comics.total;
+  const total = typeof rawTotal === "number" ? rawTotal
+    : typeof rawTotal === "string" && rawTotal.trim() ? Number(rawTotal) : NaN;
+  if (!Number.isSafeInteger(total) || total < favDocs.length) {
+    throw new Error("收藏资料读取不完整，请重试");
+  }
   const currentPage = toNum(comics.page, page);
   const pages = toNum(comics.pages, currentPage);
   const items = await Promise.all(
@@ -301,7 +317,7 @@ export async function getFavoriteData(
       paging: {
         page: currentPage,
         pages,
-        total: toNum(comics.total, favDocs.length),
+        total,
         hasReachedMax: currentPage >= pages,
       },
       items,
@@ -309,7 +325,7 @@ export async function getFavoriteData(
     paging: {
       page: currentPage,
       pages,
-      total: toNum(comics.total, favDocs.length),
+      total,
       hasReachedMax: currentPage >= pages,
     },
     items,
@@ -413,12 +429,14 @@ export async function getFunctionPage(
       }
 
       const action = toStringMap(item?.action);
+      const actionPayload = toStringMap(action.payload);
+      if (isBikaNativeVideoShortcut(action, toStringMap(payload.extern).nativeVideoTab))
+        return false;
       if (String(action.type ?? "") !== "openComicList") {
         return true;
       }
 
-      const payload = toStringMap(action.payload);
-      const fnPath = resolveSceneFnPath(payload.scene);
+      const fnPath = resolveSceneFnPath(actionPayload.scene);
       return !!fnPath;
     });
     return {
@@ -429,7 +447,7 @@ export async function getFunctionPage(
         title: "导航",
         body: {
           type: "list" as const,
-          children: [{ type: "action-grid", key: "items" }],
+          children: [{ type: "action-grid", key: "items", bikaCategoryGrid: true }],
         },
       } as unknown as FunctionPageContract["scheme"],
       data: {

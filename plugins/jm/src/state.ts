@@ -39,12 +39,20 @@ function writeSession(revision: number, write: () => Promise<void>) {
   return task;
 }
 
+async function waitForPersistentWrites(writes: Promise<unknown>[]) {
+  // A rejected member must not release the queue while another persistent
+  // write is still running and could cross a later clear or login.
+  const results = await Promise.allSettled(writes);
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
 export function saveSessionValues(
   revision: number,
   values: Record<string, unknown>,
 ) {
   return writeSession(revision, async () => {
-    await Promise.all(Object.entries(values).map(([key, value]) =>
+    await waitForPersistentWrites(Object.entries(values).map(([key, value]) =>
       pluginConfig.save(key, JSON.stringify(value)),
     ));
   });
@@ -56,13 +64,14 @@ export function clearSession() {
   // Queue clearing after any already-started write. Late responses retain
   // their old revision and cannot restore either settings or the cached JWT.
   return writeSession(revision, async () => {
-    await Promise.all([
+    await waitForPersistentWrites([
       cacheDelete(scopedKey("jwt")),
       ...Object.entries({
         "auth.account": "",
         "auth.password": "",
         "auth.jwt": "",
         "auth.userInfo": {},
+        "auth.checkin": {},
       }).map(([key, value]) => pluginConfig.save(key, JSON.stringify(value))),
     ]);
   });

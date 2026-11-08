@@ -154,3 +154,34 @@ export async function decodeResponsePayload(
 ): Promise<unknown> {
   return decodeValue(await normalizeRawResponse(raw), ts);
 }
+
+/** Album-only normalization. Generic account/mutation envelopes keep their
+ * existing decoder contract; a data property on an album is not an envelope.
+ */
+export function unwrapJmAlbumPayload(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const root = value as Record<string, unknown>;
+  if (root.code !== undefined && Number(root.code) !== 200) return {};
+  if (Object.prototype.hasOwnProperty.call(root, "id")) return root;
+  const data = root.data;
+  if (data && typeof data === "object" && !Array.isArray(data) &&
+      (root.code === undefined || Number(root.code) === 200)) {
+    const album = { ...data as Record<string, unknown> };
+    // A few public album fields occur beside the envelope on supported
+    // responses. Do not merge credentials/arbitrary wrapper properties, and
+    // never replace an explicit nested empty value with the wrapper value.
+    for (const field of ["description", "tags", "total_views", "likes", "comment_total"]) {
+      if (!Object.prototype.hasOwnProperty.call(album, field) &&
+          Object.prototype.hasOwnProperty.call(root, field)) album[field] = root[field];
+    }
+    return album;
+  }
+  return root;
+}
+
+export function optionalJmCount(value: unknown): number | null {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && !/^\d+$/.test(value.trim())) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}

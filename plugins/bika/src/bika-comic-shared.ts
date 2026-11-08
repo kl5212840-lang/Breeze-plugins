@@ -10,6 +10,7 @@ import type {
   PluginAction,
   StringMap,
 } from "breeze-plugin-kit";
+import { bikaVideoEntry } from "./bika-video";
 import { buildBikaImageUrl } from "./bika-image";
 import type { RankingFilterOption } from "./bika-types";
 import { sanitizePath, toBool, toNum, toStrList, toStringMap } from "./bika-utils";
@@ -293,6 +294,8 @@ export async function buildHomeAction(
   }
   if (category?.isWeb) {
     let url = String(category?.link ?? "");
+    const videoAction = bikaVideoEntry(url);
+    if (videoAction) return videoAction as unknown as PluginAction;
     if (title === "嗶咔畫廊" && authorization.trim()) {
       url = `${url}?token=${authorization}`;
     }

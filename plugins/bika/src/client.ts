@@ -2,6 +2,17 @@ import axios, { AxiosHeaders } from "axios";
 import { buildUnauthorizedError, cache, hostRuntime } from "breeze-plugin-kit";
 import { loadPluginSetting } from "./plugin-config";
 import { BIKA_PLUGIN_ID } from "./info";
+import { loadAppChannel, normalizeAppChannel } from "./bika-network";
+import { assertBikaImageQuality, BikaImageQualityChangedError, loadBikaImageQuality, normalizeBikaImageQuality, type BikaImageQuality } from "./bika-image-quality";
+import { isTransientError, RetryableRequestError } from "../../shared/transient-retry";
+import { BikaAccountChangedError } from "./bika-auth-session";
+
+class BikaRequestError extends RetryableRequestError {
+  constructor(message: string, retryable: boolean) {
+    super(message, retryable);
+    this.name = "BikaRequestError";
+  }
+}
 
 type ClientPayload = {
   url?: string;
@@ -11,15 +22,26 @@ type ClientPayload = {
   imageQuality?: string;
   authorization?: string;
   settings?: {
-    proxy?: string;
     imageQuality?: string;
     authorization?: string;
   };
 };
 
-export const DEFAULT_API_BASE = "https://picaapi.picacomic.com/";
-export const BACKUP_API_BASE = "https://picaapi.go2778.com/";
-export const API_BASE_CACHE_KEY = "bika:network.apiBase";
+export { DEFAULT_API_BASE, BACKUP_API_BASE, API_BASE_CACHE_KEY } from "./bika-access-line-policy";
+import { DEFAULT_API_BASE, BACKUP_API_BASE, API_BASE_CACHE_KEY,
+  LINE_CONFIRMATION_KEY, lineBase } from "./bika-access-line-policy";
+
+export class BikaAccessLineChangedError extends Error {
+  constructor() { super("访问线路已更改，请重试"); this.name = "BikaAccessLineChangedError"; }
+}
+export async function captureBikaLine(): Promise<string> {
+  return JSON.stringify([await loadPluginSetting("network.apiBase", DEFAULT_API_BASE),
+    await loadPluginSetting(LINE_CONFIRMATION_KEY, null)]);
+}
+export async function assertBikaLine(snapshot: string): Promise<void> {
+  if (await captureBikaLine() !== snapshot) throw new BikaAccessLineChangedError();
+}
+
 export let API_BASE = DEFAULT_API_BASE;
 export const CACHE_KEY_PREFIX = "bikaComic:requestCache:";
 const API_KEY = "C69BAF41DA5ABD1FFEDC6D2FEA56B";
@@ -35,11 +57,13 @@ function normalizeApiBase(base: string): string {
 export function setApiBase(base: string) {
   const normalized = normalizeApiBase(base);
   API_BASE = normalized || DEFAULT_API_BASE;
+  bikaClient.defaults.baseURL = API_BASE;
 }
 
 export async function getApiBase() {
-  const raw = await cache.get(API_BASE_CACHE_KEY, DEFAULT_API_BASE);
-  const normalized = normalizeApiBase(String(raw ?? ""));
+  const cached = await cache.get(API_BASE_CACHE_KEY, DEFAULT_API_BASE);
+  const raw = await loadPluginSetting("network.apiBase", cached);
+  const normalized = lineBase(raw) ?? DEFAULT_API_BASE;
   const next = normalized || DEFAULT_API_BASE;
   if (API_BASE !== next) {
     API_BASE = next;
@@ -112,13 +136,14 @@ function normalizeRequestUrlForKey(url: unknown): string {
   return cleanPath(value);
 }
 
-export function buildCacheKey(payload: ClientPayload, method: string): string {
+export function buildCacheKey(payload: ClientPayload, method: string, channel = "3"): string {
   const authForKey = payload.authorization ?? payload.settings?.authorization;
-  const qualityForKey = payload.imageQuality ?? payload.settings?.imageQuality;
+  const qualityForKey = normalizeBikaImageQuality(payload.imageQuality ?? payload.settings?.imageQuality);
   const normalizedUrl = normalizeRequestUrlForKey(payload.url);
-  const rawKey = `${method}|${normalizedUrl}|${normalizeForKey(payload.body)}|${String(authForKey || "")}|${String(qualityForKey || "")}`;
+  const origin = new URL(String(payload.url || "/"), API_BASE).origin;
+  const rawKey = `${origin}|${normalizeAppChannel(channel)}|${method}|${normalizedUrl}|${normalizeForKey(payload.body)}|${String(authForKey || "")}|${String(qualityForKey || "")}`;
   const digest = hostRuntime.crypto.createHash("sha256").update(rawKey).digest("hex") as string;
-  return `v1:${digest}`;
+  return `v3:${digest}`;
 }
 
 function nowSeconds(): number {
@@ -159,35 +184,41 @@ function createSignature(path: string, timestamp: number, nonce: string, method:
   return hostRuntime.crypto.createHmac("sha256", SECRET_KEY).update(raw).digest("hex") as string;
 }
 
+export function safeBikaResponseMessage(raw: unknown, fallback: string, privateValues: string[] = []): string {
+  const data = raw as { message?: unknown; errorMsg?: unknown } | null;
+  const value = data?.message ?? data?.errorMsg;
+  let message = typeof value === "string" ? value.trim() : "";
+  const known: Record<string, string> = {
+    "email or password not match": "账号或密码不匹配",
+    "invalid email or password": "账号或密码不匹配",
+    "under review": "审核中",
+    "unauthorized": "账号验证失败，请重试",
+  };
+  if (known[message.toLowerCase()]) return known[message.toLowerCase()]!;
+  for (const value of privateValues.filter(Boolean)) message = message.split(value).join("[已隐藏]");
+  message = message.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[已隐藏]");
+  return message && message.length <= 160 &&
+    !/[\r\n]|https?:\/\/|(?:password|token|authorization|cookie)\s*[=:]|bearer\s+/i.test(message)
+    ? message : fallback;
+}
+
 function mapNetworkError(err: unknown): string {
   const e = err as {
     code?: string;
     message?: string;
+    config?: { data?: unknown; headers?: Record<string, unknown> };
     response?: {
       data?: { code?: number; message?: string; errorMsg?: string };
     };
   };
 
   const data = e?.response?.data;
-  const message = String(data?.message || data?.errorMsg || "");
-
-  if (data?.code === 401 && message === "unauthorized") {
-    return "__NEED_LOGIN__:unauthorized";
-  }
-  if (message === "under review") {
-    return "审核中";
-  }
-  if (
-    message &&
-    message.length <= 160 &&
-    !/[\r\n]|https?:\/\/|(?:password|token|authorization|cookie)\s*[=:]|bearer\s+/i.test(message)
-  ) {
-    return message;
-  }
-  if (e?.code === "ECONNABORTED") {
-    return "连接服务器超时";
-  }
-  return "网络请求失败，请检查网络后重试";
+  let body: Record<string, unknown> = {};
+  try { body = typeof e?.config?.data === "string" ? JSON.parse(e.config.data) : e?.config?.data as Record<string, unknown> ?? {}; } catch {}
+  const privateValues = ["email", "password", "old_password", "new_password", "token"]
+    .map((key) => typeof body?.[key] === "string" ? body[key] as string : "");
+  privateValues.push(String(e?.config?.headers?.authorization ?? ""));
+  return safeBikaResponseMessage(data, e?.code === "ECONNABORTED" ? "连接服务器超时" : "网络请求失败，请检查网络后重试", privateValues);
 }
 
 const bikaClient = axios.create({
@@ -196,17 +227,34 @@ const bikaClient = axios.create({
 });
 
 bikaClient.interceptors.request.use(async (config) => {
-  const payload = ((config as unknown as { __bikaPayload?: ClientPayload }).__bikaPayload ??
-    {}) as Partial<ClientPayload>;
+  const lineConfig = config as unknown as { __bikaLine?: string };
+  const line = lineConfig.__bikaLine ?? await captureBikaLine();
+  lineConfig.__bikaLine = line;
+  await assertBikaLine(line);
   const method = toUpperMethod(config.method);
   const requestUrl = String(config.url || "");
+  const [selectedBase, confirmation] = JSON.parse(line) as [string, { base?: string } | null];
+  if (confirmation && (confirmation.base !== selectedBase ||
+      new URL(requestUrl || "/", selectedBase).origin !== new URL(selectedBase).origin)) {
+    throw new BikaAccessLineChangedError();
+  }
   const nonce = randomHex(32);
   const timestamp = nowSeconds();
   const path = cleanPath(requestUrl);
 
-  const imageQuality = "original";
+  const qualitySnapshot = (config as unknown as { __bikaImageQuality?: BikaImageQuality }).__bikaImageQuality;
+  const imageQuality = qualitySnapshot === undefined
+    ? await loadBikaImageQuality()
+    : normalizeBikaImageQuality(qualitySnapshot);
+  (config as unknown as { __bikaImageQuality?: BikaImageQuality }).__bikaImageQuality = imageQuality;
+  if (method === "GET") await assertBikaImageQuality(imageQuality);
   const authorization = String(await loadPluginSetting("auth.authorization", "")).trim();
-  const appChannel = String(payload.settings?.proxy || "3");
+  const pinnedAuthorization = (config as unknown as { __bikaAuthorization?: string }).__bikaAuthorization;
+  if (pinnedAuthorization !== undefined && pinnedAuthorization !== authorization) {
+    throw new BikaAccountChangedError();
+  }
+  const snapshot = (config as unknown as { __bikaChannel?: string }).__bikaChannel;
+  const appChannel = snapshot == null ? await loadAppChannel() : normalizeAppChannel(snapshot);
   const headers = AxiosHeaders.from(config.headers);
 
   headers.set("api-key", API_KEY);
@@ -230,16 +278,29 @@ bikaClient.interceptors.request.use(async (config) => {
 
   config.method = method;
   config.headers = headers;
+  if (pinnedAuthorization !== undefined &&
+      String(await loadPluginSetting("auth.authorization", "")).trim() !== pinnedAuthorization) {
+    throw new BikaAccountChangedError();
+  }
+  await (config as unknown as { __bikaAssertAuthorization?: () => Promise<void> }).__bikaAssertAuthorization?.();
+  await assertBikaLine(line);
   return config;
 });
 
 bikaClient.interceptors.response.use(
   async (response) => {
     const cfg = response.config as {
+      __bikaLine?: string;
       __cacheKey?: string;
       __useCache?: boolean;
+      __bikaImageQuality?: BikaImageQuality;
+      method?: string;
     };
 
+    if (cfg.__bikaLine !== undefined) await assertBikaLine(cfg.__bikaLine);
+    if (cfg.__bikaImageQuality !== undefined && toUpperMethod(cfg.method) === "GET") {
+      await assertBikaImageQuality(cfg.__bikaImageQuality);
+    }
     if (cfg.__useCache && cfg.__cacheKey) {
       await writeCache(cfg.__cacheKey, response.data);
     }
@@ -247,17 +308,23 @@ bikaClient.interceptors.response.use(
     return response;
   },
   async (error: unknown) => {
+    if (error instanceof BikaAccountChangedError || error instanceof BikaAccessLineChangedError || error instanceof BikaImageQualityChangedError) throw error;
+    const pinnedLine = (error as { config?: { __bikaLine?: string } })?.config?.__bikaLine;
+    if (pinnedLine !== undefined) await assertBikaLine(pinnedLine);
     const e = error as {
+      code?: string;
+      config?: { url?: string };
       response?: {
         data?: { code?: number; message?: string; error?: string };
         status?: number;
       };
     };
     const data = e?.response?.data;
-    if (
+    const isLogin = cleanPath(String(e?.config?.url ?? "")).split("?")[0] === "auth/sign-in";
+    if (!isLogin && (
       e?.response?.status === 401 ||
       (data?.code === 401 && data?.error === "1005" && data?.message === "unauthorized")
-    ) {
+    )) {
       throw buildUnauthorizedError(BIKA_PLUGIN_ID, "登录过期，请重新登录");
     }
 
@@ -265,7 +332,11 @@ bikaClient.interceptors.response.use(
 
     // Axios errors retain config, headers and request bodies (including login
     // credentials). Only a safe message may cross the plugin/runtime boundary.
-    throw new Error(mapped);
+    const status = e?.response?.status;
+    const retryable = e?.code !== "ERR_CANCELED" && (
+      status === undefined ? isTransientError(error) : status === 429 || status >= 500
+    );
+    throw new BikaRequestError(mapped, retryable);
   },
 );
 

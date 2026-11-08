@@ -1,0 +1,23 @@
+{
+  "releaseSeries": 1,
+  "scriptSha256": "ea15f718a0339bff24c1b034475cd05053772628b8fa6427366b0790b5b58fb7",
+  "migrationFrom": [],
+  "requirements": {
+    "version": 1,
+    "capabilities": {
+      "videoLibraryProtocol": 2
+    }
+  },
+  "uuid": "b27083a4-a643-462a-8204-e6f42c19a5b9",
+  "tag_name": "v0.1.0",
+  "name": "魔都资源 v0.1.0",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.08",
+  "assets": [
+    {
+      "name": "Modu-native-v0.1.0.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.08/Modu-native-v0.1.0.cjs",
+      "size": 18903
+    }
+  ],
+  "sha256": "805bfb6a5513be28548536b53d1f6d1ce082c3dd4baf35387d48470311709f61"
+}

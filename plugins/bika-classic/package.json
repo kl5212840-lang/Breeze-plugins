@@ -1,0 +1,11 @@
+{
+  "name": "breeze-plugin-bika-classic",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build/build.mjs",
+    "test": "node build/build.mjs && node --experimental-transform-types --test tests/*.test.cjs",
+    "typecheck": "node ../bika/node_modules/typescript/bin/tsc --project tsconfig.json"
+  }
+}

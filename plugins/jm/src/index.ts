@@ -30,7 +30,8 @@ import {
   createJmClient,
   setUnauthorizedSchemeProvider,
 } from "./client";
-import { decodeResponsePayload } from "./codec";
+import { decodeResponsePayload, optionalJmCount, unwrapJmAlbumPayload } from "./codec";
+import { parseJmNotifications } from "./notifications";
 import { Config } from "./constants";
 import { JmRequestError, retryTransient, toFriendlyError } from "./errors";
 import { buildPluginInfo } from "./get-info";
@@ -54,6 +55,100 @@ import { getHost, md5Hex } from "./utils";
 const JM_PLUGIN_ID = "6886291b-f524-441c-844b-c2efae9899a9";
 
 const jmClient = createJmClient();
+
+// Only explicit server check-in evidence creates this account-scoped receipt.
+function checkinDate() {
+  return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+async function readCheckin(uid: unknown, revision: number) {
+  const receipt = await loadPluginSetting("auth.checkin", {});
+  assertCurrentSession(revision);
+  const accountId = String(uid ?? "").trim();
+  const checkedInDate = accountId && receipt?.accountId === accountId &&
+    receipt?.checkedInDate === checkinDate() ? receipt.checkedInDate : null;
+  return { accountId, checkedIn: checkedInDate ? true : null, checkedInDate,
+    checkinProof: checkedInDate ? {
+      source: "savedReceipt", date: checkedInDate, verifiedThisRequest: false,
+      evidenceSource: receipt.evidenceSource ?? null,
+      confirmedAt: typeof receipt.confirmedAt === "string" ? receipt.confirmedAt : null,
+    } : null };
+}
+
+// GET /daily is the current activity's account-specific calendar. Only its
+// explicit boolean for today's cell establishes a receipt; progress, missing
+// cells, web-only error strings and failed requests are not evidence.
+async function verifyCheckinCalendar(uid: unknown, revision: number) {
+  const requestDate = checkinDate();
+  const result = (status: "confirmed" | "notSigned" | "unknown" | "failed", signed: boolean | null = null) => ({
+    source: "serverCalendar", date: requestDate, checkedAt: new Date().toISOString(), status, signed,
+  });
+  try {
+    const response = await jmRequest({
+      path: `${Config.baseUrl}/daily`,
+      method: "GET",
+      params: { user_id: uid },
+      cache: false,
+    }, revision);
+    assertCurrentSession(revision);
+    const daily = response?.data ?? response;
+    if (response?.status === false || daily?.status === false ||
+        daily?.ok === false || daily?.success === false ||
+        (response?.code !== undefined && Number(response.code) !== 200) ||
+        (daily?.code !== undefined && Number(daily.code) !== 200) ||
+        !daily?.daily_id || !Array.isArray(daily.record) ||
+        checkinDate() !== requestDate) return result("unknown");
+    const today = requestDate.slice(-2);
+    const cells = daily.record.flatMap((week: unknown) => Array.isArray(week) ? week : [])
+      .filter((cell: any) => cell && String(cell.date).padStart(2, "0") === today);
+    if (cells.length !== 1 || typeof cells[0].signed !== "boolean") return result("unknown");
+    return result(cells[0].signed ? "confirmed" : "notSigned", cells[0].signed);
+  } catch (_) {
+    assertCurrentSession(revision);
+    // Profile data remains usable when only the read-only calendar fails.
+    console.warn("[jm.checkin] calendar unavailable");
+    return result("failed");
+  }
+}
+
+async function refreshCheckin(uid: unknown, revision: number) {
+  const known = await readCheckin(uid, revision);
+  if (known.checkedIn === true || !known.accountId) return known;
+  const verification = await verifyCheckinCalendar(uid, revision);
+  if (verification.status === "confirmed") {
+    await saveSessionValues(revision, { "auth.checkin": {
+      accountId: known.accountId, checkedInDate: verification.date,
+      evidenceSource: "serverCalendar", confirmedAt: verification.checkedAt,
+    } });
+  }
+  return { ...(await readCheckin(uid, revision)), checkinVerification: verification };
+}
+
+// Explicit recheck is read-only even when a current receipt already exists.
+// A failed or conflicting read does not overwrite a previously confirmed receipt.
+async function getCheckinStatus() {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const user = await loadPluginSetting("auth.userInfo", {});
+  assertCurrentSession(revision);
+  const known = await readCheckin(user?.uid, revision);
+  if (!known.accountId) throw await buildUnauthorizedError("请先登录禁漫账号");
+  let verification = await verifyCheckinCalendar(known.accountId, revision);
+  const current = await readCheckin(known.accountId, revision);
+  if (verification.date !== checkinDate()) {
+    verification = { ...verification, status: "unknown", signed: null };
+  }
+  return { source: JM_PLUGIN_ID, data: {
+    ...current, verification,
+    ...(verification.status === "confirmed" ? {
+      checkedIn: true, checkedInDate: verification.date,
+      checkinProof: { source: "serverCalendar", evidenceSource: "serverCalendar", date: verification.date,
+        confirmedAt: verification.checkedAt, verifiedThisRequest: true },
+    } : {}),
+  } };
+}
+
+const pendingCheckins = new Map<number, Promise<boolean>>();
 
 type FetchImageBytesParams = {
   url?: string;
@@ -1348,8 +1443,15 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
   if (!username) {
     throw new Error("未获取到用户信息，请先完成登录或刷新会话");
   }
+  return buildUserInfoBundle(user, await refreshCheckin(user.uid, revision));
+}
+
+function buildUserInfoBundle(user: Record<string, any>, checkin: Record<string, unknown>): UserInfoBundleContract {
+  const username = String(user.username ?? user.nickname ?? "").trim();
   const coin = String(user.coin ?? "").trim();
-  const level = toNum(user.level, 0);
+  const parsedLevel = (typeof user.level === "number" ||
+    typeof user.level === "string" && user.level.trim()) ? Number(user.level) : NaN;
+  const level = Number.isFinite(parsedLevel) && parsedLevel >= 0 ? parsedLevel : null;
   const levelName = String(user.level_name ?? user.levelName ?? "").trim();
   const exp = String(user.exp ?? "").trim();
   const nextLevelExp = String(user.nextLevelExp ?? "").trim();
@@ -1374,10 +1476,12 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
       },
       lines: [
         `${username}${coin ? ` (硬币: ${coin})` : ""}`,
-        `Lv.${level}${levelName ? ` ${levelName}` : ""}`,
+        level !== null ? `Lv.${level}${levelName ? ` ${levelName}` : ""}` : levelName,
         exp || nextLevelExp ? `经验值: ${exp}/${nextLevelExp}` : "",
       ],
       extern: {
+        ...checkin,
+        profileDataSource: "storedSession",
         uid: String(user.uid ?? ""),
         name: username,
         level,
@@ -1388,6 +1492,45 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
       },
     },
   };
+}
+
+// Settings must never enter the profile's legacy automatic-login fallback or
+// trigger network reads. Missing login data is an unavailable account summary.
+async function getSettingsUserInfoBundle() {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const user = await loadPluginSetting("auth.userInfo", {});
+  assertCurrentSession(revision);
+  if (!user || !String(user.username ?? user.nickname ?? "").trim()) {
+    return { source: JM_PLUGIN_ID, data: { available: false, lines: [],
+      extern: { profileDataSource: "storedSession" } } };
+  }
+  const bundle = buildUserInfoBundle(user, await readCheckin(user.uid, revision));
+  return { ...bundle, data: { ...bundle.data, available: true } };
+}
+
+// /useredit contains private edit fields too. Return only these display fields;
+// it does not establish fresh avatar, balance, level or experience information.
+async function getUserProfileDetails() {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const user = await loadPluginSetting("auth.userInfo", {});
+  assertCurrentSession(revision);
+  const accountId = String(user?.uid ?? "").trim();
+  if (!accountId) throw await buildUnauthorizedError("请先登录禁漫账号");
+  const raw = await jmRequest({ path: `${Config.baseUrl}/useredit/${encodeURIComponent(accountId)}`,
+    method: "GET", cache: false, useJwt: true }, revision);
+  assertCurrentSession(revision);
+  const data = raw?.data ?? raw;
+  if (!data || typeof data !== "object" || Array.isArray(data) ||
+      typeof data.nickName !== "string" || typeof data.aboutMe !== "string" ||
+      raw?.status === false || data.status === false || data.ok === false || data.success === false ||
+      (raw?.code !== undefined && Number(raw.code) !== 200) ||
+      (data.code !== undefined && Number(data.code) !== 200)) {
+    throw new JmRequestError("账号资料读取失败，请稍后重试");
+  }
+  return { source: JM_PLUGIN_ID, data: { accountId, nickname: data.nickName,
+    aboutMe: data.aboutMe, profileDataSource: "serverUserEdit", checkedAt: new Date().toISOString() } };
 }
 
 async function getLoginBundle() {
@@ -1669,7 +1812,17 @@ async function resolveFastestBases() {
   return { data };
 }
 
-async function tryJmCheckin(revision = currentSessionRevision()) {
+function tryJmCheckin(revision = currentSessionRevision()) {
+  const pending = pendingCheckins.get(revision);
+  if (pending) return pending;
+  const task = performJmCheckin(revision).finally(() => {
+    if (pendingCheckins.get(revision) === task) pendingCheckins.delete(revision);
+  });
+  pendingCheckins.set(revision, task);
+  return task;
+}
+
+async function performJmCheckin(revision: number) {
   await waitForSessionWrites(revision);
   const stored = await loadPluginSetting("auth.userInfo", {});
   assertCurrentSession(revision);
@@ -1678,6 +1831,9 @@ async function tryJmCheckin(revision = currentSessionRevision()) {
     console.error("无法获取用户UID，跳过签到");
     return false;
   }
+
+  if ((await readCheckin(uid, revision)).checkedIn === true) return true;
+  const requestDate = checkinDate();
 
   try {
     return await retryTransient(async () => {
@@ -1692,7 +1848,7 @@ async function tryJmCheckin(revision = currentSessionRevision()) {
       const list = dailyListRes?.data?.list ?? dailyListRes?.list ?? [];
       if (!Array.isArray(list) || list.length === 0) {
         console.log("今日无签到项");
-        return true;
+        return false;
       }
 
       const lastItem = list[list.length - 1];
@@ -1715,14 +1871,23 @@ async function tryJmCheckin(revision = currentSessionRevision()) {
       msg = await opencc.convert(msg, "t2s.json");
       assertCurrentSession(revision);
 
-      if (msg !== "今天已经签到过了") {
-        try {
-          flutterTools.showToast({
-            message: "禁漫自动签到成功！",
-            level: "success",
-          });
-        } catch (_) {}
+      // Exact endpoint outcomes, never an arbitrary toast or HTTP 200 alone.
+      const outcome = chkRes?.data ?? chkRes;
+      if (chkRes?.status === false || outcome?.status === false ||
+          outcome?.success === false || outcome?.ok === false ||
+          (chkRes?.code !== undefined && Number(chkRes.code) !== 200) ||
+          (outcome?.code !== undefined && Number(outcome.code) !== 200) ||
+          !(["今天已经签到过了", "今天已經簽到過了", "签到成功", "签到成功！"].includes(msg.trim()) ||
+            // Mobile /daily_chk rewards, documented by the upstream client.
+            // Anchor the complete message so an error quoting a reward is refused.
+            /^Jcoin:\d+\s+EXP:\d+$/.test(msg.trim()))) {
+        return false;
       }
+      if (checkinDate() !== requestDate) return false;
+      await saveSessionValues(revision, {
+        "auth.checkin": { accountId: String(uid), checkedInDate: requestDate,
+          evidenceSource: "dailyCheckin", confirmedAt: new Date().toISOString() },
+      });
 
       return true;
     }, () => assertCurrentSession(revision));
@@ -1734,86 +1899,154 @@ async function tryJmCheckin(revision = currentSessionRevision()) {
 }
 
 async function checkInToday() {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
   const user = await loadPluginSetting("auth.userInfo", {});
   if (!user?.uid) {
     throw await buildUnauthorizedError("请先登录禁漫账号");
   }
-  const ok = await tryJmCheckin();
+  assertCurrentSession(revision);
+  const ok = await tryJmCheckin(revision);
+  const checkin = await readCheckin(user.uid, revision);
   return {
     source: JM_PLUGIN_ID,
     data: {
       ok,
+      ...checkin,
       message: ok ? "今日签到已完成" : "签到未完成，请检查线路后重试",
     },
   };
 }
 
 async function getNotifications() {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const user = await loadPluginSetting("auth.userInfo", {});
+  assertCurrentSession(revision);
+  const parsed = await readNotificationList(revision);
+  let unreadSummary: Record<string, unknown>;
+  try {
+    unreadSummary = (await readNotificationUnreadCount(user?.uid, revision)).data;
+  } catch (_) {
+    assertCurrentSession(revision);
+    unreadSummary = { countsKnown: false, error: "unavailable" };
+  }
+  return {
+    source: JM_PLUGIN_ID,
+    data: { accountId: String(user?.uid ?? "").trim() || null, ...parsed, unreadSummary },
+  };
+}
+
+async function readNotificationList(revision: number) {
   const raw = await jmRequest({
     path: `${Config.baseUrl}/notifications`,
     method: "GET",
     cache: false,
     useJwt: true,
-  });
-  const root = toStringMap(raw);
-  const rows = Array.isArray(raw)
-    ? raw
-    : Array.isArray(root.list)
-      ? root.list
-      : Array.isArray(toStringMap(root.data).list)
-        ? toStringMap(root.data).list as unknown[]
-        : [];
-  const items = rows.filter((value: unknown) => {
-    const item = toStringMap(value);
-    return !String(item.content ?? "").includes("/payment?");
-  }).map((value: unknown) => {
-    const item = toStringMap(value);
-    const content = Array.isArray(item.content)
-      ? item.content
-          .map((entry) => {
-            const detail = toStringMap(entry);
-            return String(detail.name ?? detail.title ?? detail.album_name ?? "").trim();
-          })
-          .filter(Boolean)
-          .join("、")
-      : formatNotificationText(item.content);
-    const readValue = item.read;
-    return {
-      id: String(item.id ?? ""),
-      title: String(item.title ?? "通知"),
-      content,
-      time: String(item.date ?? item.time ?? ""),
-      read: readValue === true || readValue === 1 || readValue === "1" || readValue === "true",
-      type: String(item.type ?? ""),
-    };
-  });
-  return {
-    source: JM_PLUGIN_ID,
-    data: { items, total: toNum(root.total, items.length) },
-  };
+  }, revision);
+  assertCurrentSession(revision);
+  return parseJmNotifications(raw);
 }
 
-function formatNotificationText(value: unknown): string {
-  const entities: Record<string, string> = {
-    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-  };
-  return String(value ?? "")
-    .replace(/<br\s*\/?\s*>|<\/p\s*>/gi, "\n")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+);/gi, (match, entity: string) => {
-      const lower = entity.toLowerCase();
-      if (lower.startsWith("#")) {
-        const hex = lower.startsWith("#x");
-        const point = Number.parseInt(lower.slice(hex ? 2 : 1), hex ? 16 : 10);
-        return Number.isFinite(point) && point > 0 && point <= 0x10ffff
-          ? String.fromCodePoint(point)
-          : match;
+async function readNotificationUnreadCount(uid: unknown, revision: number) {
+  const accountId = String(uid ?? "").trim();
+  if (!accountId) throw await buildUnauthorizedError("请先登录禁漫账号");
+  const raw = await jmRequest({ path: `${Config.baseUrl}/notifications/unreadCount`,
+    method: "GET", cache: false, useJwt: true }, revision);
+  assertCurrentSession(revision);
+  const data = raw?.data ?? raw;
+  const valid = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  if (!valid(data?.comic_follow) || !valid(data?.site_notice) ||
+      !Number.isSafeInteger(data.comic_follow + data.site_notice) ||
+      raw?.status === false || data.status === false || data.ok === false || data.success === false ||
+      (raw?.code !== undefined && Number(raw.code) !== 200) ||
+      (data.code !== undefined && Number(data.code) !== 200)) {
+    throw new JmRequestError("未读消息数量读取失败，请稍后重试");
+  }
+  return { source: JM_PLUGIN_ID, data: { accountId,
+    comicFollow: data.comic_follow, siteNotice: data.site_notice,
+    total: data.comic_follow + data.site_notice, countsKnown: true, checkedAt: new Date().toISOString() } };
+}
+
+async function getNotificationUnreadCount() {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const user = await loadPluginSetting("auth.userInfo", {});
+  assertCurrentSession(revision);
+  return await readNotificationUnreadCount(user?.uid, revision);
+}
+
+const pendingNotificationMarks = new Set<number>();
+
+// Only explicit user-selected IDs are touched. There is no API-wide "all"
+// sentinel. Each write is serial, then independently verified by an exact ID
+// read; a successful POST or a failed connection alone proves nothing.
+async function markNotificationsRead(payload: { ids?: unknown; accountId?: unknown } = {}) {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const user = await loadPluginSetting("auth.userInfo", {});
+  assertCurrentSession(revision);
+  const accountId = String(user?.uid ?? "").trim();
+  if (!accountId || payload.accountId !== accountId) throw new JmRequestError("账号已变化，请刷新消息后重试");
+  if (!Array.isArray(payload.ids) || !payload.ids.length ||
+      payload.ids.some((id) => typeof id !== "string" || !id.trim() || id.trim().toLowerCase() === "all")) {
+    throw new JmRequestError("请选择已加载的未读消息");
+  }
+  const ids = [...new Set(payload.ids as string[])];
+  if (pendingNotificationMarks.has(revision)) throw new JmRequestError("消息正在更新，请稍后重试");
+  pendingNotificationMarks.add(revision);
+  try {
+    let latest = await readNotificationList(revision);
+    const confirmedIds: string[] = [];
+    const failedIds: string[] = [];
+    const unknownIds: string[] = [];
+    for (const id of ids) {
+      assertCurrentSession(revision);
+      const matches = latest.items.filter((item) => item.id === id);
+      if (matches.length !== 1 || matches[0]!.read === null) {
+        unknownIds.push(id);
+        continue;
       }
-      return entities[lower] ?? match;
-    })
-    .replace(/[^\S\n]+/g, " ")
-    .replace(/ *\n+ */g, "\n")
-    .trim();
+      if (matches[0]!.read === true) {
+        confirmedIds.push(id);
+        continue;
+      }
+      try {
+        await jmRequest({ path: `${Config.baseUrl}/notifications`, method: "POST",
+          formData: { id, read: "1" }, cache: false, useJwt: true }, revision);
+      } catch (_) {
+        assertCurrentSession(revision);
+        // The server may have received a write even when its response is lost.
+      }
+      assertCurrentSession(revision);
+      try {
+        latest = await readNotificationList(revision);
+        const verified = latest.items.filter((item) => item.id === id);
+        if (verified.length !== 1 || verified[0]!.read === null) unknownIds.push(id);
+        else if (verified[0]!.read === true) confirmedIds.push(id);
+        else failedIds.push(id);
+      } catch (_) {
+        assertCurrentSession(revision);
+        unknownIds.push(id);
+      }
+    }
+    let unreadSummary: Record<string, unknown>;
+    try {
+      unreadSummary = (await readNotificationUnreadCount(accountId, revision)).data;
+    } catch (_) {
+      assertCurrentSession(revision);
+      unreadSummary = { countsKnown: false, error: "unavailable" };
+    }
+    return { source: JM_PLUGIN_ID, data: { accountId, scope: "requestedLoadedItems",
+      ok: confirmedIds.length === ids.length, requestedIds: ids, confirmedIds, failedIds, unknownIds,
+      ...latest, unreadSummary } };
+  } finally {
+    pendingNotificationMarks.delete(revision);
+  }
+}
+
+async function markNotificationRead(payload: { id?: unknown; accountId?: unknown } = {}) {
+  return await markNotificationsRead({ ids: [payload.id], accountId: payload.accountId });
 }
 
 export async function runJmAuthAndCheckInLoop() {
@@ -1883,15 +2116,10 @@ async function getCapabilitiesBundle(): Promise<CapabilitiesBundleContract> {
           title: "测试所有线路速度",
           fnPath: "measureEndpointSpeeds",
         },
-        {
-          key: "clear_session",
-          title: "清理插件会话",
-          fnPath: "clearPluginSession",
-        },
       ],
     },
     data: {
-      actions: ["speedtest", "clear_session"],
+      actions: ["speedtest"],
     },
   };
 }
@@ -2319,26 +2547,50 @@ async function getComicDetail(
 
   const path = `${Config.baseUrl}/album`;
 
-  const response = (await jmRequest({
+  const response = unwrapJmAlbumPayload(await jmRequest({
     path,
     method: "GET",
     params: { id: comicId },
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
-  })) as Record<string, any>;
+  }));
 
+  const responseId = optionalJmCount(response.id);
+  const requestedId = Number(comicId);
+  if (!/^\d+$/.test(comicId) || !Number.isSafeInteger(requestedId) || requestedId <= 0 ||
+      responseId === null || responseId !== requestedId ||
+      typeof response.name !== "string" || !response.name.trim()) {
+    throw new Error("作品详情暂时无法读取，请重试");
+  }
+  const totalViews = optionalJmCount(response.total_views);
+  const totalLikes = optionalJmCount(response.likes);
+  const totalComments = optionalJmCount(response.comment_total);
+  const metricAvailability = {
+    totalViews: totalViews !== null,
+    totalLikes: totalLikes !== null,
+    totalComments: totalComments !== null,
+  };
+  const descriptionKnown = typeof response.description === "string";
+  const tagsKnown = Array.isArray(response.tags) && response.tags.every((tag) => typeof tag === "string");
+  const fieldsMissing = [
+    ...(!descriptionKnown ? ["description"] : []),
+    ...(!tagsKnown ? ["tags"] : []),
+  ];
+  const publicTags = Array.isArray(response.tags)
+    ? response.tags.filter((tag): tag is string => typeof tag === "string")
+    : [];
   const series = normalizeJmSeries(response.series as any[]);
   const normalizedInfo = {
     ...response,
     id: toNum(response.id),
     name: String(response.name ?? ""),
-    description: String(response.description ?? ""),
+    description: descriptionKnown ? response.description as string : "",
     addtime: String(response.addtime ?? "0"),
-    total_views: String(response.total_views ?? "0"),
-    likes: String(response.likes ?? "0"),
-    comment_total: String(response.comment_total ?? "0"),
+    total_views: totalViews === null ? null : String(totalViews),
+    likes: totalLikes === null ? null : String(totalLikes),
+    comment_total: totalComments === null ? null : String(totalComments),
     author: toStrList(response.author),
-    tags: toStrList(response.tags),
+    tags: toStrList(publicTags),
     works: toStrList(response.works),
     actors: toStrList(response.actors),
     related_list: Array.isArray(response.related_list)
@@ -2357,7 +2609,7 @@ async function getComicDetail(
       id: String(normalizedInfo.id),
       title: normalizedInfo.name,
       titleMeta: [
-        createActionItem(`浏览：${toNum(normalizedInfo.total_views)}`),
+        ...(totalViews === null ? [] : [createActionItem(`浏览：${totalViews}`, {}, { metric: "totalViews" })]),
         ...(timestampToIso(normalizedInfo.addtime)
           ? [createActionItem(`更新：${timestampToIso(normalizedInfo.addtime).slice(0, 10)}`)]
           : []),
@@ -2483,16 +2735,16 @@ async function getComicDetail(
         };
       },
     ),
-    totalViews: toNum(normalizedInfo.total_views),
-    totalLikes: toNum(normalizedInfo.likes),
-    totalComments: toNum(normalizedInfo.comment_total),
+    totalViews: totalViews ?? 0,
+    totalLikes: totalLikes ?? 0,
+    totalComments: totalComments ?? 0,
     isFavourite: toBool(normalizedInfo.is_favorite),
     isLiked: toBool(normalizedInfo.liked),
     allowComments: true,
     allowLike: true,
     allowCollected: true,
     allowDownload: true,
-    extern: {},
+    extern: { metricAvailability, fieldsMissing },
   };
 
   const scheme = {
@@ -3724,8 +3976,14 @@ export default {
   getComicDetail,
   getSettingsBundle,
   getUserInfoBundle,
+  getSettingsUserInfoBundle,
+  getUserProfileDetails,
   checkInToday,
+  getCheckinStatus,
   getNotifications,
+  getNotificationUnreadCount,
+  markNotificationRead,
+  markNotificationsRead,
   getLoginBundle,
   loginWithPassword,
   getCapabilitiesBundle,

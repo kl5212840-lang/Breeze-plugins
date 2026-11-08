@@ -1,0 +1,43 @@
+{
+  "name": "魔都资源",
+  "uuid": "b27083a4-a643-462a-8204-e6f42c19a5b9",
+  "version": "0.1.0",
+  "home": "https://github.com/kl5212840-lang/Breeze-plugins",
+  "websiteUrl": "https://www.mdzyapi.com/",
+  "iconUrl": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAIKADAAQAAAABAAAAIAAAAACshmLzAAAFDklEQVRYCe2WS2gdVRjHv5k8mtYQ02ollBKKIAqFIlVc+ciiEbXFoi60VTQFK7pQF8GKhBhEK6VSiaikIKUQFz4LDYRSRFC6iFXaNCKUtoi6kBBsjdcQYm5y5xx/35k5M3Nfyd3rwJ/vvOb8/9/jnBmR//oTNByASStipVsi6QG3gFCM/ColmaB9SXoD0/BeuYWNCZiyzZC9BF6BrAtIDvOIGGXuoDwYTOf2bqi5uoAfbQebHwcPQ6RCBCvOqhBtx4J+we4LS9YExvZKZLcEkW0NIztD+wvaZ4vPtlVFaXUBU1Y9fy/ncZ7UkzsbRDKvpEFkgAgWWMC4se/QPvTP82uXkJw+Ydqq1Ziy3ZC/mnrrQ69+VEArAJJ20Jq06etYMh7ZQeaeqqRZWYCRXRBtct5XEFYKEEOR5gCZ66tN0EwEhq4bnu/Mi6gv4LwNqfp7qokS7zUaiSgX5ozIEZL32KaidL3dTET25gU05ztlbUPBCd7X8xwHdc6F2Mpv2B/AT4B8S3tgZSv2LnAzcGKwIdHo7Tg8d3TuQIfu7EjUlj/n8J4XwWYnIOdtWTEaOSvWHiRSEzaQQrhs9ASEFJ1hXMk6we3gZbAL6NgW0AbhgpJWp+C8Xcf4ATb9PhERh7q8ACGQ02CnfSQch7itqWj2cqSOMzYWWHuM49dHajrAt+Ax8CIoQK7HWgW4pzwFk0xa+YwFO7Dxma+dAjyXPU3FqCCflp4gt0fwuAuLh+zr8i597HMNnKQ/wPqjkF8hgh8iUJ2cVQVZBCZd0emZfwA0p5WfD78XoyJ3BwXev5tcfwTppji/aa415xrum8BzrDmB95wm+zX9fqDc7skEiGxDZT/kccjr20U2ONn0SQkS2Y13evaTIqtjI3sva8aQp4JOwZNe2ZkAI49D3rmaADaYY820u0IpJiWPQ24L2GFQSvqVorZTF0//NbTeKJIA5FJgpMeR+2Lz1keCfny9ShsbtSuJekUUZrXqsV8S5jdo/5ysSyPJXNK2/RsGZ+tcRFqZ6UJeSM65F6WbqLdAye8vPdlCWzSnt1KAW3njBQRoRNZRZH6ts4lYbWsKelibPvkUnEsLT4VoBPI2CzXn3L7WMrrUtfRMqxT3rbnGV+5SWIxU0BAE3czHAtyHiHZmtTDvSNlpZMcwkjEI+0DV8eOleMPM6uXyzZpjiwN8fi9CwEfL7idqjzrRabTSqKk4B+bTO0CFZAIIJ5NfgYf8Jmr9izXsbYydgHQJNNNW71Kh8R5aoLA4xMXKmstK7J8sBfcFi4R9kMUz/iUtJpc/H9IcQY6Mz6878yl5bq5y7A/2Pu3J1WYCtLcjmGTBToRcjGsgzh9F5oToF64KiagGhOr1PXj1yMbflco/5QJ01IiK0F/MQ2AKzLhjpsfQpwQdrp1YFat9CJJw0/djxh3RafZ8m9MxqhT5Z8VfsvDzKAxLRq/ZCxTajblqzipbI1BKch/bCdadYUyP3ALtC9hTVw9vnMkT+/aKAnRRy8fLeq6/Y6NtGn4uoYy8uj1PFPYUBjvHuXBE74M/37rBc9W02SmoOc0gXoD3wQiecESJcwVc+A3/x4YiFjuuW82+uaHejmXj1TVQNi2yzGXD12wUknfBgpJVAkHTeKvkHxReX1+xw8rdVVPgX187sqBCtpOK/eBOcqxfQQrUnsHzkb8Hrq+ZY/9+PduwAL9B+/C8Vrre+Xr+F/m3K/vP9+v+t41G4F+SZd7nf/BxpAAAAABJRU5ErkJggg==",
+  "updateUrl": "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/modu.json",
+  "describe": "分类片库、详情与原生播放，本机收藏与续播。需配套支持视频协议 2 的 Breeze。",
+  "function": [
+    {
+      "id": "library",
+      "title": "片库",
+      "action": {
+        "type": "openVideoLibrary",
+        "payload": {
+          "source": "b27083a4-a643-462a-8204-e6f42c19a5b9",
+          "title": "魔都资源",
+          "url": "https://www.mdzyapi.com/",
+          "protocol": 2,
+          "nativeSearch": true,
+          "capabilities": {
+            "search": "full",
+            "year": true,
+            "recent": true
+          },
+          "catalogFnPath": "getLibrary",
+          "detailFnPath": "getItem",
+          "playbackFnPath": "getSession",
+          "batchDetailFnPath": "getItems"
+        }
+      }
+    }
+  ],
+  "releaseSeries": 1,
+  "npmName": "",
+  "requirements": {
+    "version": 1,
+    "capabilities": {
+      "videoLibraryProtocol": 2
+    }
+  }
+}

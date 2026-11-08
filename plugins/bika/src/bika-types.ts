@@ -4,6 +4,9 @@ export type BikaRequestPayload = {
   body?: unknown;
   cache?: boolean;
   imageQuality?: string;
+  /** Internal authenticated operations pin one authorization identity. */
+  authorization?: string;
+  assertAuthorization?: () => Promise<void>;
 };
 
 export type ComicDetailPayload = {

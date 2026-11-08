@@ -1,0 +1,8 @@
+{
+  "extends": "../bika/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": ["../bika/node_modules/@types"],
+    "paths": { "breeze-plugin-kit": ["../bika/node_modules/breeze-plugin-kit/dist/index.d.ts"] }
+  },
+  "include": ["src/**/*.ts"]
+}

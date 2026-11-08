@@ -1,6 +1,6 @@
 {
   "releaseSeries": 1,
-  "scriptSha256": "447a781fcdaa40e65a44129c1a06c2521801bdc9e3b255a1e664032de37f0a41",
+  "scriptSha256": "5bd867fb172ef009024da54f27d9bb97da15f8021fd21282bfdc533878b067b7",
   "migrationFrom": [
     {
       "version": "0.3.4",
@@ -24,15 +24,15 @@
     }
   ],
   "uuid": "6886291b-f524-441c-844b-c2efae9899a9",
-  "tag_name": "v0.1.1",
-  "name": "禁漫天堂+ v0.1.1",
-  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-v0.1.1",
+  "tag_name": "v0.1.2",
+  "name": "禁漫天堂+ v0.1.2",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.08",
   "assets": [
     {
-      "name": "Jm-v0.1.1.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-v0.1.1/Jm-v0.1.1.cjs",
-      "size": 111719
+      "name": "Jm-v0.1.2.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.08/Jm-v0.1.2.cjs",
+      "size": 122028
     }
   ],
-  "sha256": "447a781fcdaa40e65a44129c1a06c2521801bdc9e3b255a1e664032de37f0a41"
+  "sha256": "880590d7a09cf9c100747bc079b6b58f011491b40723da5a97a16f8b10561c42"
 }

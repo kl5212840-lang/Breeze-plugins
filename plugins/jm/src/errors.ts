@@ -1,3 +1,6 @@
+import { RetryableRequestError } from "../../shared/transient-retry";
+export { isTransientError, retryTransient } from "../../shared/transient-retry";
+
 export function resolveServerMessage(data: unknown, fallback: string): string {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return fallback;
@@ -33,38 +36,9 @@ export function toFriendlyError(err: unknown): Error {
   }
   return new Error(toFriendlyNetworkError(err));
 }
-export class JmRequestError extends Error {
-  constructor(message: string, readonly retryable = false) {
-    super(message);
+export class JmRequestError extends RetryableRequestError {
+  constructor(message: string, retryable = false) {
+    super(message, retryable);
     this.name = "JmRequestError";
-  }
-}
-
-export function isTransientError(error: unknown): boolean {
-  if (error instanceof JmRequestError) return error.retryable;
-  const code = String((error as { code?: unknown } | null)?.code ?? "");
-  return [
-    "ECONNABORTED", "ETIMEDOUT", "ERR_NETWORK",
-    "ECONNRESET", "ENETUNREACH", "EAI_AGAIN",
-  ].includes(code);
-}
-
-export async function retryTransient<T>(
-  operation: () => Promise<T>,
-  assertActive: () => void,
-): Promise<T> {
-  for (let attempt = 0; ; attempt++) {
-    assertActive();
-    try {
-      const result = await operation();
-      assertActive();
-      return result;
-    } catch (error) {
-      assertActive();
-      if (attempt >= 2 || !isTransientError(error)) throw error;
-      await new Promise<void>((resolve) =>
-        setTimeout(resolve, (attempt + 1) * 1000),
-      );
-    }
   }
 }

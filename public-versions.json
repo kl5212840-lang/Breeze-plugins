@@ -1,0 +1,62 @@
+{
+  "repo": "kl5212840-lang/Breeze-plugins",
+  "tag": "plugins-2026.11.08",
+  "plugins": [
+    {
+      "key": "bika-classic",
+      "label": "Bika-classic",
+      "version": "0.1.0",
+      "inputSha256": "ae13a6b081fae1ad25436654f4b03251733d304cb8c0cd80e700b495292fe511",
+      "developmentVersion": "0.1.4"
+    },
+    {
+      "key": "bika",
+      "label": "Bika",
+      "version": "0.1.2",
+      "inputSha256": "a591cf3dba17806a95368fd6b8c38803c43f46363fcdb745da094910a5a722ef",
+      "developmentVersion": "0.1.23"
+    },
+    {
+      "key": "jm",
+      "label": "Jm",
+      "version": "0.1.2",
+      "inputSha256": "a9fc840b2b20567a9e7d0ab0309a5c0671c4ea1996efbf492b6c9f0a4d72fa63",
+      "developmentVersion": "0.3.9"
+    },
+    {
+      "key": "copy",
+      "label": "Copy",
+      "version": "0.1.2",
+      "inputSha256": "13c063d64d8150859c9fec85ac633729f2f0666e41329cf8fe69388fefadc065",
+      "developmentVersion": "0.1.12"
+    },
+    {
+      "key": "hanime",
+      "label": "Hanime1-native",
+      "version": "0.1.1",
+      "inputSha256": "132dee7b5cd9810cfc54ef28948e91b7bdb770173fba553a220cc2d5fcfa5bf7",
+      "developmentVersion": "0.11.5"
+    },
+    {
+      "key": "omofun",
+      "label": "OmoFun-native",
+      "version": "0.1.0",
+      "inputSha256": "b1e67729fff451a3f827d20e071df356649a0f5df4a48f2b0fe9f0b0eab4e61c",
+      "developmentVersion": "0.1.8"
+    },
+    {
+      "key": "ikun",
+      "label": "iKun-native",
+      "version": "0.1.2",
+      "inputSha256": "0bcf66e1949a45fc376c6ca7659af853c8e126708c6b2a9626625e104d8362d6",
+      "developmentVersion": "0.1.4"
+    },
+    {
+      "key": "modu",
+      "label": "Modu-native",
+      "version": "0.1.0",
+      "inputSha256": "569578a67dd8c109e19787d055f238cec524b94fad79872ea77d694467acea86",
+      "developmentVersion": "0.1.2"
+    }
+  ]
+}

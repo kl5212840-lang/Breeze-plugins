@@ -735,3 +735,40 @@ test('a no-op target confirmation cannot copy an older action snapshot back into
   assert.equal(env.document.querySelector('[name="like-status"]').value,'');
   assert.equal(env.document.querySelector('[name="likes-count"]').value,'100');
 });
+
+test('login validation crosses DOM and plugin mapping only as bounded error kinds', () => {
+  const plugin = require('./hanime1-native.cjs');
+  const mapAuth = (env, auth) => {
+    // Catalog parsing requires the actual login-page readiness snapshot as well
+    // as separately-read auth metadata, matching the production host boundary.
+    const snapshot = JSON.parse(env.run(scripts.catalog));
+    assert.equal(snapshot.personalPageReady, true);
+    return plugin.getCatalog({ pageUrl: `${home}/login`, snapshot: { ...snapshot, auth } });
+  };
+  for (const [text, kind] of [
+    ['These credentials do not match our records.', 'credentials'],
+    ['Invalid email or password', 'credentials'],
+    ['Too many login attempts', 'rateLimited'],
+    ['Captcha verification failed', 'verification'],
+    ['Account suspended', 'accountRestricted'],
+    ['Client access restricted', 'clientRestricted'],
+    ['Unrecognized rejection with private diagnostic', 'unknown'],
+  ]) {
+    const env = browser(login + `<div class="alert-danger">${text}</div>`, `${home}/login`);
+    env.document.querySelector('[name=email]').value = 'fixture@example.test';
+    env.document.querySelector('[name=password]').value = 'synthetic-password';
+    const auth = env.run(scripts.authMetadata);
+    assert.equal(auth.failed, true);
+    assert.equal(auth.errorKind, kind);
+    const mapped = mapAuth(env, auth);
+    assert.equal(mapped.data.auth.errorKind, kind);
+    assert.equal(JSON.stringify(mapped).includes(text), false);
+    assert.equal(JSON.stringify(auth).includes('synthetic-password'), false);
+    assert.equal(JSON.stringify(auth).includes('fixture@example.test'), false);
+  }
+  const reflected = browser(login + '<div class="alert-danger">invalid credentials</div>', `${home}/login`);
+  reflected.document.querySelector('[name=password]').value = 'invalid credentials';
+  assert.equal(reflected.run(scripts.authMetadata).errorKind, 'unknown');
+  const mapped = mapAuth(reflected, { failed: true, errorKind: 'private response' });
+  assert.equal(mapped.data.auth.errorKind, 'unknown');
+});

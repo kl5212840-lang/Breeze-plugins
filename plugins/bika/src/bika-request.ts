@@ -1,6 +1,8 @@
 import axios from "axios";
 import type { BikaRequestPayload } from "./bika-types";
-import client, { buildCacheKey, readCache } from "./client";
+import client, { buildCacheKey, readCache, captureBikaLine, assertBikaLine } from "./client";
+import { loadAppChannel } from "./bika-network";
+import { assertBikaImageQuality, loadBikaImageQuality, normalizeBikaImageQuality } from "./bika-image-quality";
 
 function toUpperMethod(method: unknown): string {
   const value = String(method || "GET").trim();
@@ -8,16 +10,23 @@ function toUpperMethod(method: unknown): string {
 }
 
 export async function bikaRequest(payload: BikaRequestPayload = { url: "" }) {
-  const resolvedPayload: BikaRequestPayload = {
-    ...payload,
-  };
+  const line = await captureBikaLine();
+  const imageQuality = payload.imageQuality === undefined
+    ? await loadBikaImageQuality()
+    : normalizeBikaImageQuality(payload.imageQuality);
+  const resolvedPayload: BikaRequestPayload = { ...payload, imageQuality };
   const method = toUpperMethod(resolvedPayload.method);
   const useCache = Boolean(resolvedPayload.cache && method === "GET");
-  const cacheKey = buildCacheKey(resolvedPayload, method);
+  if (method === "GET") await assertBikaImageQuality(imageQuality);
+  // One immutable channel snapshot feeds both the cache and the wire request.
+  const channel = await loadAppChannel();
+  const cacheKey = buildCacheKey(resolvedPayload, method, channel);
 
   if (useCache) {
     const cachedData = await readCache(cacheKey);
     if (cachedData !== undefined) {
+      await assertBikaLine(line);
+      await assertBikaImageQuality(imageQuality);
       return cachedData;
     }
   }
@@ -25,9 +34,13 @@ export async function bikaRequest(payload: BikaRequestPayload = { url: "" }) {
   const requestConfig: Record<string, unknown> = {
     url: resolvedPayload.url,
     method,
-    __bikaPayload: resolvedPayload,
+    __bikaChannel: channel,
+    __bikaImageQuality: imageQuality,
+    __bikaLine: line,
     __useCache: useCache,
     __cacheKey: cacheKey,
+    ...(resolvedPayload.authorization !== undefined ? { __bikaAuthorization: resolvedPayload.authorization } : {}),
+    ...(resolvedPayload.assertAuthorization ? { __bikaAssertAuthorization: resolvedPayload.assertAuthorization } : {}),
   };
 
   if (method !== "GET" && method !== "HEAD") {
@@ -38,6 +51,8 @@ export async function bikaRequest(payload: BikaRequestPayload = { url: "" }) {
   }
 
   const response = await client.request(requestConfig);
+  await assertBikaLine(line);
+  if (method === "GET") await assertBikaImageQuality(imageQuality);
   return response.data;
 }
 
@@ -68,8 +83,10 @@ export async function fetchImageBytes({
     // Some category art exists on Picacomic's image CDN but returns 404 on
     // the original-quality storage mirror. Do not retry unrelated hosts.
     const status = axios.isAxiosError(error) ? error.response?.status : null;
-    if ((status === 404 || status === 422) &&
-        ["s3.picacomic.com", "storage.diwodiwo.xyz"].includes(host)) {
+    if (
+      (status === 404 || status === 422) &&
+      ["s3.picacomic.com", "storage.diwodiwo.xyz"].includes(host)
+    ) {
       const fallback = new URL(targetUrl);
       fallback.host = "img.picacomic.com";
       return requestImage(fallback.toString());
