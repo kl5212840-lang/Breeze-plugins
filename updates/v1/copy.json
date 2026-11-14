@@ -1,6 +1,6 @@
 {
   "releaseSeries": 1,
-  "scriptSha256": "a9e4e0de92b433739ad5721e2ab8ce115a2dd944c2c8de5a480848e00750d5aa",
+  "scriptSha256": "3457bb3c03c5c32c36db7198b4738638ceb0da67a830b53e1ed83febd0ce8375",
   "migrationFrom": [
     {
       "version": "0.1.1",
@@ -12,15 +12,15 @@
     }
   ],
   "uuid": "b28da416-f2d4-4208-a85e-8b4c7c648e48",
-  "tag_name": "v0.1.2",
-  "name": "拷贝漫画 v0.1.2",
-  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.08",
+  "tag_name": "v0.2.0",
+  "name": "拷贝漫画 v0.2.0",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.14",
   "assets": [
     {
-      "name": "Copy-v0.1.2.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.08/Copy-v0.1.2.cjs",
-      "size": 89378
+      "name": "Copy-v0.2.0.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.14/Copy-v0.2.0.cjs",
+      "size": 110692
     }
   ],
-  "sha256": "73ba38770c848fb4c66645abd0e265da0817f6b96cd80a5d61a4d5fe8e56b1f6"
+  "sha256": "5e2209261fcd1764782ebdb388cd39ed1397b924988650b085172d05a46a226f"
 }

@@ -1,6 +1,6 @@
 {
   "releaseSeries": 1,
-  "scriptSha256": "d28825f8f6e6ba503cc446e837292fb4684b818d63694f3e18e76df92111a413",
+  "scriptSha256": "47ab5eda041db37eeeff6d8fb6f1750bb8aff417a735f44a105e333c686f8bd4",
   "migrationFrom": [
     {
       "version": "0.1.11",
@@ -48,15 +48,15 @@
     }
   ],
   "uuid": "e9f18928-3ba8-4d86-a12e-b53a62f47933",
-  "tag_name": "v0.1.2",
-  "name": "哔咔漫画+ v0.1.2",
-  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.08",
+  "tag_name": "v0.2.0",
+  "name": "哔咔漫画+ v0.2.0",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.14",
   "assets": [
     {
-      "name": "Bika-v0.1.2.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.08/Bika-v0.1.2.cjs",
-      "size": 104918
+      "name": "Bika-v0.2.0.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.14/Bika-v0.2.0.cjs",
+      "size": 115089
     }
   ],
-  "sha256": "55bd5a6b71e522e7760da38f2b4969c9f74c1906c387687dcf2cf2a18218be9e"
+  "sha256": "32f9d3471eecfc0234695ce72eeae67d75b416dd678369c75c97df74aae470af"
 }
