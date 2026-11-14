@@ -462,7 +462,7 @@ test('public profile preserves actual uploaded and playlists navigation without 
   assert.equal(data.account.links.some(link=>new URL(link.url).pathname.startsWith('/user/101')),false);
 });
 
-test('detail keeps full episode titles and recommendation wrappers without mixing their order', () => {
+test('detail keeps an unbound site playlist separate from episodes and recommendations', () => {
   const fullTitle = 'Series with a long title Episode 12';
   const env = documentFor(`<meta property="og:title" content="Current"><div id="playlist-scroll">
     <div class="playlist-hover-wrap"><a href="/watch?v=30"><img alt="Short"></a><span class="title" title="${fullTitle}">Series…</span></div>
@@ -470,8 +470,10 @@ test('detail keeps full episode titles and recommendation wrappers without mixin
     </div><div id="related-tabcontent"><a href="/watch?v=88"><div class="related-video-margin-bottom"><img src="/related.jpg"></div><div class="home-rows-videos-title">Related full title</div></a></div>`, 'https://hanime1.me/watch?v=30');
   const snapshot = JSON.parse(env.run(scripts.detail));
   const detail = getVideoDetail({watchUrl:'https://hanime1.me/watch?v=30',snapshot}).data;
-  assert.deepEqual(detail.episodes.map(card=>card.title), [fullTitle,'Series OVA']);
-  assert.deepEqual(detail.episodes.map(card=>card.id), ['30','2']);
+  assert.equal(detail.sequenceKind, 'sitePlaylist');
+  assert.deepEqual(detail.episodes, detail.playlist);
+  assert.deepEqual(detail.playlist.map(card=>card.title), [fullTitle,'Series OVA']);
+  assert.deepEqual(detail.playlist.map(card=>card.id), ['30','2']);
   assert.equal(detail.related[0].title, 'Related full title');
   assert.equal(detail.related[0].id, '88');
 });

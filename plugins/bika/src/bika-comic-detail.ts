@@ -18,7 +18,7 @@ import { buildBikaImageUrl } from "./bika-image";
 import { assertBikaImageQuality, loadBikaImageQuality } from "./bika-image-quality";
 import { bikaRequest } from "./bika-request";
 import type { BikaChapterPayload, BikaReadSnapshotPayload, ComicDetailPayload } from "./bika-types";
-import { toBool, toNum, toStringMap } from "./bika-utils";
+import { bikaCount, bikaLikesCount, toBool, toNum, toStringMap } from "./bika-utils";
 import { getApiBase } from "./client";
 import { BIKA_PLUGIN_ID } from "./info";
 import { loadPluginSetting } from "./plugin-config";
@@ -38,13 +38,20 @@ export async function getComicDetail(
   })) as StringMap;
 
   const comic: StringMap = toStringMap(toStringMap(infoResponse.data).comic);
+  const totalViews = bikaCount(comic.totalViews) ?? bikaCount(comic.viewsCount);
+  const totalLikes = bikaLikesCount(comic);
+  const totalComments = bikaCount(comic.totalComments) ?? bikaCount(comic.commentsCount);
+  const epsCount = bikaCount(comic.epsCount);
+  const pagesCount = bikaCount(comic.pagesCount);
+  const updatedAt = typeof comic.updated_at === "string" && Number.isFinite(Date.parse(comic.updated_at))
+    ? comic.updated_at : null;
   ensureBikaComicShape(comic as Record<string, unknown>);
 
-  const epsCount = toNum(comic.epsCount, 0);
   const firstEpsResponse = await bikaRequest({
     url: `${apiBase}comics/${comicId}/eps?page=1`,
     method: "GET",
     cache: true,
+    cacheArray: ["eps", "docs"],
   });
   const firstEps = toStringMap(toStringMap(toStringMap(firstEpsResponse).data).eps);
   const pageValue = firstEps.pages;
@@ -57,13 +64,14 @@ export async function getComicDetail(
   const totalPages =
     Number.isSafeInteger(reportedPages) && reportedPages >= 0
       ? Math.max(1, reportedPages)
-      : Math.max(1, Math.ceil(epsCount / 40));
+      : Math.max(1, Math.ceil(toNum(comic.epsCount) / 40));
   const remainingEpsResponses = await Promise.all(
     Array.from({ length: totalPages - 1 }, (_, index) =>
       bikaRequest({
         url: `${apiBase}comics/${comicId}/eps?page=${index + 2}`,
         method: "GET",
         cache: true,
+        cacheArray: ["eps", "docs"],
       }),
     ),
   );
@@ -80,6 +88,7 @@ export async function getComicDetail(
       url: `${apiBase}comics/${comicId}/recommendation`,
       method: "GET",
       cache: true,
+      cacheArray: ["comics"],
     })) as StringMap;
   } catch {
     // Recommendations are optional. Essential detail/chapter failures above
@@ -127,12 +136,10 @@ export async function getComicDetail(
       id: String(comic._id ?? comicId),
       title: String(comic.title ?? ""),
       titleMeta: [
-        createActionItem(`浏览：${toNum(comic.totalViews)}`),
-        createActionItem(`更新时间：${String(comic.updated_at ?? new Date().toISOString())}`),
-        ...(toNum(comic.pagesCount) > 0
-          ? [createActionItem(`页数：${toNum(comic.pagesCount)}`)]
-          : []),
-        createActionItem(`章节数：${toNum(comic.epsCount)}`),
+        ...(totalViews === null ? [] : [createActionItem(`浏览：${totalViews}`, null, { metric: "totalViews" })]),
+        ...(updatedAt === null ? [] : [createActionItem(`更新时间：${updatedAt}`)]),
+        ...(pagesCount === null ? [] : [createActionItem(`页数：${pagesCount}`)]),
+        ...(epsCount === null ? [] : [createActionItem(`章节数：${epsCount}`)]),
       ],
       creator: {
         id: "",
@@ -160,10 +167,14 @@ export async function getComicDetail(
       }),
       metadata: [
         createMetadataActionList("author", "作者", comic.author, (item) =>
-          createActionItem(item, openSearchAction({ source: BIKA_PLUGIN_ID, keyword: item })),
+          createActionItem(item, openSearchAction({
+            source: BIKA_PLUGIN_ID, keyword: item, extern: { bikaSearchField: "author" },
+          })),
         ),
         createMetadataActionList("chineseTeam", "汉化组", comic.chineseTeam, (item) =>
-          createActionItem(item, openSearchAction({ source: BIKA_PLUGIN_ID, keyword: item })),
+          createActionItem(item, openSearchAction({
+            source: BIKA_PLUGIN_ID, keyword: item, extern: { bikaSearchField: "team" },
+          })),
         ),
         createMetadataActionList("categories", "分类", comic.categories, (item) =>
           createActionItem(
@@ -175,7 +186,9 @@ export async function getComicDetail(
           ),
         ),
         createMetadataActionList("tags", "标签", comic.tags, (item) =>
-          createActionItem(item, openSearchAction({ source: BIKA_PLUGIN_ID, keyword: item })),
+          createActionItem(item, openSearchAction({
+            source: BIKA_PLUGIN_ID, keyword: item, extern: { bikaSearchField: "tag" },
+          })),
         ),
       ].filter((item): item is NonNullable<typeof item> => item != null),
       extern: {} as StringMap,
@@ -190,16 +203,22 @@ export async function getComicDetail(
       extern: {} as StringMap,
     })),
     recommend: recommendItems,
-    totalViews: toNum(comic.totalViews),
-    totalLikes: toNum(comic.totalLikes),
-    totalComments: toNum(comic.totalComments),
+    totalViews: totalViews ?? 0,
+    totalLikes: totalLikes ?? 0,
+    totalComments: totalComments ?? 0,
     isFavourite: toBool(comic.isFavourite),
     isLiked: toBool(comic.isLiked),
     allowComments: toBool(comic.allowComment, false),
     allowLike: true,
     allowCollected: true,
     allowDownload: true,
-    extern: {} as StringMap,
+    extern: {
+      metricAvailability: {
+        totalViews: totalViews !== null,
+        totalLikes: totalLikes !== null,
+        totalComments: totalComments !== null,
+      },
+    },
   };
 
   return {
@@ -248,6 +267,7 @@ export async function getChapter(
       url: `${apiBase}comics/${comicId}/order/${chapterId}/pages?page=${page}`,
       method: "GET",
       cache: true,
+      cacheArray: ["pages", "docs"],
       imageQuality,
     })) as StringMap;
     const data = toStringMap(result.data);

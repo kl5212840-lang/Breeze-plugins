@@ -10,6 +10,7 @@ import type {
   PluginAction,
   StringMap,
 } from "breeze-plugin-kit";
+import { BASES } from "./bika-access-line-policy";
 import { bikaVideoEntry } from "./bika-video";
 import { buildBikaImageUrl } from "./bika-image";
 import type { RankingFilterOption } from "./bika-types";
@@ -216,6 +217,34 @@ export function ensureBikaComicShape(comic: Record<string, any>) {
   comic.thumb.fileServer ??= "";
   comic.thumb.path ??= "";
   comic.thumb.originalName ??= "";
+}
+
+export function bikaSearchOverride(raw: unknown, apiBase: string): URL | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  try {
+    const url = new URL(raw);
+    const knownOrigin = [apiBase, ...BASES].some(base => new URL(base).origin === url.origin);
+    if (!knownOrigin || url.username || url.password || url.hash ||
+        !["/comics", "/comics/random"].includes(url.pathname)) return null;
+    // Retain the entry's resource and qualifiers while following the active line.
+    return new URL(url.pathname + url.search, apiBase);
+  } catch {
+    return null;
+  }
+}
+
+export function bikaSearchSortBy(value: unknown, fallback = 1): number {
+  const index = ["dd", "da", "ld", "vd"].indexOf(String(value ?? ""));
+  return index < 0 ? fallback : index + 1;
+}
+
+export function bikaSearchFieldParameter(field: unknown): "a" | "t" | "ct" | null {
+  switch (field) {
+    case "author": return "a";
+    case "tag": return "t";
+    case "team": return "ct";
+    default: return null;
+  }
 }
 
 export function toSortKeyword(sortBy: unknown): string {

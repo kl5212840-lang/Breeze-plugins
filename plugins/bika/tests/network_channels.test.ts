@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import * as nodeCrypto from "node:crypto";
 import { after, beforeEach, test } from "node:test";
-import type { AxiosAdapter } from "axios";
+import axios, { AxiosError, type AxiosAdapter } from "axios";
 import client, { BACKUP_API_BASE, DEFAULT_API_BASE } from "../src/client";
-import { bikaRequest } from "../src/bika-request";
+import { bikaRequest, fetchImageBytes } from "../src/bika-request";
+import { getFunctionPage } from "../src/bika-comic-library";
 import { getCapabilitiesBundle, getSettingsBundle, saveSettings } from "../src/bika-settings";
 import { buildBikaImageUrl } from "../src/bika-image";
 import { normalizeAppChannel } from "../src/bika-network";
@@ -12,12 +13,17 @@ const config = new Map<string, unknown>();
 const cache = new Map<string, unknown>();
 const writes: string[] = [];
 const requests: { url: string; channel: string }[] = [];
+let responseBody: unknown;
+let brokenResponseCache = false;
 Object.assign(globalThis, {
   nodeCryptoCompat: nodeCrypto,
   uuidv4: nodeCrypto.randomUUID,
   bridge: {
     async call(name: string, ...args: unknown[]) {
       const key = String(args[0]);
+      if (brokenResponseCache && name.startsWith("cache.")) {
+        throw new Error("fixture: optional cache is unavailable");
+      }
       switch (name) {
         case "load_plugin_config":
           return {
@@ -48,7 +54,7 @@ const originalAdapter = client.defaults.adapter;
 const adapter: AxiosAdapter = async (request) => {
   requests.push({ url: String(request.url), channel: String(request.headers.get("app-channel")) });
   return {
-    data: { code: 200, request: requests.length },
+    data: responseBody ?? { code: 200, request: requests.length },
     status: 200,
     statusText: "OK",
     headers: {},
@@ -60,6 +66,8 @@ beforeEach(() => {
   cache.clear();
   writes.length = 0;
   requests.length = 0;
+  responseBody = undefined;
+  brokenResponseCache = false;
   client.defaults.adapter = adapter;
 });
 after(() => {
@@ -160,6 +168,56 @@ test("request cache is isolated by actual origin and channel without deleting ol
   assert.equal(requests.length, 3);
 });
 
+test("manual refresh replaces the current account's cache without sharing it with another account", async () => {
+  const load = (refresh = false) => bikaRequest({
+    url: `${DEFAULT_API_BASE}categories`,
+    cache: true,
+    refresh,
+  });
+  config.set("auth.authorization", "fixture-first-session");
+  const first = await load();
+  assert.deepEqual(await load(), first);
+  assert.equal(requests.length, 1);
+  const refreshed = await load(true);
+  assert.notDeepEqual(refreshed, first);
+  assert.deepEqual(await load(), refreshed);
+  assert.equal(requests.length, 2);
+
+  config.set("auth.authorization", "fixture-second-session");
+  const second = await load();
+  assert.notDeepEqual(second, refreshed);
+  assert.equal(requests.length, 3);
+  config.delete("auth.authorization");
+  assert.notDeepEqual(await load(), second);
+  assert.equal(requests.length, 4);
+});
+
+test("a broken 200 response cannot overwrite the last valid hot-search list", async () => {
+  const read = (refresh = false) => getFunctionPage({ id: "hotSearch", refresh });
+  responseBody = { code: 200, data: { keywords: ["fixture"] } };
+  const expected = await read();
+  assert.equal(requests.length, 1);
+  for (const invalid of [
+    { code: 200, data: { keywords: {} } },
+    { code: 503, data: { keywords: [] } },
+  ]) {
+    responseBody = invalid;
+    await assert.rejects(read(true), /哔咔/);
+    assert.deepEqual(await read(), expected);
+  }
+  assert.equal(requests.length, 3);
+  responseBody = { code: 200, data: { keywords: [] } };
+  assert.notDeepEqual(await read(true), expected);
+});
+
+test("failed cache IO does not turn a valid network response into a failed page", async () => {
+  responseBody = { code: 200, data: { keywords: ["fixture"] } };
+  brokenResponseCache = true;
+  const result = await getFunctionPage({ id: "hotSearch" });
+  assert.equal((result.data.items as unknown[]).length, 1);
+  assert.equal(requests.length, 1);
+});
+
 // Capability discovery must be a pure read, not a maintenance reset shortcut.
 test("ordinary settings expose no account-clearing maintenance command", async () => {
   config.set("auth.account", "synthetic-account");
@@ -171,4 +229,79 @@ test("ordinary settings expose no account-clearing maintenance command", async (
   assert.deepEqual(requests, []);
   assert.equal(config.get("auth.account"), "synthetic-account");
   assert.equal(config.get("auth.password"), "synthetic-password");
+});
+
+const publicCoverPath = "/static/01234567-abcd-4abc-9def-1234567890ab.jpg";
+const coverMirror = `https://storage-b.diwodiwo.xyz${publicCoverPath}`;
+const fixtureJpeg = Uint8Array.of(0xff, 0xd8, 0xff, 0xe0, 0xff, 0xd9);
+function signedCover(source = `https://storage-b.picacomic.com${publicCoverPath}`, signature = "a".repeat(43)) {
+  const encoded = Buffer.from(source).toString("base64url");
+  return `https://img.picacomic.com/${signature}/rs:fill:300:400:0/g:sm/${encoded}.jpg`;
+}
+
+test("a timed-out signed cover uses the exact trusted mirror once within the caller budget", async (t) => {
+  const original = axios.defaults.adapter;
+  t.after(() => { axios.defaults.adapter = original; });
+  const target = signedCover();
+  const attempts: string[] = [];
+  axios.defaults.adapter = async (request) => {
+    attempts.push(String(request.url));
+    assert.equal(request.headers.has("Authorization"), false);
+    assert.equal(request.headers.has("Cookie"), false);
+    if (request.url === target) {
+      assert.equal(request.timeout, 1000);
+      throw new AxiosError("fixture timeout", "ECONNABORTED", request);
+    }
+    assert.equal(request.url, coverMirror);
+    assert.ok(request.timeout! > 0 && request.timeout! <= 2000);
+    assert.equal(request.withCredentials, false);
+    assert.equal(request.maxRedirects, 0);
+    return { data: fixtureJpeg, status: 200, statusText: "OK", headers: {}, config: request };
+  };
+  assert.deepEqual(await fetchImageBytes({ url: target, timeoutMs: 2000 }), fixtureJpeg);
+  assert.deepEqual(attempts, [target, coverMirror]);
+  assert.deepEqual(writes, []);
+});
+
+test("a successful signed cover never requests its mirror", async (t) => {
+  const original = axios.defaults.adapter;
+  t.after(() => { axios.defaults.adapter = original; });
+  const target = signedCover();
+  const attempts: string[] = [];
+  axios.defaults.adapter = async (request) => {
+    attempts.push(String(request.url));
+    return { data: fixtureJpeg, status: 200, statusText: "OK", headers: {}, config: request };
+  };
+  assert.deepEqual(await fetchImageBytes({ url: target }), fixtureJpeg);
+  assert.deepEqual(attempts, [target]);
+});
+
+test("unsafe image targets never redirect to a fallback and broken mirror data never succeeds", async (t) => {
+  const original = axios.defaults.adapter;
+  t.after(() => { axios.defaults.adapter = original; });
+  const attempts: string[] = [];
+  axios.defaults.adapter = async (request) => {
+    attempts.push(String(request.url));
+    if (request.url === coverMirror) {
+      const brokenJpeg = Uint8Array.of(0xff, 0xd8, 0xff);
+      return { data: brokenJpeg, status: 200, statusText: "OK", headers: {}, config: request };
+    }
+    return { data: new Uint8Array(0), status: 404, statusText: "Not Found", headers: {}, config: request };
+  };
+  for (const target of [
+    signedCover(`https://unrelated.example${publicCoverPath}`),
+    signedCover(`https://user:password@storage-b.picacomic.com${publicCoverPath}`),
+    signedCover(`https://storage-b.picacomic.com${publicCoverPath}?key=fixture`),
+    signedCover(undefined, "invalid-signature"),
+    `https://storage-b.picacomic.com${publicCoverPath}`,
+  ]) {
+    attempts.length = 0;
+    await assert.rejects(fetchImageBytes({ url: target }), /404/);
+    assert.deepEqual(attempts, [target]);
+  }
+  attempts.length = 0;
+  const target = signedCover();
+  await assert.rejects(fetchImageBytes({ url: target }), /404/);
+  assert.deepEqual(attempts, [target, coverMirror]);
+  assert.deepEqual(writes, []);
 });

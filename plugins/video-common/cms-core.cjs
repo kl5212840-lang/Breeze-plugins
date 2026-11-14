@@ -16,6 +16,10 @@ function integer(value, fallback = 0) {
   const result = Number(value);
   return Number.isSafeInteger(result) && result >= 0 ? result : fallback;
 }
+function metricInteger(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !/^\d+$/.test(value))) return null;
+  return integer(value, null);
+}
 function credit(value, limit) {
   const result=text(value,limit);
   return ['', '暂无','未知','不详','内详','N/A'].includes(result) ? '' : result;
@@ -79,6 +83,20 @@ function normalize(raw, detail = false) {
   const id = itemId(raw.vod_id), title = text(raw.vod_name);
   if (!title) throw new Error('影片缺少名称');
   const score = Number(raw.vod_score), scoreCount = integer(raw.vod_score_num);
+  const validScore = Number.isFinite(score) && score > 0 && score <= 10 && scoreCount > 0;
+  const scoreSum = metricInteger(raw.vod_score_all);
+  // MacCMS publishes its average to one decimal. Keep the source's average,
+  // but do not present a contradictory vote count as its denominator.
+  const ratingCountConsistent = !validScore || scoreSum === null ||
+    Math.abs(score - scoreSum / scoreCount) <= 0.05 + Number.EPSILON * 10;
+  const clickTime = metricInteger(raw.vod_time_hits);
+  const totalClicks = metricInteger(raw.vod_hits);
+  const periods = Object.fromEntries(['day','week','month']
+    .map(key=>[key,metricInteger(raw['vod_hits_'+key])])
+    .filter(([, count])=>count !== null));
+  // Rows without any measured window often contain all three defaults.
+  const uninitializedPeriods = !clickTime && Object.keys(periods).length === 3 &&
+    Object.values(periods).every(count=>count === 0);
   return {
     id, title, detailUrl: new URL(config.detailPath(id), HOME).href,
     coverUrl: https(raw.vod_pic) || https(raw.vod_pic_thumb), description: text(raw.vod_content || raw.vod_blurb, detail ? 20000 : 1500),
@@ -93,16 +111,15 @@ function normalize(raw, detail = false) {
       ? Number(raw.vod_douban_score) : null,
     updatedAt: text(raw.vod_time, 80), releaseDate: text(raw.vod_pubdate, 80),
     plannedEpisodes: integer(raw.vod_total), finished: String(raw.vod_isend) === '1',
-    // These are the resource site's own counters, not player/user actions.
-    sourceViews: integer(raw.vod_hits) > 0 ? integer(raw.vod_hits) : null,
-    sourceCounters: Object.fromEntries(['day','week','month'].filter(key=>
-      Object.hasOwn(raw,'vod_hits_'+key) && /^\d+$/.test(String(raw['vod_hits_'+key])))
-      .map(key=>[key,integer(raw['vod_hits_'+key])])),
+    sourceViews: totalClicks === 0 && !clickTime ? null : totalClicks,
+    sourceViewsKind: 'clicks',
+    sourceCounters: uninitializedPeriods ? {} : periods,
     sourceDuration: credit(raw.vod_duration,200).replace(/^0(?:\.0+)?$/,''),
     sourceVersion: credit(raw.vod_version,100),
     sourceAddedAt: /^0+$/.test(String(raw.vod_time_add))?'':text(raw.vod_time_add,80), sourceStatus: credit(raw.vod_state,200),
-    sourceRating: Number.isFinite(score) && score > 0 && score <= 10 && scoreCount > 0 ? score : null,
+    sourceRating: validScore ? score : null,
     sourceRatingCount: scoreCount > 0 ? scoreCount : null,
+    ...(ratingCountConsistent ? {} : {sourceRatingCountConsistent: false}),
     ...(detail ? {lines: lines(raw, id)} : {}),
   };
 }

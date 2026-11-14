@@ -9,6 +9,8 @@ export type BikaPluginInfo = InfoContract & {
   breezeExperience: {
     aggregateMedia: string;
     searchHotFunction: string;
+    comicFollow: 1;
+    publicSearchFields: 1;
     profileTab: boolean;
     bikaExperience: {
       version: number;
@@ -85,7 +87,7 @@ export function buildManifestInfo(): BikaPluginInfo {
     iconUrl:
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
     describe: "独立更新的哔咔漫画插件",
-    version: "0.1.23",
+    version: "0.1.32",
     updateUrl:
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/bika.json",
     home: "https://github.com/kl5212840-lang/Breeze-plugin-bika-personal",
@@ -94,6 +96,8 @@ export function buildManifestInfo(): BikaPluginInfo {
     breezeExperience: {
       aggregateMedia: "comic",
       searchHotFunction: "hotSearch",
+      comicFollow: 1,
+      publicSearchFields: 1,
       profileTab: true,
       bikaExperience: {
         version: 1,

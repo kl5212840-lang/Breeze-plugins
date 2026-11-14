@@ -21,6 +21,7 @@ function deferred() {
 }
 function fixture(
   gate: (name: string, key: string, value: unknown) => Promise<void> = async () => {},
+  respond: (request: Request) => unknown = () => profile,
 ) {
   const settings = new Map<string, unknown>(),
     cache = new Map<string, unknown>();
@@ -50,7 +51,7 @@ function fixture(
     async fetch(input: Request | string, init?: RequestInit) {
       const request = input instanceof Request ? input : new Request(input, init);
       requests.push(new URL(request.url).pathname);
-      return new Response(JSON.stringify(profile), {
+      return new Response(JSON.stringify(respond(request)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -100,6 +101,32 @@ test("the actual compiled JM login and clearing use only the synthetic network a
   assert.equal(f.settings.get("auth.jwt"), profile.jwttoken, JSON.stringify(result));
   await f.plugin.clearPluginSession();
   assert.equal(f.settings.get("auth.jwt"), "");
+});
+
+test("compiled JM profile verification uses the configured origin without password, redirects or session writes", async () => {
+  const expectedPath = `/useredit/${profile.uid}`;
+  const f = fixture(async (name, key) => {
+    assert.notEqual(key, "auth.password");
+    assert.notEqual(key, "auth.account");
+    assert.notEqual(name, "save_plugin_config");
+  }, (request) => {
+    const url = new URL(request.url);
+    assert.equal(url.origin, "https://www.cdnhjk.net");
+    assert.equal(url.pathname, expectedPath);
+    assert.equal(request.method, "GET");
+    assert.equal(request.headers.get("authorization"), "Bearer fixture-token");
+    assert.equal(request.headers.get("cookie"), null);
+    assert.equal(request.credentials, "omit");
+    assert.equal(request.redirect, "error");
+    return { nickName: "Fixture", aboutMe: "", jwttoken: "unexpected-fixture-token" };
+  });
+  f.settings.set("auth.userInfo", profile);
+  f.settings.set("auth.jwt", profile.jwttoken);
+  const verification = await f.plugin.getUserProfileDetails();
+  assert.equal(verification.data.accountId, profile.uid);
+  assert.deepEqual(f.requests, [expectedPath]);
+  assert.equal(f.settings.get("auth.jwt"), profile.jwttoken);
+  assert.equal(f.cache.has("JmComic::jwt"), false);
 });
 
 test("compiled JM cannot release clearing after one write rejects while its persisted JWT write still runs", async () => {

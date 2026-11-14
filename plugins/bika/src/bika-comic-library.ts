@@ -1,3 +1,4 @@
+import { buildUnauthorizedError } from "breeze-plugin-kit";
 import type {
   FunctionPageContract,
   ListFavoriteFoldersResult,
@@ -7,10 +8,18 @@ import type {
   ToggleLikeResult,
 } from "breeze-plugin-kit";
 import {
+  assertBikaAuthRevision,
+  BikaAccountChangedError,
+  currentBikaAuthRevision,
+  waitBikaSessionWrites,
+} from "./bika-auth-session";
+import {
+  bikaSearchFieldParameter,
+  bikaSearchOverride,
+  bikaSearchSortBy,
   boolKeyList,
   buildHomeAction,
   loadBlockedCategories,
-  saveBlockedCategories,
   toActionItem,
   toBoolMap,
   toComicListItem,
@@ -20,6 +29,7 @@ import {
 import { buildBikaImageUrl } from "./bika-image";
 import { resolveBikaCategoryArtwork } from "./bika-category-art";
 import { isBikaNativeVideoShortcut } from "./bika-navigation";
+import { loadAppChannel } from "./bika-network";
 import { bikaRequest } from "./bika-request";
 import type {
   BikaFavoriteFolderPayload,
@@ -29,8 +39,8 @@ import type {
   BikaSearchPayload,
   BikaToggleFavoritePayload,
 } from "./bika-types";
-import { resolveSceneFnPath, toNum, toStrList, toStringMap } from "./bika-utils";
-import { getApiBase } from "./client";
+import { bikaCount, bikaLikesCount, resolveSceneFnPath, toBool, toNum, toStrList, toStringMap } from "./bika-utils";
+import { captureBikaLine, getApiBase } from "./client";
 import { BIKA_PLUGIN_ID } from "./info";
 import { loadPluginSetting } from "./plugin-config";
 
@@ -39,49 +49,42 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
   const payloadMap = toStringMap(payload);
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, toNum(payload.page, 1));
-  const sort =
-    String(
-      extern.sort ?? payloadMap.sort ?? toSortKeyword(extern.sortBy ?? payloadMap.sortBy),
-    ).trim() || "dd";
   const keyword = String(payload.keyword ?? extern.keyword ?? "").trim();
+  const field = bikaSearchFieldParameter(extern.bikaSearchField);
+  if (extern.bikaSearchField != null && (!field || !keyword)) {
+    throw new Error("搜索范围或关键词无效");
+  }
   const mode = String(extern.mode ?? payloadMap.mode ?? "").trim();
   const creatorId = String(extern.creatorId ?? payloadMap.creatorId ?? "").trim();
   const categories = boolKeyList(extern.categories ?? payloadMap.categories);
-  const blockedCategories = boolKeyList(extern.blockedCategories ?? payloadMap.blockedCategories);
-  if (blockedCategories.length || extern.blockedCategories || payloadMap.blockedCategories) {
-    await saveBlockedCategories(blockedCategories);
-  }
+  const localBlockedCategories = boolKeyList(extern.blockedCategories ?? payloadMap.blockedCategories);
+  const blockedCategories = [...new Set([
+    ...await loadBlockedCategories(),
+    ...localBlockedCategories,
+  ])];
   const overrideUrl = String(extern.url ?? payloadMap.url ?? "").trim();
 
+  const scoped = bikaSearchOverride(overrideUrl, apiBase);
+  if (overrideUrl && !scoped) throw new Error("无法识别此搜索入口，请重新打开");
+  const sortBy = toNum(
+    extern.sortBy ?? payloadMap.sortBy,
+    bikaSearchSortBy(scoped?.searchParams.get("s")),
+  );
+  const sort = String(extern.sort ?? payloadMap.sort ?? toSortKeyword(sortBy)).trim() || "dd";
+
   let response: Record<string, unknown>;
-  if (mode === "creator" && creatorId) {
-    response = (await bikaRequest({
-      url: `${apiBase}comics?ca=${creatorId}&s=${sort}&page=${page}`,
-      method: "GET",
-    })) as Record<string, unknown>;
-  } else if (overrideUrl) {
-    if (overrideUrl.includes("comics?ca=")) {
-      const prefix = overrideUrl.split("&s")[0];
-      response = (await bikaRequest({
-        url: `${prefix}&s=${sort}&page=${page}`,
-        method: "GET",
-      })) as Record<string, unknown>;
-    } else if (overrideUrl.includes("%E9%82%A3%E5%B9%B4%E4%BB%8A%E5%A4%A9")) {
-      response = (await bikaRequest({
-        url: `${apiBase}comics?page=${page}&c=%E9%82%A3%E5%B9%B4%E4%BB%8A%E5%A4%A9&s=${sort}`,
-        method: "GET",
-      })) as Record<string, unknown>;
-    } else if (overrideUrl.includes("%E5%AE%98%E6%96%B9%E9%83%BD%E5%9C%A8%E7%9C%8B")) {
-      response = (await bikaRequest({
-        url: `${apiBase}comics?page=${page}&c=%E5%AE%98%E6%96%B9%E9%83%BD%E5%9C%A8%E7%9C%8B&s=${sort}`,
-        method: "GET",
-      })) as Record<string, unknown>;
-    } else {
-      response = (await bikaRequest({
-        url: overrideUrl,
-        method: "GET",
-      })) as Record<string, unknown>;
+  if (field || (mode === "creator" && creatorId)) {
+    const url = new URL("comics", apiBase);
+    url.searchParams.set(field ?? "ca", field ? keyword : creatorId);
+    url.searchParams.set("s", sort);
+    url.searchParams.set("page", String(page));
+    response = (await bikaRequest({ url: url.href, method: "GET" })) as Record<string, unknown>;
+  } else if (scoped) {
+    if (scoped.pathname === "/comics") {
+      scoped.searchParams.set("page", String(page));
+      scoped.searchParams.set("s", sort);
     }
+    response = (await bikaRequest({ url: scoped.href, method: "GET" })) as Record<string, unknown>;
   } else {
     response = (await bikaRequest({
       url: `${apiBase}comics/advanced-search?page=${page}`,
@@ -104,7 +107,10 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
         pages: page,
       }
     : toStringMap(comicsPayload);
-  const rawDocs = Array.isArray(comics.docs) ? comics.docs : [];
+  if (!Array.isArray(comics.docs)) {
+    throw new Error("搜索结果格式错误");
+  }
+  const rawDocs = comics.docs;
   const docs: StringMap[] = rawDocs.filter(
     (item): item is StringMap => !!item && typeof item === "object" && !Array.isArray(item),
   );
@@ -128,7 +134,7 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
   });
 
   const blockedSet = new Set(
-    blockedCategories.length ? blockedCategories : await loadBlockedCategories(),
+    blockedCategories,
   );
   const filteredDocs = normalizedDocs.filter((doc: StringMap) => {
     const docCategories = toStrList(doc.categories);
@@ -163,11 +169,9 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
       ...(overrideUrl ? { url: overrideUrl } : {}),
       ...(mode ? { mode } : {}),
       ...(creatorId ? { creatorId } : {}),
-      sortBy: toNum(extern.sortBy ?? payloadMap.sortBy, 1),
+      sortBy: bikaSearchSortBy(sort, sortBy),
       categories: toBoolMap(categories),
-      blockedCategories: toBoolMap(
-        blockedCategories.length ? blockedCategories : await loadBlockedCategories(),
-      ),
+      blockedCategories: toBoolMap(localBlockedCategories),
     },
     scheme,
     data,
@@ -176,12 +180,14 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
   };
 }
 
-async function getNavigationItems() {
+async function getNavigationItems(refresh: boolean) {
   const apiBase = await getApiBase();
   const categoriesResponse = await bikaRequest({
     url: `${apiBase}categories`,
     method: "GET",
     cache: true,
+    cacheArray: ["categories"],
+    refresh,
   });
   const categoriesData = toStringMap(toStringMap(categoriesResponse).data);
   const categoriesRaw = Array.isArray(categoriesData.categories) ? categoriesData.categories : [];
@@ -231,14 +237,17 @@ async function getNavigationItems() {
   ];
 }
 
-export async function getHomeData(_payload: BikaHomePayload = {}): Promise<FunctionPageContract> {
+export async function getHomeData(payload: BikaHomePayload = {}): Promise<FunctionPageContract> {
   const apiBase = await getApiBase();
+  const refresh = payload.refresh === true;
   const [navItems, keywordsResponse] = await Promise.all([
-    getNavigationItems(),
+    getNavigationItems(refresh),
     bikaRequest({
       url: `${apiBase}keywords`,
       method: "GET",
       cache: true,
+      cacheArray: ["keywords"],
+      refresh,
     }),
   ]);
   const keywordsData = toStringMap(toStringMap(keywordsResponse).data);
@@ -332,40 +341,119 @@ export async function getFavoriteData(
   };
 }
 
-export async function toggleLike(payload: BikaLikePayload = {}): Promise<ToggleLikeResult> {
-  const apiBase = await getApiBase();
+function bikaLikeResponseData(response: unknown) {
+  const envelope = toStringMap(response);
+  const code = bikaCount(envelope.code);
+  if (code === 401) {
+    throw buildUnauthorizedError(BIKA_PLUGIN_ID, "登录过期，请重新登录");
+  }
+  if ((envelope.code != null && code !== 200) ||
+      envelope.error || envelope.success === false || envelope.ok === false || envelope.status === false) {
+    throw new Error("哔咔返回的点赞结果无效，请重新读取");
+  }
+  return toStringMap(envelope.data);
+}
+
+function compatibleLikeState(value: unknown, liked: boolean): boolean {
+  return value == null || toBool(value, !liked) === liked;
+}
+
+export async function toggleLike(
+  payload: BikaLikePayload = {},
+): Promise<ToggleLikeResult & { verified: true; totalLikes?: number }> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
   }
 
-  await bikaRequest({
-    url: `${apiBase}comics/${comicId}/like`,
-    method: "POST",
+  const revision = currentBikaAuthRevision();
+  await waitBikaSessionWrites(revision);
+  const lineSnapshot = await captureBikaLine();
+  const apiBase = await getApiBase();
+  const appChannel = await loadAppChannel();
+  const loadAuthorization = async () =>
+    String(await loadPluginSetting("auth.authorization", "")).trim();
+  const authorization = await loadAuthorization();
+  const assertAuthorization = async () => {
+    if (await loadAuthorization() !== authorization) throw new BikaAccountChangedError();
+    assertBikaAuthRevision(revision);
+  };
+  const pinned = { authorization, assertAuthorization, lineSnapshot, appChannel };
+  const url = `${apiBase}comics/${encodeURIComponent(comicId)}`;
+  const response = await bikaRequest({ ...pinned, url: `${url}/like`, method: "POST" }).catch(async (error: unknown) => {
+    await assertAuthorization();
+    throw error;
   });
+  await assertAuthorization();
+  const data = bikaLikeResponseData(response);
+  if (data.action !== "like" && data.action !== "unlike") {
+    throw new Error("哔咔未确认点赞状态，请重新读取");
+  }
+  const liked = data.action === "like";
+  const sameWork = [data._id, data.id, data.comicId].every((id) => id == null || id === comicId);
+  const totalLikes = sameWork && compatibleLikeState(data.isLiked ?? data.liked, liked)
+    ? bikaLikesCount(data) : null;
 
-  const currentLiked = Boolean(payload.currentLiked);
   return {
-    liked: !currentLiked,
+    liked,
+    verified: true,
+    ...(totalLikes === null ? {} : { totalLikes }),
   };
 }
 
 export async function toggleFavorite(
   payload: BikaToggleFavoritePayload = {},
 ): Promise<ToggleFavoriteResult> {
-  const apiBase = await getApiBase();
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
   }
 
-  await bikaRequest({
-    url: `${apiBase}comics/${comicId}/favourite`,
-    method: "POST",
-  });
+  const revision = currentBikaAuthRevision();
+  await waitBikaSessionWrites(revision);
+  const lineSnapshot = await captureBikaLine();
+  const apiBase = await getApiBase();
+  const appChannel = await loadAppChannel();
+  const loadAuthorization = async () =>
+    String(await loadPluginSetting("auth.authorization", "")).trim();
+  const authorization = await loadAuthorization();
+  if (!authorization) throw buildUnauthorizedError(BIKA_PLUGIN_ID, "请先登录哔咔");
+  const assertAuthorization = async () => {
+    if (await loadAuthorization() !== authorization) throw new BikaAccountChangedError();
+    assertBikaAuthRevision(revision);
+  };
+  const pinned = { authorization, assertAuthorization, lineSnapshot, appChannel };
+  const url = `${apiBase}comics/${encodeURIComponent(comicId)}`;
+  const requireFavoriteData = (response: unknown) => {
+    const envelope = toStringMap(response);
+    const code = bikaCount(envelope.code);
+    if (code === 401) throw buildUnauthorizedError(BIKA_PLUGIN_ID, "登录过期，请重新登录");
+    if ((envelope.code != null && code !== 200) || envelope.error ||
+        envelope.success === false || envelope.ok === false || envelope.status === false) {
+      throw new Error("哔咔未确认收藏状态，请重新打开作品查看");
+    }
+    return toStringMap(envelope.data);
+  };
+
+  const response = await bikaRequest({ ...pinned, url: `${url}/favourite`, method: "POST" });
+  await assertAuthorization();
+  const data = requireFavoriteData(response);
+  const sameWork = [data._id, data.id, data.comicId].every((id) => id == null || id === comicId);
+  if (!sameWork) throw new Error("哔咔未确认收藏状态，请重新打开作品查看");
+
+  // The site's receipt reports the resulting state in data.action.
+  let favorited = data.action === "favourite" ? true : data.action === "un_favourite" ? false : null;
+  if (favorited === null && typeof payload.currentFavorite === "boolean") {
+    const detail = requireFavoriteData(await bikaRequest({ ...pinned, url, method: "GET", timeoutMs: 3500 }));
+    await assertAuthorization();
+    const comic = toStringMap(detail.comic);
+    const desired = !payload.currentFavorite;
+    if (comic._id === comicId && toBool(comic.isFavourite, !desired) === desired) favorited = desired;
+  }
+  if (favorited === null) throw new Error("哔咔未确认收藏状态，请重新打开作品查看");
 
   return {
-    favorited: !payload.currentFavorite,
+    favorited,
     nextStep: "none" as const,
   };
 }
@@ -390,6 +478,7 @@ export async function getFunctionPage(
   const id = String(
     payload.id ?? toStringMap(payload.core).id ?? toStringMap(payload.extern).id,
   ).trim();
+  const refresh = payload.refresh === true;
 
   if (id === "hotSearch") {
     const apiBase = await getApiBase();
@@ -397,6 +486,8 @@ export async function getFunctionPage(
       url: `${apiBase}keywords`,
       method: "GET",
       cache: true,
+      cacheArray: ["keywords"],
+      refresh,
     });
     const keywordsData = toStringMap(toStringMap(keywordsResponse).data);
     const items = Array.isArray(keywordsData.keywords)
@@ -422,7 +513,7 @@ export async function getFunctionPage(
 
   if (id === "navigation") {
     const blocked = new Set(toStrList(await loadPluginSetting("home.blockedCategories", [])));
-    const items = (await getNavigationItems()).filter((item) => {
+    const items = (await getNavigationItems(refresh)).filter((item) => {
       const title = String(item?.title ?? "").trim();
       if (blocked.has(title)) {
         return false;

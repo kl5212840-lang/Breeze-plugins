@@ -7,8 +7,8 @@ import { assertBikaImageQuality, BikaImageQualityChangedError, loadBikaImageQual
 import { isTransientError, RetryableRequestError } from "../../shared/transient-retry";
 import { BikaAccountChangedError } from "./bika-auth-session";
 
-class BikaRequestError extends RetryableRequestError {
-  constructor(message: string, retryable: boolean) {
+export class BikaRequestError extends RetryableRequestError {
+  constructor(message: string, retryable: boolean, readonly status?: number) {
     super(message, retryable);
     this.name = "BikaRequestError";
   }
@@ -61,7 +61,7 @@ export function setApiBase(base: string) {
 }
 
 export async function getApiBase() {
-  const cached = await cache.get(API_BASE_CACHE_KEY, DEFAULT_API_BASE);
+  const cached = await cache.get(API_BASE_CACHE_KEY, DEFAULT_API_BASE).catch(() => DEFAULT_API_BASE);
   const raw = await loadPluginSetting("network.apiBase", cached);
   const normalized = lineBase(raw) ?? DEFAULT_API_BASE;
   const next = normalized || DEFAULT_API_BASE;
@@ -88,7 +88,7 @@ function deepClone<T>(input: T): T {
   return structuredClone(input);
 }
 
-async function writeCache(cacheKey: string, data: unknown) {
+export async function writeCache(cacheKey: string, data: unknown) {
   await cache.set(toCacheStorageKey(cacheKey), {
     expireAt: Date.now() + CACHE_TTL_MS,
     data: deepClone(data),
@@ -143,7 +143,8 @@ export function buildCacheKey(payload: ClientPayload, method: string, channel = 
   const origin = new URL(String(payload.url || "/"), API_BASE).origin;
   const rawKey = `${origin}|${normalizeAppChannel(channel)}|${method}|${normalizedUrl}|${normalizeForKey(payload.body)}|${String(authForKey || "")}|${String(qualityForKey || "")}`;
   const digest = hostRuntime.crypto.createHash("sha256").update(rawKey).digest("hex") as string;
-  return `v3:${digest}`;
+  // Older entries may have been written in the guest bucket by a signed request.
+  return `v4:${digest}`;
 }
 
 function nowSeconds(): number {
@@ -202,13 +203,14 @@ export function safeBikaResponseMessage(raw: unknown, fallback: string, privateV
     ? message : fallback;
 }
 
-function mapNetworkError(err: unknown): string {
+function mapNetworkError(err: unknown, retryable: boolean): string {
   const e = err as {
     code?: string;
     message?: string;
     config?: { data?: unknown; headers?: Record<string, unknown> };
     response?: {
       data?: { code?: number; message?: string; errorMsg?: string };
+      status?: number;
     };
   };
 
@@ -218,7 +220,25 @@ function mapNetworkError(err: unknown): string {
   const privateValues = ["email", "password", "old_password", "new_password", "token"]
     .map((key) => typeof body?.[key] === "string" ? body[key] as string : "");
   privateValues.push(String(e?.config?.headers?.authorization ?? ""));
-  return safeBikaResponseMessage(data, e?.code === "ECONNABORTED" ? "连接服务器超时" : "网络请求失败，请检查网络后重试", privateValues);
+  const status = e?.response?.status;
+  if (status === 408 || e?.code === "ECONNABORTED" || e?.code === "ETIMEDOUT") {
+    return "连接哔咔超时，请重试";
+  }
+  if (status !== undefined && status >= 500) {
+    return `哔咔服务暂时无法响应（HTTP ${status}）`;
+  }
+  if (status === 429) return "请求太频繁，请稍后重试（HTTP 429）";
+  if (status === undefined && retryable) return "无法连接哔咔，请检查网络后重试";
+  return safeBikaResponseMessage(data, status === undefined
+    ? "请求失败，请稍后重试"
+    : `请求失败（HTTP ${status}）`, privateValues);
+}
+
+export function isBikaUnauthorizedEnvelope(value: unknown): boolean {
+  const payload = value as { code?: unknown; error?: unknown; message?: unknown } | null;
+  return (payload?.code === 401 || payload?.code === "401") &&
+    (payload.error === "1005" || payload.error === 1005) &&
+    payload.message === "unauthorized";
 }
 
 const bikaClient = axios.create({
@@ -291,8 +311,6 @@ bikaClient.interceptors.response.use(
   async (response) => {
     const cfg = response.config as {
       __bikaLine?: string;
-      __cacheKey?: string;
-      __useCache?: boolean;
       __bikaImageQuality?: BikaImageQuality;
       method?: string;
     };
@@ -301,10 +319,6 @@ bikaClient.interceptors.response.use(
     if (cfg.__bikaImageQuality !== undefined && toUpperMethod(cfg.method) === "GET") {
       await assertBikaImageQuality(cfg.__bikaImageQuality);
     }
-    if (cfg.__useCache && cfg.__cacheKey) {
-      await writeCache(cfg.__cacheKey, response.data);
-    }
-
     return response;
   },
   async (error: unknown) => {
@@ -313,7 +327,7 @@ bikaClient.interceptors.response.use(
     if (pinnedLine !== undefined) await assertBikaLine(pinnedLine);
     const e = error as {
       code?: string;
-      config?: { url?: string };
+      config?: { url?: string; __bikaRequireStructuredUnauthorized?: boolean };
       response?: {
         data?: { code?: number; message?: string; error?: string };
         status?: number;
@@ -322,21 +336,19 @@ bikaClient.interceptors.response.use(
     const data = e?.response?.data;
     const isLogin = cleanPath(String(e?.config?.url ?? "")).split("?")[0] === "auth/sign-in";
     if (!isLogin && (
-      e?.response?.status === 401 ||
-      (data?.code === 401 && data?.error === "1005" && data?.message === "unauthorized")
+      (e?.response?.status === 401 && !e?.config?.__bikaRequireStructuredUnauthorized) ||
+      isBikaUnauthorizedEnvelope(data)
     )) {
       throw buildUnauthorizedError(BIKA_PLUGIN_ID, "登录过期，请重新登录");
     }
-
-    const mapped = mapNetworkError(error);
 
     // Axios errors retain config, headers and request bodies (including login
     // credentials). Only a safe message may cross the plugin/runtime boundary.
     const status = e?.response?.status;
     const retryable = e?.code !== "ERR_CANCELED" && (
-      status === undefined ? isTransientError(error) : status === 429 || status >= 500
+      status === undefined ? isTransientError(error) : status === 408 || status === 429 || status >= 500
     );
-    throw new BikaRequestError(mapped, retryable);
+    throw new BikaRequestError(mapNetworkError(error, retryable), retryable, status);
   },
 );
 

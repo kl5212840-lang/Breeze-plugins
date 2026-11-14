@@ -1,9 +1,12 @@
-/** Official web avatar protocol, deliberately unbound until API-token compatibility is verified.
+/** Official web avatar protocol.
  * Source: person.1b8bbe2f18a97f2437e5.js (2026copy.com public website).
  * The caller owns authentication and transport; this module never reads account configuration.
  */
 export const COPY_PROFILE_ORIGIN = "https://2026copy.com";
-export const COPY_AVATAR_LIMIT = 2 * 1024 * 1024;
+// The avatar form says 500 KB. Its generic picker allows larger files, which
+// does not prove the site will accept them as avatars. Follow the avatar form.
+export const COPY_AVATAR_LIMIT = 500_000;
+export const COPY_AVATAR_SIZE_MESSAGE = "头像图片不能超过 500 KB";
 
 export type CopyAvatarImage = {
   bytes: Uint8Array;
@@ -14,6 +17,7 @@ export type CopyProfileRequest = {
   url: string;
   method: "GET" | "POST";
   headers: Record<string, string>;
+  timeoutMs?: number;
   // Transport must encode multipart with its own boundary, preserving file bytes/name.
   body?:
     | { kind: "multipart"; field: "file"; image: CopyAvatarImage }
@@ -36,8 +40,26 @@ function record(value: unknown): Record<string, unknown> {
 }
 function results(response: unknown, action: string): unknown {
   const body = record(response);
-  if (body.code !== 200) {
-    if (body.code === 401 || body.code === 403) throw new Error("登录已失效，请重新登录");
+  const code = typeof body.code === "number" || typeof body.code === "string"
+    ? Number(body.code) : NaN;
+  if (code !== 200) {
+    const message = typeof body.message === "string" && body.message.length <= 256
+      ? body.message : "";
+    // Use the website's message only to classify a rejection. Never forward it.
+    if (action !== "读取资料" && /[頭头]像/.test(message) && /30\s*[天日]/.test(message) &&
+        /只[能可]|一次|未[滿满]|不可|不能|間隔|间隔/.test(message)) {
+      throw new CopyAvatarRejectedError("cooldown", "拷贝漫画头像每 30 天只能更换一次");
+    }
+    if (code === 429) throw new CopyAvatarRejectedError("rateLimit", "请求过于频繁，请稍后再试");
+    if (code === 413 || code === 415) {
+      throw new CopyAvatarRejectedError("image", "站点未接受这张头像，请选择另一张图片");
+    }
+    if (code === 401 || code === 403) {
+      throw new CopyAvatarRejectedError("signIn", "请重新登录拷贝漫画后再更换头像");
+    }
+    if (code >= 400 && code < 500 && action !== "读取资料") {
+      throw new CopyAvatarRejectedError("rejected", `${action}失败，站点未接受这次修改`);
+    }
     // Do not echo arbitrary remote payloads, which can contain private account fields.
     throw new Error(`${action}失败，请稍后重试`);
   }
@@ -84,8 +106,9 @@ function validateImage(image: CopyAvatarImage) {
   if (image.mime !== "image/jpeg" && image.mime !== "image/png") {
     throw new Error("请选择 JPEG 或 PNG 图片");
   }
-  if (!image.bytes.length || image.bytes.length >= COPY_AVATAR_LIMIT) {
-    throw new Error("请选择小于 2MiB 的非空图片");
+  if (!image.bytes.length) throw new Error("请选择非空图片");
+  if (image.bytes.length > COPY_AVATAR_LIMIT) {
+    throw new Error(COPY_AVATAR_SIZE_MESSAGE);
   }
   const b = image.bytes;
   const jpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
@@ -95,6 +118,17 @@ function validateImage(image: CopyAvatarImage) {
   }
   if (!image.filename.trim() || /[\r\n\0]/.test(image.filename)) {
     throw new Error("图片文件名无效，请重新选择");
+  }
+}
+
+/** The site explicitly declined the request; resending the same image won't help. */
+export class CopyAvatarRejectedError extends Error {
+  constructor(
+    readonly restriction: "cooldown" | "rateLimit" | "image" | "signIn" | "rejected",
+    message: string,
+  ) {
+    super(message);
+    this.name = "CopyAvatarRejectedError";
   }
 }
 
@@ -116,11 +150,12 @@ export function createCopyAvatarHelper(transport: CopyProfileTransport, token: s
       throw new Error("网络请求失败，请稍后重试");
     }
   };
-  const read = async () =>
+  const read = async (timeoutMs?: number) =>
     profile(
       await send({
         url: `${COPY_PROFILE_ORIGIN}/api/v2/web/user/update/info`,
         method: "GET",
+        ...(timeoutMs == null ? {} : { timeoutMs }),
         headers: {
           Accept: "application/json",
           "Content-Type": "application/x-www-form-urlencoded",
@@ -153,9 +188,8 @@ export function createCopyAvatarHelper(transport: CopyProfileTransport, token: s
         avatar: handle,
       };
       if (before.birthday) values.birthday = before.birthday;
-      let saved: unknown;
       try {
-        saved = await send({
+        const saved = await send({
           url: `${COPY_PROFILE_ORIGIN}/api/v2/web/me/edit`,
           method: "POST",
           headers: {
@@ -165,12 +199,13 @@ export function createCopyAvatarHelper(transport: CopyProfileTransport, token: s
           },
           body: { kind: "form", values },
         });
-      } catch {
+        results(saved, "保存头像");
+      } catch (error) {
+        if (error instanceof CopyAvatarRejectedError) throw error;
         // A timeout/transport failure does not prove that the one-time write
         // failed. Never offer a repeat upload after crossing this boundary.
         throw new CopyAvatarSubmittedError("头像提交结果暂未确认，请刷新资料查看");
       }
-      results(saved, "保存头像");
       let after: CopyEditableProfile;
       try {
         after = await read();

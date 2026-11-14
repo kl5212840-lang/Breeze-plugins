@@ -10,6 +10,15 @@ export function toNum(value: unknown, fallback = 0): number {
   return Number.isFinite(number) ? number : fallback;
 }
 
+export function bikaCount(value: unknown): number | null {
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) value = Number(value);
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+export function bikaLikesCount(comic: Record<string, unknown>): number | null {
+  return bikaCount(comic.totalLikes) ?? bikaCount(comic.likesCount);
+}
+
 export function toBool(value: unknown, fallback = false): boolean {
   if (typeof value === "boolean") {
     return value;

@@ -155,6 +155,11 @@ export async function decodeResponsePayload(
   return decodeValue(await normalizeRawResponse(raw), ts);
 }
 
+export async function readJmJsonEnvelope(raw: unknown): Promise<unknown> {
+  const value = await normalizeRawResponse(raw);
+  return typeof value === "string" ? tryParseJson(value.trim()) : value;
+}
+
 /** Album-only normalization. Generic account/mutation envelopes keep their
  * existing decoder contract; a data property on an album is not an envelope.
  */

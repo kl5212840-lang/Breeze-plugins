@@ -19,26 +19,34 @@ import type {
   UserInfoBundleContract,
 } from "breeze-plugin-kit";
 import {
-  flutterTools,
   hostRuntime,
   opencc,
   pluginConfig,
   runtime,
 } from "breeze-plugin-kit";
+import { buildUnauthorizedError, createJmClient, JmLikeUnconfirmedError, recordJmLikeStage } from "./client";
+import { optionalJmCount, unwrapJmAlbumPayload } from "./codec";
 import {
-  buildUnauthorizedError,
-  createJmClient,
-  setUnauthorizedSchemeProvider,
-} from "./client";
-import { decodeResponsePayload, optionalJmCount, unwrapJmAlbumPayload } from "./codec";
+  downloadRouteExclusions,
+  jmBackgroundDownload,
+  jmDownloadBase,
+  jmDownloadPair,
+  jmPublicImageHeaders,
+  lockedDownloadImage,
+  lockedRouteRequestOptions,
+  readJmDownloadAlbum,
+  readJmDownloadChapter,
+} from "./download-route";
 import { parseJmNotifications } from "./notifications";
+import { decodePublicJmData, probeJmAlbum, probeJmCatalog, probeJmCover, probeJmRankingCatalog } from "./line-speed";
 import { Config } from "./constants";
-import { JmRequestError, retryTransient, toFriendlyError } from "./errors";
+import { isTransientError, JmFollowError, JmRequestError, retryTransient, toFriendlyError } from "./errors";
 import { buildPluginInfo } from "./get-info";
 import { buildRequestConfig } from "./request-config";
 import {
   getCachedResponse,
   getEndpointSpeedCache,
+  getJwtToken,
   getRuntimeEndpointCache,
   setEndpointSpeedCache,
   setRuntimeEndpointCache,
@@ -48,9 +56,10 @@ import {
   saveSessionValues,
   waitForSessionWrites,
 } from "./state";
-import type { EndpointSpeedRecord } from "./state";
-import type { RequestPayload } from "./types";
+import type { EndpointSpeedCache, EndpointSpeedRecord } from "./state";
+import type { JmLikeDiagnostic, RequestPayload } from "./types";
 import { getHost, md5Hex } from "./utils";
+import { notifyAutoCheckinCompleted } from "../../shared/auto-checkin-notice";
 
 const JM_PLUGIN_ID = "6886291b-f524-441c-844b-c2efae9899a9";
 
@@ -132,7 +141,7 @@ async function getCheckinStatus() {
   const user = await loadPluginSetting("auth.userInfo", {});
   assertCurrentSession(revision);
   const known = await readCheckin(user?.uid, revision);
-  if (!known.accountId) throw await buildUnauthorizedError("请先登录禁漫账号");
+  if (!known.accountId) throw buildUnauthorizedError("请先登录禁漫账号");
   let verification = await verifyCheckinCalendar(known.accountId, revision);
   const current = await readCheckin(known.accountId, revision);
   if (verification.date !== checkinDate()) {
@@ -148,7 +157,11 @@ async function getCheckinStatus() {
   } };
 }
 
-const pendingCheckins = new Map<number, Promise<boolean>>();
+type JmCheckinOutcome = "failed" | "alreadyCheckedIn" | { accountId: string; date: string };
+const pendingCheckins = new Map<number, {
+  task: Promise<JmCheckinOutcome>;
+  manualRequested: boolean;
+}>();
 
 type FetchImageBytesParams = {
   url?: string;
@@ -223,7 +236,8 @@ function noteImageBaseSuccess(url: string) {
   if (!base) return;
   imageBaseFailures.set(base, 0);
   const index = Config.imagesUrls.indexOf(base);
-  if (index >= 0) {
+  if (index >= 0 &&
+      (imageBaseFailures.get(Config.imagesUrl) ?? 0) >= IMAGE_BASE_FAILURE_LIMIT) {
     Config.imagesUrlIndex = index;
   }
 }
@@ -234,7 +248,7 @@ function noteImageBaseFailure(url: string) {
   imageBaseFailures.set(base, (imageBaseFailures.get(base) ?? 0) + 1);
 }
 
-/** 候选顺序：用户固定线路 → 请求本身域名 → 当前最快 → 其余备用 */
+/** 新请求优先使用当前线路，旧封面地址仍可作为候选。 */
 async function buildImageAttempts(targetUrl: string): Promise<string[]> {
   const pinned = await getPinnedImageBase();
   const candidates = (
@@ -252,8 +266,8 @@ async function buildImageAttempts(targetUrl: string): Promise<string[]> {
   };
 
   push(pinned);
-  push(imageBaseOf(targetUrl));
   push(Config.imagesUrl);
+  push(imageBaseOf(targetUrl));
   for (const base of candidates) push(base);
 
   const healthy = order.filter(
@@ -268,6 +282,7 @@ async function fetchImageBytes({
   url = "",
   timeoutMs = 30000,
   taskGroupKey = "",
+  extern,
 }: FetchImageBytesParams = {}): Promise<Uint8Array> {
   const targetUrl = String(url).trim();
   if (!targetUrl) throw new Error("url 不能为空");
@@ -277,21 +292,21 @@ async function fetchImageBytes({
     return new Uint8Array(new ArrayBuffer(0));
   }
 
-  const timeout = Math.max(0, Number(timeoutMs)) || 30000;
-  const attempts = await buildImageAttempts(targetUrl);
+  const locked = lockedDownloadImage(targetUrl, extern);
+  const requestedTimeout = Math.max(0, Number(timeoutMs)) || 30000;
+  const timeout = locked ? Math.min(requestedTimeout, 12000) : requestedTimeout;
+  const attempts = locked ? [targetUrl] : await buildImageAttempts(targetUrl);
   let lastError: unknown = null;
 
   for (const attempt of attempts) {
     const host = getHost(attempt);
     try {
       const response = await axios.get(attempt, {
+        ...(locked ? lockedRouteRequestOptions : {}),
         headers: {
           Host: host,
-          Referer: Config.baseUrl || Config.JM_FALLBACK_API_BASE,
-          "X-Requested-With": "com.JMComic3.app",
-          Accept:
-            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-          "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+          Referer: locked?.referer ?? (Config.baseUrl || Config.JM_FALLBACK_API_BASE),
+          ...jmPublicImageHeaders,
           "x-rquickjs-host-offload-binary-v1": "1",
         },
         timeout,
@@ -300,7 +315,7 @@ async function fetchImageBytes({
       });
 
       const status = Number(response.status || 0);
-      if (status < 200 || status >= 300) {
+      if (locked ? status !== 200 : status < 200 || status >= 300) {
         throw new Error(`图片下载失败 (${status || "unknown"})`);
       }
 
@@ -309,12 +324,14 @@ async function fetchImageBytes({
         throw new Error("图片数据为空");
       }
 
-      noteImageBaseSuccess(attempt);
+      if (!locked) noteImageBaseSuccess(attempt);
       return bytes;
     } catch (error) {
       lastError = error;
-      noteImageBaseFailure(attempt);
-      console.warn("[jm.image] current route failed; trying next route");
+      if (!locked) {
+        noteImageBaseFailure(attempt);
+        console.warn("[jm.image] current route failed; trying next route");
+      }
     }
   }
 
@@ -326,18 +343,21 @@ async function fetchImageBytes({
 async function jmRequest(
   input: RequestPayload,
   revision = currentSessionRevision(),
+  requestJwt?: string,
 ) {
   await waitForSessionWrites(revision);
   const resolvedJwtToken =
     input.useJwt === false
       ? ""
-      : String(input.jwtToken ?? "").trim() ||
-        String(await loadPluginSetting("auth.jwt", "")).trim();
+      : requestJwt ?? (
+        String(input.jwtToken ?? "").trim() ||
+        String(await loadPluginSetting("auth.jwt", "")).trim()
+      );
   assertCurrentSession(revision);
   const { config, cacheEnabled } = await buildRequestConfig({
     ...input,
     jwtToken: resolvedJwtToken,
-  }, revision);
+  }, revision, requestJwt);
 
   try {
     const response = await jmClient.request(config);
@@ -388,6 +408,7 @@ type JmChapterPayload = {
   path?: string;
   useJwt?: boolean;
   jwtToken?: string;
+  downloadRoute?: unknown;
 };
 
 type JmReadSnapshotPayload = {
@@ -397,6 +418,7 @@ type JmReadSnapshotPayload = {
 };
 
 type JmHomePayload = {
+  refresh?: boolean;
   page?: number;
   extern?: Record<string, unknown>;
   path?: string;
@@ -405,6 +427,7 @@ type JmHomePayload = {
 };
 
 type JmRankingPayload = {
+  refresh?: boolean;
   page?: number;
   extern?: Record<string, unknown>;
   path?: string;
@@ -413,6 +436,7 @@ type JmRankingPayload = {
 };
 
 type JmPromoteListPayload = {
+  refresh?: boolean;
   id?: number;
   page?: number;
   extern?: Record<string, unknown>;
@@ -422,6 +446,7 @@ type JmPromoteListPayload = {
 };
 
 type JmWeekRankingPayload = {
+  refresh?: boolean;
   date?: number;
   type?: string;
   page?: number;
@@ -444,6 +469,8 @@ type JmCloudFavoritePayload = {
 type JmLikePayload = {
   comicId?: string;
   currentLiked?: boolean;
+  previousTotalLikes?: number;
+  includeLikeDiagnostic?: boolean;
   extern?: Record<string, unknown>;
   path?: string;
   useJwt?: boolean;
@@ -702,15 +729,17 @@ function buildJmCoverUrl(item: any): string {
 
 function toComicItem(item: any) {
   const id = String(item?.id ?? "");
+  const totalLikes = optionalJmCount(item?.likes);
+  const totalViews = optionalJmCount(item?.total_views ?? item?.totalViews);
   return {
     source: JM_PLUGIN_ID,
     id,
     title: String(item?.name ?? ""),
     subtitle: "",
     finished: false,
-    likesCount: toNum(item?.likes),
-    viewsCount: toNum(item?.total_views ?? item?.totalViews),
-    updatedAt: String(item?.update_at ?? ""),
+    likesCount: totalLikes ?? 0,
+    viewsCount: totalViews ?? 0,
+    updatedAt: comicUpdateTime(item?.update_at),
     cover: {
       id,
       url: buildJmCoverUrl(item),
@@ -750,13 +779,13 @@ function toComicItem(item: any) {
       liked: toBool(item?.liked),
       is_favorite: toBool(item?.is_favorite),
       update_at: toNum(item?.update_at),
-      likes: toNum(item?.likes),
-      totalViews: toNum(item?.total_views ?? item?.totalViews),
+      likes: totalLikes,
+      totalViews,
       tags: toStrList(item?.tags),
       works: toStrList(item?.works),
       actors: toStrList(item?.actors),
     },
-    extern: {},
+    extern: { metricAvailability: { totalLikes: totalLikes !== null, totalViews: totalViews !== null } },
   };
 }
 
@@ -769,7 +798,7 @@ function normalizeJmSeries(series: any[]): any[] {
       id: String(item?.id ?? ""),
       sort: String(item?.sort ?? ""),
       rawOrder: toNum(item?.sort, 0),
-      rawName: String(item?.name ?? ""),
+      rawName: typeof item?.name === "string" ? item.name.trim() : "",
     }))
     .sort((a, b) => toNum(a?.sort, 0) - toNum(b?.sort, 0));
 
@@ -778,7 +807,7 @@ function normalizeJmSeries(series: any[]): any[] {
     return {
       ...item,
       order,
-      name: `第${order}话 ${String(item?.rawName ?? "")}`,
+      name: item.rawName || (item.rawOrder > 0 ? `第${item.rawOrder}话` : ""),
     };
   });
 }
@@ -950,6 +979,15 @@ function getJmRankingOrderOptions(): RankingFilterOption[] {
   ];
 }
 
+function rankingCategoryForType(options: RankingFilterOption[], type: string): RankingFilterOption | undefined {
+  for (const option of options) {
+    if (toStringMap(option.result.extern).type === type) return option;
+    const child = rankingCategoryForType(option.children ?? [], type);
+    if (child) return child;
+  }
+  return undefined;
+}
+
 function getJmWeekRankingWeekOptions(): RankingFilterOption[] {
   return [
     createChoiceOption("周一", "monday", { core: { date: 1 } }),
@@ -1067,21 +1105,22 @@ function sortByToOrder(value: unknown): string {
   return "";
 }
 
-async function loadPluginSetting(key: string, fallback: unknown) {
+async function loadPluginSetting(key: string, fallback: unknown, { strict = false } = {}) {
   const raw = await pluginConfig.load(key, JSON.stringify(fallback));
   try {
     const decoded = JSON.parse(String(raw));
-    if (decoded?.ok === true) {
+    if (decoded?.ok === true && (!strict || Object.prototype.hasOwnProperty.call(decoded, "value"))) {
       return decoded.value;
     }
   } catch (_) {
     // noop
   }
+  if (strict) throw new JmRequestError("账号资料读取失败，请稍后重试", true);
   return fallback;
 }
 
-async function isJmLoggedIn(): Promise<boolean> {
-  const jwt = String(await loadPluginSetting("auth.jwt", "")).trim();
+async function isJmLoggedIn({ strict = false } = {}): Promise<boolean> {
+  const jwt = String(await loadPluginSetting("auth.jwt", "", { strict }) ?? "").trim();
   return jwt.length > 0 && jwt !== "null" && jwt !== "undefined";
 }
 
@@ -1149,7 +1188,7 @@ function formatClock(ts: number): string {
   if (Number.isNaN(date.getTime())) return "";
   const hour = String(date.getHours()).padStart(2, "0");
   const minute = String(date.getMinutes()).padStart(2, "0");
-  return `${hour}:${minute}`;
+  return `${date.getMonth() + 1}-${date.getDate()} ${hour}:${minute}`;
 }
 
 function buildSpeedMap(records: EndpointSpeedRecord[]) {
@@ -1162,52 +1201,45 @@ function buildSpeedMap(records: EndpointSpeedRecord[]) {
 }
 
 function speedLabel(record?: EndpointSpeedRecord): string {
-  if (!record) return "未测试";
-  if (!record.ok) return "不可用";
-  return record.ms === null ? "已响应" : `${record.ms} ms`;
+  if (!record) return "未测";
+  if (record.ok) return record.ms === null ? "通过" : `${record.ms} ms`;
+  if (record.status === null) return "连接无响应";
+  if (record.failedAt === "album") return "无法打开作品";
+  if (record.failedAt === "catalog") return "无法打开作品列表";
+  return "无法加载封面";
 }
 
 function buildEndpointOptions(
   bases: string[],
   speedMap: Map<string, EndpointSpeedRecord>,
+  activeAutoBase: string,
 ) {
+  const active = Config.normalizeBaseUrl(activeAutoBase);
+  const domains = bases.map((base) => {
+    try { return new URL(base).hostname; } catch { return ""; }
+  });
+  const shortNames = domains.map((domain) =>
+    domain.length > 24 ? `${domain.slice(0, 13)}…${domain.slice(-8)}` : domain);
+  const counts = new Map<string, number>();
+  for (const name of shortNames) counts.set(name, (counts.get(name) ?? 0) + 1);
   return [
-    { label: "自动（选最快）", value: "" },
-    ...bases.map((base) => ({
-      label: `${getHost(base)}（${speedLabel(speedMap.get(base))}）`,
-      value: base,
-    })),
+    { label: "自动（可用优先）", value: "" },
+    ...bases.map((base, index) => {
+      const domain = domains[index]!;
+      const shortened = shortNames[index]!;
+      const name = counts.get(shortened) === 1 ? shortened : domain;
+      const speed = speedLabel(speedMap.get(base));
+      return {
+        label: `${getHost(base)}（${speed}）`,
+        value: base,
+        routeOption: {
+          title: `${name} · ${speed}`,
+          domain,
+          inUse: Boolean(active && base === active),
+        },
+      };
+    }),
   ];
-}
-
-async function probeEndpoint(
-  url: string,
-  timeoutMs = 6000,
-): Promise<EndpointSpeedRecord> {
-  const started = Date.now();
-  try {
-    const response = await axios.get(url, {
-      timeout: timeoutMs,
-      validateStatus: () => true,
-      responseType: "arraybuffer",
-    });
-    return {
-      url,
-      ok: true,
-      ms: Date.now() - started,
-      status: Number(response.status || 0) || null,
-      checkedAt: Date.now(),
-    };
-  } catch (error) {
-    console.warn("[jm.speed] route unavailable");
-    return {
-      url,
-      ok: false,
-      ms: null,
-      status: null,
-      checkedAt: Date.now(),
-    };
-  }
 }
 
 function rankSpeedRecords(records: EndpointSpeedRecord[], limit = 3) {
@@ -1238,47 +1270,169 @@ function currentApiBases(): string[] {
   return list.length ? Array.from(new Set(list)) : [Config.JM_FALLBACK_API_BASE];
 }
 
-/** 探测所有候选线路并缓存结果，供插件设置页展示（不修改全局设置） */
-async function measureEndpointSpeeds() {
-  const imageTargets = currentImageBases();
-  const apiTargets = currentApiBases();
+const JM_SPEED_MAX_AGE_MS = 20 * 60_000;
+let endpointWrites = Promise.resolve();
+let pendingEndpointMeasurement: ReturnType<typeof measureAndApplyEndpointSpeeds> | undefined;
+let runtimeEndpointsReady = false;
 
-  const [image, api] = await Promise.all([
-    Promise.all(imageTargets.map((base) => probeEndpoint(`${base}/`))),
-    Promise.all(
-      apiTargets.map((base) =>
-        probeEndpoint(`${base}/setting?app_img_shunt=1&express=off`),
-      ),
-    ),
-  ]);
+function writeEndpoints<T>(write: () => Promise<T>): Promise<T> {
+  const result = endpointWrites.then(write);
+  endpointWrites = result.then(() => {}, () => {});
+  return result;
+}
+
+function isRecentEndpointSpeed(speed: EndpointSpeedCache): boolean {
+  const age = Date.now() - speed.measuredAt;
+  return age >= 0 && age <= JM_SPEED_MAX_AGE_MS;
+}
+
+function fastestEndpoint(bases: string[], records: EndpointSpeedRecord[]): string {
+  const results = buildSpeedMap(records);
+  let best = "";
+  let fastest = Infinity;
+  for (const base of bases) {
+    const record = results.get(base);
+    if (record?.ok && record.ms !== null && record.ms >= 0 && record.ms < fastest) {
+      best = base;
+      fastest = record.ms;
+    }
+  }
+  return best;
+}
+
+function rankedDownloadBases(pin: string, active: string, bases: string[], records: EndpointSpeedRecord[]) {
+  const known = new Map<string, URL>();
+  for (const base of bases) {
+    const url = jmDownloadBase(base);
+    if (url) known.set(url.origin, url);
+  }
+  if (pin) {
+    const pinned = known.get(jmDownloadBase(pin)?.origin ?? "");
+    return pinned ? [pinned] : [];
+  }
+  const order = [active, ...records.filter((record) => record.ok && record.ms !== null && record.ms >= 0)
+    .sort((a, b) => a.ms! - b.ms!).map((record) => record.url), ...bases];
+  const origins = new Set(order.map((base) => jmDownloadBase(base)?.origin));
+  return [...origins].flatMap((origin) => {
+    const candidate = origin ? known.get(origin) : undefined;
+    return candidate ? [candidate] : [];
+  });
+}
+
+function endpointIndex(bases: string[], preference: string, fastest: string, previous: string) {
+  for (const value of [preference, fastest, previous]) {
+    const index = bases.indexOf(value);
+    if (index >= 0) return index;
+  }
+  return 0;
+}
+
+function applyEndpointSelection(
+  pinnedApi: string,
+  pinnedImage: string,
+  speed: EndpointSpeedCache | null,
+  previousApi: string,
+  previousImage: string,
+) {
+  const recent = speed && isRecentEndpointSpeed(speed) ? speed : null;
+  const api = recent ? fastestEndpoint(Config.baseUrls, recent.api) : "";
+  const image = recent ? fastestEndpoint(Config.imagesUrls, recent.image) : "";
+  Config.baseUrlIndex = endpointIndex(Config.baseUrls, pinnedApi, api, previousApi);
+  Config.imagesUrlIndex = endpointIndex(Config.imagesUrls, pinnedImage, image, previousImage);
+  if (image && !pinnedImage) imageBaseFailures.delete(image);
+}
+
+function measureEndpointSpeeds() {
+  if (pendingEndpointMeasurement) return pendingEndpointMeasurement;
+  const measurement = measureAndApplyEndpointSpeeds();
+  pendingEndpointMeasurement = measurement;
+  const release = () => {
+    if (pendingEndpointMeasurement === measurement) pendingEndpointMeasurement = undefined;
+  };
+  void measurement.then(release, release);
+  return measurement;
+}
+
+/** 以有效公开响应为测速依据，只给自动模式应用成绩。 */
+async function measureAndApplyEndpointSpeeds() {
+  const activeApi = Config.baseUrl;
+  const catalogs = await Promise.all(currentApiBases().map(probeJmCatalog));
+  let directory = catalogs.find(({ record, value }) => record.url === activeApi && value !== null) ??
+    catalogs.find(({ value }) => value !== null);
+  if (!directory) {
+    // One anonymous read on the active line when the latest feed did not
+    // respond anywhere. Never retry a rejection or change the user's line.
+    const index = catalogs.findIndex(({ record }) => record.url === activeApi && record.status === null);
+    if (index >= 0) {
+      const fallback = await probeJmRankingCatalog(activeApi);
+      catalogs[index] = fallback;
+      if (fallback.value !== null) directory = fallback;
+    }
+  }
+  let api: EndpointSpeedRecord[] = catalogs.map(({ record }) => ({
+    ...record, failedAt: "catalog",
+  }));
+  let sampleId = "";
+  let sampleApi = "";
+  for (const id of directory?.value ?? []) {
+    api = await Promise.all(catalogs.map(async ({ record }) => {
+      if (!record.ok) return { ...record, failedAt: "catalog" as const };
+      const detail = await probeJmAlbum(record.url, id, (raw) => {
+        const album = unwrapJmAlbumPayload(raw);
+        const workId = Number(id);
+        if (optionalJmCount(album.id) !== workId || typeof album.name !== "string" || !album.name.trim()) {
+          return false;
+        }
+        normalizeJmFollowSeries(album, workId);
+        return true;
+      });
+      return detail.ok ? detail : { ...detail, failedAt: "album" as const };
+    }));
+    const winner = fastestEndpoint(api.map((row) => row.url), api);
+    if (winner) {
+      sampleId = id;
+      sampleApi = winner;
+      break;
+    }
+  }
+  const image = sampleId
+    ? await Promise.all(currentImageBases().map((base) => probeJmCover(base, sampleId, sampleApi)))
+    : [];
 
   const measuredAt = Date.now();
-  await setEndpointSpeedCache({ measuredAt, image, api });
+  const effectiveRouteChanged = await writeEndpoints(async () => {
+    const speed = { measuredAt, image, api };
+    await setEndpointSpeedCache(speed);
+    const [pinnedApi, pinnedImage] = await Promise.all([getPinnedApiBase(), getPinnedImageBase()]);
+    const previousApi = Config.baseUrl;
+    const previousImage = Config.imagesUrl;
+    Config.baseUrls = currentApiBases();
+    Config.imagesUrls = currentImageBases();
+    applyEndpointSelection(pinnedApi, pinnedImage, speed, previousApi, previousImage);
+    return previousApi !== Config.baseUrl;
+  });
 
   const failed = image.filter((item) => !item.ok).length +
     api.filter((item) => !item.ok).length;
+  const anyPassing = api.some((item) => item.ok) || image.some((item) => item.ok);
+  const outcome = !anyPassing ? "failure" : failed > 0 || !api.length || !image.length ? "partial" : "success";
   const message = [
-    `图片线路: ${rankSpeedRecords(image) || "无可用"}`,
-    `接口线路: ${rankSpeedRecords(api) || "无可用"}`,
-    failed > 0 ? `不可用 ${failed} 条` : "",
+    `接口线路：${rankSpeedRecords(api) || "无法打开作品"}`,
+    `图片线路：${sampleId ? rankSpeedRecords(image) || "无法加载封面" : "作品未能打开，暂未测试"}`,
+    failed > 0 ? `${failed} 条线路未通过` : "",
   ]
     .filter(Boolean)
     .join("\n");
 
-  try {
-    flutterTools.showToast({ message, level: "info" });
-  } catch (_) {
-    // noop
-  }
-  console.log("[jm.speed] measured", { measuredAt, image, api });
-
   return {
     source: JM_PLUGIN_ID,
-    data: { ok: true, measuredAt, message, image, api },
+    ok: true,
+    message,
+    data: { ok: true, outcome, measuredAt, message, image, api, effectiveRouteChanged },
   };
 }
 
-/** 设置页线路字段变更回调：固定线路并立即生效 */
+/** 保存固定线路或回到自动模式。 */
 async function onNetworkChanged(
   payload: {
     key?: string;
@@ -1287,35 +1441,42 @@ async function onNetworkChanged(
   } = {},
 ) {
   const key = String(payload.key ?? "");
-  const value = String(payload.value ?? "").trim();
+  const value = Config.normalizeBaseUrl(payload.value);
 
-  if (key === "network.imageBase") {
-    pinnedImageBaseCache = { value, at: Date.now() };
-    if (value) {
-      Config.imagesUrls = Array.from(
-        new Set([...Config.buildImageCandidates(value), ...Config.imagesUrls]),
-      );
-      Config.imagesUrlIndex = Math.max(0, Config.imagesUrls.indexOf(value));
-    } else {
-      Config.imagesUrlIndex = 0;
+  const isImage = key === "network.imageBase";
+  const isApi = key === "network.apiBase";
+  const previousApi = Config.baseUrl;
+  if (isImage || isApi) {
+    const shouldMeasure = await writeEndpoints(async () => {
+      const bases = isImage ? currentImageBases() : currentApiBases();
+      if (value && !bases.includes(value)) throw new Error("线路不在当前候选中");
+      const previousPin = await (isImage ? getPinnedImageBase() : getPinnedApiBase());
+      await pluginConfig.save(key, JSON.stringify(value));
+      const speed = value ? null : await getEndpointSpeedCache().catch(() => null);
+      const results = speed && isRecentEndpointSpeed(speed) ? (isImage ? speed.image : speed.api) : [];
+      const fastest = fastestEndpoint(bases, results);
+      const index = endpointIndex(bases, value, fastest, previousPin ? "" : (isImage ? Config.imagesUrl : Config.baseUrl));
+      if (isImage) {
+        pinnedImageBaseCache = { value, at: Date.now() };
+        Config.imagesUrls = bases;
+        Config.imagesUrlIndex = index;
+        imageBaseFailures.delete(Config.imagesUrl);
+      } else {
+        pinnedApiBaseCache = { value, at: Date.now() };
+        Config.baseUrls = bases;
+        Config.baseUrlIndex = index;
+      }
+      return Boolean(previousPin && !value && !fastest);
+    });
+    if (shouldMeasure) {
+      // A failed probe leaves the saved Auto selection and its available fallback.
+      await measureEndpointSpeeds().catch(() => {});
     }
-  } else if (key === "network.apiBase") {
-    pinnedApiBaseCache = { value, at: Date.now() };
-    if (value) {
-      Config.baseUrls = Array.from(new Set([value, ...Config.baseUrls]));
-      Config.baseUrlIndex = 0;
-    } else {
-      Config.baseUrlIndex = 0;
-    }
-  }
-
-  if (key) {
-    await pluginConfig.save(key, JSON.stringify(value));
   }
 
   return {
     source: JM_PLUGIN_ID,
-    data: { ok: true, key, value },
+    data: { ok: true, key, value, effectiveRouteChanged: previousApi !== Config.baseUrl },
   };
 }
 
@@ -1335,9 +1496,30 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
 
   const imageSpeedMap = buildSpeedMap(speedCache?.image ?? []);
   const apiSpeedMap = buildSpeedMap(speedCache?.api ?? []);
-  const networkTitle = speedCache
-    ? `网络线路（测于 ${formatClock(speedCache.measuredAt)}）`
-    : "网络线路（未测速，可在下方操作区测试）";
+  const networkSection = {
+    id: "network",
+    title: "网络线路",
+    headerAction: { key: "speedtest", title: "测速", fnPath: "measureEndpointSpeeds" },
+    ...(speedCache ? { footer: `上次测速 ${formatClock(speedCache.measuredAt)}${isRecentEndpointSpeed(speedCache) ? "" : " · 旧结果"}` } : {}),
+    fields: [
+      {
+        key: "network.imageBase",
+        kind: "choice" as const,
+        label: "图片线路",
+        description: `当前使用 ${getHost(Config.imagesUrl)}。自动模式优先使用加载封面最快的可用线路。`,
+        fnPath: "onNetworkChanged",
+        options: buildEndpointOptions(imageBases, imageSpeedMap, pinnedImage ? "" : Config.imagesUrl),
+      },
+      {
+        key: "network.apiBase",
+        kind: "choice" as const,
+        label: "接口线路",
+        description: `当前使用 ${getHost(Config.baseUrl)}。自动模式优先使用打开作品最快的可用线路。`,
+        fnPath: "onNetworkChanged",
+        options: buildEndpointOptions(apiBases, apiSpeedMap, pinnedApi ? "" : Config.baseUrl),
+      },
+    ],
+  };
 
   return {
     source: JM_PLUGIN_ID,
@@ -1365,26 +1547,7 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
             },
           ],
         },
-        {
-          id: "network",
-          title: networkTitle,
-          fields: [
-            {
-              key: "network.imageBase",
-              kind: "choice",
-              label: "图片线路",
-              fnPath: "onNetworkChanged",
-              options: buildEndpointOptions(imageBases, imageSpeedMap),
-            },
-            {
-              key: "network.apiBase",
-              kind: "choice",
-              label: "接口线路",
-              fnPath: "onNetworkChanged",
-              options: buildEndpointOptions(apiBases, apiSpeedMap),
-            },
-          ],
-        },
+        networkSection,
       ],
     },
     data: {
@@ -1404,7 +1567,7 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
   const revision = currentSessionRevision();
   await waitForSessionWrites(revision);
   const ensureUserInfo = async () => {
-    const stored = await loadPluginSetting("auth.userInfo", {});
+    const stored = await loadPluginSetting("auth.userInfo", {}, { strict: true });
     assertCurrentSession(revision);
     const current =
       stored && typeof stored === "object"
@@ -1414,11 +1577,18 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
       return current;
     }
 
-    const account = String(await loadPluginSetting("auth.account", "")).trim();
+    const account = String(await loadPluginSetting("auth.account", "", { strict: true }) ?? "").trim();
     const password = String(
-      await loadPluginSetting("auth.password", ""),
+      await loadPluginSetting("auth.password", "", { strict: true }) ?? "",
     ).trim();
     if (!account || !password) {
+      const profileMissing = stored == null ||
+        (typeof stored === "object" && !Array.isArray(stored) && Object.keys(stored).length === 0);
+      if (profileMissing && !(await isJmLoggedIn({ strict: true })) && !(await getJwtToken(revision))) {
+        const error = buildUnauthorizedError("请先登录禁漫账号");
+        assertCurrentSession(revision);
+        throw error;
+      }
       return current;
     }
 
@@ -1439,9 +1609,9 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
   const user = await ensureUserInfo();
   assertCurrentSession(revision);
 
-  const username = String(user.username ?? user.nickname ?? "").trim();
+  const username = String(user?.username ?? user?.nickname ?? "").trim();
   if (!username) {
-    throw new Error("未获取到用户信息，请先完成登录或刷新会话");
+    throw new JmRequestError("账号资料读取失败，请稍后重试", true);
   }
   return buildUserInfoBundle(user, await refreshCheckin(user.uid, revision));
 }
@@ -1514,12 +1684,31 @@ async function getSettingsUserInfoBundle() {
 async function getUserProfileDetails() {
   const revision = currentSessionRevision();
   await waitForSessionWrites(revision);
-  const user = await loadPluginSetting("auth.userInfo", {});
+  const [user, storedJwt] = await Promise.all([
+    loadPluginSetting("auth.userInfo", {}, { strict: true }),
+    loadPluginSetting("auth.jwt", "", { strict: true }),
+  ]);
   assertCurrentSession(revision);
-  const accountId = String(user?.uid ?? "").trim();
-  if (!accountId) throw await buildUnauthorizedError("请先登录禁漫账号");
-  const raw = await jmRequest({ path: `${Config.baseUrl}/useredit/${encodeURIComponent(accountId)}`,
-    method: "GET", cache: false, useJwt: true }, revision);
+  if (!user || typeof user !== "object" || Array.isArray(user) || typeof storedJwt !== "string") {
+    throw new JmRequestError("账号资料读取失败，请稍后重试", true);
+  }
+  const uid = user.uid;
+  if (uid != null && typeof uid !== "string" && typeof uid !== "number") {
+    throw new JmRequestError("账号资料读取失败，请稍后重试", true);
+  }
+  const accountId = String(uid ?? "").trim();
+  const jwt = storedJwt.trim();
+  // The UID alone may have come from an imported profile. Require the current
+  // persisted session, even if a previous runtime left a cached JWT behind.
+  if (!accountId || !jwt || jwt === "null" || jwt === "undefined") {
+    throw buildUnauthorizedError("请先登录禁漫账号");
+  }
+  const api = jmDownloadBase(Config.baseUrl);
+  if (!api) throw new JmRequestError("账号线路暂不可用，请稍后重试");
+  const raw = await jmRequest({
+    path: `${api.origin}/useredit/${encodeURIComponent(accountId)}`,
+    method: "GET", cache: false, useJwt: true, readOnlyProfile: true,
+  }, revision, jwt);
   assertCurrentSession(revision);
   const data = raw?.data ?? raw;
   if (!data || typeof data !== "object" || Array.isArray(data) ||
@@ -1555,11 +1744,6 @@ async function getLoginBundle() {
     },
   };
 }
-
-setUnauthorizedSchemeProvider(async () => {
-  const bundle = await getLoginBundle();
-  return bundle as Record<string, unknown>;
-});
 
 async function loginWithPassword(
   payload: JmLoginPayload = {},
@@ -1597,12 +1781,7 @@ async function loginWithPassword(
 
   return {
     source: JM_PLUGIN_ID,
-    data: {
-      account,
-      password,
-      jwtToken,
-    },
-    raw: result,
+    data: { account },
   };
 }
 
@@ -1662,14 +1841,15 @@ async function fetchSettingFromDomain(domain: string, tsSec: string) {
   if (response.status < 200 || response.status >= 300) {
     throw new Error(`status=${response.status}`);
   }
-  const decoded = (await decodeResponsePayload(response.data, tsSec)) as Record<
+  const decoded = (await decodePublicJmData(response.data, tsSec)) as Record<
     string,
     unknown
   > | null;
-  if (!decoded || typeof decoded !== "object") {
+  const imageBase = typeof decoded?.img_host === "string" ? Config.normalizeBaseUrl(decoded.img_host) : "";
+  if (!imageBase || !getHost(imageBase)) {
     throw new Error("decode setting response failed");
   }
-  return decoded;
+  return { imageBase };
 }
 
 async function resolveDynamicHosts() {
@@ -1680,7 +1860,7 @@ async function resolveDynamicHosts() {
 
   const tsSec = String(Math.floor(Date.now() / 1000));
   let picked = "";
-  let setting: Record<string, unknown> | null = null;
+  let setting: Awaited<ReturnType<typeof fetchSettingFromDomain>> | null = null;
   for (const domain of hostPool) {
     try {
       setting = await fetchSettingFromDomain(domain, tsSec);
@@ -1695,48 +1875,40 @@ async function resolveDynamicHosts() {
     throw new Error("all setting endpoints failed");
   }
 
-  const imageBaseUrls = Config.buildImageCandidates(setting.img_host);
+  const imageBaseUrls = Config.buildImageCandidates(setting.imageBase);
   const rawBaseUrls = [
     picked,
     ...hostPool.map((item) => normalizeBaseBaseUrl(item)),
   ].filter(Boolean);
 
   return {
-    imageBaseUrl: imageBaseUrls[0] ?? Config.JM_FALLBACK_IMAGE_BASE,
     imageBaseUrls,
     baseUrls: Array.from(new Set(rawBaseUrls)),
   };
 }
 
-/** 写入候选线路列表，并把用户固定的线路设为当前首选 */
-function applyEndpointLists(
-  apiList: string[],
-  imageList: string[],
-  pinnedApi: string,
-) {
-  Config.baseUrls = apiList.length ? apiList : [Config.JM_FALLBACK_API_BASE];
-  Config.imagesUrls = imageList.length
-    ? imageList
-    : Config.buildImageCandidates();
-
-  const apiPinnedIndex = pinnedApi ? Config.baseUrls.indexOf(pinnedApi) : -1;
-  Config.baseUrlIndex = apiPinnedIndex >= 0 ? apiPinnedIndex : 0;
-
-  const pinnedImage = pinnedImageBaseCache.value;
-  const imagePinnedIndex = pinnedImage
-    ? Config.imagesUrls.indexOf(pinnedImage)
-    : -1;
-  Config.imagesUrlIndex = imagePinnedIndex >= 0 ? imagePinnedIndex : 0;
+/** 初始化候选列表，并恢复固定线路或仍有效的测速结果。 */
+async function applyEndpointLists(apiList: string[], imageList: string[]) {
+  await writeEndpoints(async () => {
+    const [pinnedApi, pinnedImage, speed] = await Promise.all([
+      getPinnedApiBase(), getPinnedImageBase(), getEndpointSpeedCache().catch(() => null),
+    ]);
+    const previousApi = runtimeEndpointsReady ? Config.baseUrl : "";
+    const previousImage = runtimeEndpointsReady ? Config.imagesUrl : "";
+    Config.baseUrls = apiList.length ? apiList : [Config.JM_FALLBACK_API_BASE];
+    Config.imagesUrls = imageList.length ? imageList : Config.buildImageCandidates();
+    applyEndpointSelection(pinnedApi, pinnedImage, speed, previousApi, previousImage);
+    runtimeEndpointsReady = true;
+  });
 }
 
-async function resolveFastestBases() {
-  const pinnedApi = await getPinnedApiBase();
+async function resolveRuntimeEndpoints() {
   const cached = await getRuntimeEndpointCache();
 
   if (cached) {
     const apiList = Array.from(
       new Set(
-        [cached.apiBaseUrl, ...cached.hostPool]
+        [...cached.hostPool, cached.apiBaseUrl]
           .map((item) => normalizeBaseBaseUrl(item))
           .filter(Boolean),
       ),
@@ -1746,22 +1918,8 @@ async function resolveFastestBases() {
         ? cached.imageBaseUrls
         : Config.buildImageCandidates(cached.imageBaseUrl);
 
-    applyEndpointLists(
-      apiList.length ? apiList : [Config.JM_FALLBACK_API_BASE],
-      imageList,
-      pinnedApi,
-    );
-
-    if (pinnedApi && Config.baseUrls.includes(pinnedApi)) {
-      Config.baseUrlIndex = Config.baseUrls.indexOf(pinnedApi);
-    } else {
-      Config.baseUrlIndex = Math.max(
-        0,
-        Config.baseUrls.indexOf(normalizeBaseBaseUrl(cached.apiBaseUrl)),
-      );
-    }
-
-    return { data: Config.baseUrl };
+    await applyEndpointLists(apiList, imageList);
+    return;
   }
 
   let baseCandidates = [Config.JM_FALLBACK_API_BASE];
@@ -1778,65 +1936,55 @@ async function resolveFastestBases() {
     console.warn("[jm.init] resolve dynamic hosts failed");
   }
 
-  Config.baseUrls = baseCandidates;
-  Config.imagesUrls = imageCandidates;
-
-  try {
-    Config.baseUrlIndex = await getFastestUrlIndex(Config.baseUrls);
-  } catch (error) {
-    console.warn("[jm.init] choose fastest api base failed");
-  }
-
-  try {
-    Config.imagesUrlIndex = await getFastestUrlIndex(Config.imagesUrls);
-  } catch (error) {
-    console.warn("[jm.init] choose fastest image base failed");
-  }
-
-  // 用户固定线路优先于测速结果（候选列表全部保留，供失败时回退）
-  applyEndpointLists(Config.baseUrls, Config.imagesUrls, pinnedApi);
-
-  const data = Config.baseUrl || Config.JM_FALLBACK_API_BASE;
+  await applyEndpointLists(baseCandidates, imageCandidates);
 
   try {
     await setRuntimeEndpointCache({
-      apiBaseUrl: Config.baseUrl,
-      imageBaseUrl: Config.imagesUrl,
-      imageBaseUrls: Config.imagesUrls,
+      apiBaseUrl: baseCandidates[0]!,
+      imageBaseUrl: imageCandidates[0]!,
+      imageBaseUrls: imageCandidates,
       hostPool: baseCandidates,
     });
   } catch (error) {
     console.warn("[jm.init] cache hostRuntime endpoints failed");
   }
 
-  return { data };
 }
 
-function tryJmCheckin(revision = currentSessionRevision()) {
-  const pending = pendingCheckins.get(revision);
-  if (pending) return pending;
-  const task = performJmCheckin(revision).finally(() => {
-    if (pendingCheckins.get(revision) === task) pendingCheckins.delete(revision);
-  });
-  pendingCheckins.set(revision, task);
-  return task;
+async function tryJmCheckin(revision: number, automatic = false) {
+  let pending = pendingCheckins.get(revision);
+  if (pending === undefined) {
+    const task = performJmCheckin(revision).finally(() => {
+      if (pendingCheckins.get(revision)?.task === task) pendingCheckins.delete(revision);
+    });
+    pending = { task, manualRequested: !automatic };
+    pendingCheckins.set(revision, pending);
+  }
+  if (!automatic) pending.manualRequested = true;
+  const result = await pending.task;
+  if (automatic && typeof result === "object" && !pending.manualRequested && result.date === checkinDate()) {
+    assertCurrentSession(revision);
+    void notifyAutoCheckinCompleted(result.accountId, result.date);
+  }
+  return result !== "failed";
 }
 
-async function performJmCheckin(revision: number) {
+async function performJmCheckin(revision: number): Promise<JmCheckinOutcome> {
   await waitForSessionWrites(revision);
   const stored = await loadPluginSetting("auth.userInfo", {});
   assertCurrentSession(revision);
   const uid = stored?.uid;
-  if (!uid) {
+  const accountId = String(uid ?? "").trim();
+  if (!uid || !accountId) {
     console.error("无法获取用户UID，跳过签到");
-    return false;
+    return "failed";
   }
 
-  if ((await readCheckin(uid, revision)).checkedIn === true) return true;
+  if ((await readCheckin(uid, revision)).checkedIn === true) return "alreadyCheckedIn";
   const requestDate = checkinDate();
 
   try {
-    return await retryTransient(async () => {
+    return await retryTransient<JmCheckinOutcome>(async () => {
       const dailyListRes = await jmRequest({
         url: `${Config.baseUrl}/daily_list/filter`,
         method: "POST",
@@ -1848,7 +1996,7 @@ async function performJmCheckin(revision: number) {
       const list = dailyListRes?.data?.list ?? dailyListRes?.list ?? [];
       if (!Array.isArray(list) || list.length === 0) {
         console.log("今日无签到项");
-        return false;
+        return "failed";
       }
 
       const lastItem = list[list.length - 1];
@@ -1866,35 +2014,35 @@ async function performJmCheckin(revision: number) {
         },
       }, revision);
 
-      let msg = String(chkRes?.data?.msg ?? chkRes?.msg ?? "");
-
-      msg = await opencc.convert(msg, "t2s.json");
+      const rawMessage = String(chkRes?.data?.msg ?? chkRes?.msg ?? "");
+      const message = (await opencc.convert(rawMessage, "t2s.json")).trim();
       assertCurrentSession(revision);
 
       // Exact endpoint outcomes, never an arbitrary toast or HTTP 200 alone.
       const outcome = chkRes?.data ?? chkRes;
+      const alreadyCheckedIn = ["今天已经签到过了", "今天已經簽到過了"].includes(message);
+      // Mobile /daily_chk rewards are anchored so an error quoting a reward is refused.
+      const newlyCheckedIn = ["签到成功", "签到成功！"].includes(message) ||
+        /^Jcoin:\d+\s+EXP:\d+$/.test(message);
       if (chkRes?.status === false || outcome?.status === false ||
           outcome?.success === false || outcome?.ok === false ||
           (chkRes?.code !== undefined && Number(chkRes.code) !== 200) ||
           (outcome?.code !== undefined && Number(outcome.code) !== 200) ||
-          !(["今天已经签到过了", "今天已經簽到過了", "签到成功", "签到成功！"].includes(msg.trim()) ||
-            // Mobile /daily_chk rewards, documented by the upstream client.
-            // Anchor the complete message so an error quoting a reward is refused.
-            /^Jcoin:\d+\s+EXP:\d+$/.test(msg.trim()))) {
-        return false;
+          !(alreadyCheckedIn || newlyCheckedIn)) {
+        return "failed";
       }
-      if (checkinDate() !== requestDate) return false;
+      if (checkinDate() !== requestDate) return "failed";
       await saveSessionValues(revision, {
-        "auth.checkin": { accountId: String(uid), checkedInDate: requestDate,
+        "auth.checkin": { accountId, checkedInDate: requestDate,
           evidenceSource: "dailyCheckin", confirmedAt: new Date().toISOString() },
       });
 
-      return true;
+      return newlyCheckedIn ? { accountId, date: requestDate } : "alreadyCheckedIn";
     }, () => assertCurrentSession(revision));
   } catch (_) {
     assertCurrentSession(revision);
     console.warn("[jm.checkin] request failed; stopped");
-    return false;
+    return "failed";
   }
 }
 
@@ -1903,7 +2051,7 @@ async function checkInToday() {
   await waitForSessionWrites(revision);
   const user = await loadPluginSetting("auth.userInfo", {});
   if (!user?.uid) {
-    throw await buildUnauthorizedError("请先登录禁漫账号");
+    throw buildUnauthorizedError("请先登录禁漫账号");
   }
   assertCurrentSession(revision);
   const ok = await tryJmCheckin(revision);
@@ -1950,7 +2098,7 @@ async function readNotificationList(revision: number) {
 
 async function readNotificationUnreadCount(uid: unknown, revision: number) {
   const accountId = String(uid ?? "").trim();
-  if (!accountId) throw await buildUnauthorizedError("请先登录禁漫账号");
+  if (!accountId) throw buildUnauthorizedError("请先登录禁漫账号");
   const raw = await jmRequest({ path: `${Config.baseUrl}/notifications/unreadCount`,
     method: "GET", cache: false, useJwt: true }, revision);
   assertCurrentSession(revision);
@@ -2072,7 +2220,7 @@ export async function runJmAuthAndCheckInLoop() {
       () => assertCurrentSession(revision),
     );
 
-    const checkedIn = await tryJmCheckin(revision);
+    const checkedIn = await tryJmCheckin(revision, true);
     if (!checkedIn) {
       console.warn("[jm.init] checkin incomplete; stopped");
       return;
@@ -2087,7 +2235,7 @@ export async function runJmAuthAndCheckInLoop() {
 }
 
 async function init() {
-  await resolveFastestBases();
+  await resolveRuntimeEndpoints();
   if (!jmInitStarted) {
     jmInitStarted = true;
     void runJmAuthAndCheckInLoop();
@@ -2283,11 +2431,11 @@ async function getFunctionPage(
         title,
         list: {
           fnPath: "getRankingData",
-          extern: { source: "ranking", type, order: "new" },
+          extern: { source: "ranking", type, order: "new", categoryScope: type },
         },
         filter: {
           fnPath: "getRankingFilterBundle",
-          extern: { source: "ranking", type, order: "new" },
+          extern: { source: "ranking", type, order: "new", categoryScope: type },
         },
       })),
     }));
@@ -2309,7 +2457,7 @@ async function getFunctionPage(
     throw new Error(`未知功能: ${id}`);
   }
 
-  const recommend = await getHomeRecommendData();
+  const recommend = await getHomeRecommendData({ refresh: payload.refresh === true });
   const sections = Array.isArray((recommend as any)?.data?.sections)
     ? (recommend as any).data.sections
     : [];
@@ -2381,19 +2529,25 @@ async function getRankingFilterBundle(
 ): Promise<FilterBundleContract> {
   const extern = toStringMap(payload.extern);
   const selectedType = String(extern.type ?? "latest");
+  const categoryScope = typeof extern.categoryScope === "string" ? extern.categoryScope : "";
+  const categories = getJmRankingCategoryOptions();
+  const scoped = categoryScope ? rankingCategoryForType(categories, categoryScope) : undefined;
   return {
     source: JM_PLUGIN_ID,
     scheme: {
       version: "1.0.0",
       type: "rankingFilter",
       title: "筛选漫画",
+      ...(categoryScope ? { optionLayout: "wrap" } : {}),
       fields: [
-        {
+        ...(!categoryScope || (scoped && scoped.children?.length) ? [{
           key: "category",
-          kind: "choice",
-          label: "分类",
-          options: getJmRankingCategoryOptions(),
-        },
+          kind: "choice" as const,
+          label: scoped ? "子分类" : "分类",
+          options: scoped
+            ? [createChoiceOption("全部", scoped.value, scoped.result), ...(scoped.children ?? [])]
+            : categories,
+        }] : []),
         {
           key: "order",
           kind: "choice",
@@ -2404,13 +2558,20 @@ async function getRankingFilterBundle(
     },
     data: {
       values: {
-        category: selectedType === "禁漫汉化组"
+        category: scoped ? scoped.value : selectedType === "禁漫汉化组"
           ? "jm_translation_team"
           : selectedType,
         order: String(extern.order ?? "new"),
       },
     },
   };
+}
+
+function jmSearchScope(value: unknown): 0 | 2 | 3 {
+  const mode = typeof value === "string" ? value.trim() : value;
+  if (mode === 2 || mode === "2") return 2;
+  if (mode === 3 || mode === "3") return 3;
+  return 0;
 }
 
 async function getAdvancedSearchScheme(
@@ -2423,6 +2584,16 @@ async function getAdvancedSearchScheme(
       version: "1.0.0",
       type: "advancedSearch",
       fields: [
+        {
+          key: "main_tag",
+          kind: "choice",
+          label: "搜索范围",
+          options: [
+            { label: "综合", value: 0 },
+            { label: "作者", value: 2 },
+            { label: "标签", value: 3 },
+          ],
+        },
         {
           key: "sortBy",
           kind: "choice",
@@ -2438,6 +2609,7 @@ async function getAdvancedSearchScheme(
     },
     data: {
       values: {
+        main_tag: jmSearchScope(extern.main_tag),
         sortBy: toNum(extern.sortBy, 1),
       },
     },
@@ -2537,34 +2709,206 @@ function timestampToIso(value: unknown): string {
   return new Date(seconds * 1000).toISOString();
 }
 
+function comicUpdateTime(value: unknown): string {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  const text = String(value).trim();
+  if (/^[1-9][0-9]{9}$/.test(text)) return timestampToIso(text);
+  if (!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(text)) return "";
+  const day = text.slice(0, 10);
+  const calendarDate = new Date(day);
+  return Number.isFinite(calendarDate.getTime()) &&
+    calendarDate.toISOString().slice(0, 10) === day &&
+    Number.isFinite(Date.parse(text)) ? text : "";
+}
+
+async function readJmFollowAlbum(path: string, comicId: string) {
+  const revision = currentSessionRevision();
+  const input = {
+    path,
+    method: "GET",
+    params: { id: comicId },
+    comicFollow: true,
+  };
+  try {
+    return await jmRequest({ ...input, useJwt: false }, revision);
+  } catch (error) {
+    if (!(error instanceof JmFollowError) || error.reason !== "signInRequired") throw error;
+
+    // Use the same configured API route only after a site-specific member
+    // response. A gateway status alone must never receive a saved token.
+    const route = new URL(path);
+    if (route.protocol !== "https:" || route.username || route.password) {
+      throw new JmFollowError("sourceUnavailable");
+    }
+    const saved = await loadPluginSetting("auth.jwt", "");
+    const configuredJwt = typeof saved === "string" ? saved.trim() : "";
+    const jwt = configuredJwt && !["null", "undefined"].includes(configuredJwt)
+      ? configuredJwt
+      : await getJwtToken(revision);
+    assertCurrentSession(revision);
+    if (!jwt) throw error;
+    if (path !== `${Config.baseUrl}/album`) throw new JmFollowError("sourceUnavailable");
+    return jmRequest(input, revision, jwt);
+  }
+}
+
+function normalizeJmFollowSeries(response: Record<string, unknown>, albumId: number) {
+  if (!Array.isArray(response.series)) throw new JmFollowError("invalidResponse");
+
+  const chapters: Array<{ id: string; sort: number; name: string }> = [];
+  const seen = new Set<number>();
+  for (const raw of response.series) {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new JmFollowError("invalidResponse");
+    }
+    const id = optionalJmCount(raw.id);
+    const sort = raw.sort;
+    const order = typeof sort === "number" || (typeof sort === "string" && sort.trim())
+      ? Number(sort)
+      : NaN;
+    if (id === null || id <= 0 || !Number.isFinite(order) || order < 0) {
+      throw new JmFollowError("invalidResponse");
+    }
+    if (order === 0) {
+      if (id !== albumId) throw new JmFollowError("invalidResponse");
+      continue;
+    }
+    if (seen.has(id)) throw new JmFollowError("invalidResponse");
+    seen.add(id);
+    chapters.push({
+      id: String(id),
+      sort: order,
+      name: typeof raw.name === "string" ? raw.name : "",
+    });
+  }
+
+  const parentId = optionalJmCount(response.series_id);
+  // A one-shot has an explicit empty series (or its own cover row) and pages.
+  // Missing lists, empty partial replies and redirected children are uncertain.
+  if (chapters.length === 0 &&
+      ((optionalJmCount(response.total_photos) ?? 0) <= 0 ||
+       (parentId !== null && parentId !== 0 && parentId !== albumId))) {
+    throw new JmFollowError("invalidResponse");
+  }
+  return normalizeJmSeries(chapters);
+}
+
+function jmDownloadTransportError(status: number) {
+  return new Error(JSON.stringify({
+    type: "comic_download_route_unavailable",
+    reason: status === 429 ? "rateLimited" : "sourceUnavailable",
+    retryable: true, httpStatus: status,
+  }));
+}
+
+async function readAutomaticJmDownloadAlbum(payload: ComicDetailPayload, albumId: number) {
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const readPin = async () => {
+    await endpointWrites;
+    const pin = await loadPluginSetting("network.apiBase", "", { strict: true });
+    assertCurrentSession(revision);
+    if (typeof pin !== "string") throw new Error("下载线路设置暂不可用，请重试");
+    return pin.trim();
+  };
+  if (await readPin()) return null;
+
+  const speed = await getEndpointSpeedCache().catch(() => null);
+  const recent = speed && isRecentEndpointSpeed(speed) ? speed.api : [];
+  const activeApi = jmDownloadBase(Config.baseUrl)?.origin;
+  const candidates = rankedDownloadBases("", Config.baseUrl, currentApiBases(), recent).slice(0, 3);
+  const chapterId = optionalJmCount(payload.extern?.chapterId);
+  const read = (api: URL, jwt?: string) => readJmDownloadAlbum(api, albumId, revision, jwt).catch(() => {
+    assertCurrentSession(revision);
+    return "unavailable" as const;
+  });
+  const unavailable = () => new Error(JSON.stringify({ type: "comic_download_route_unavailable" }));
+  const terminal = (reason: "notFound" | "sourceUnavailable", message: string) =>
+    new Error(JSON.stringify({ type: "comic_detail_error", reason, message, retryable: false }));
+
+  let lastTransportStatus: number | undefined;
+  for (const api of candidates) {
+    if (await readPin()) throw unavailable();
+    let album = await read(api);
+    if (await readPin()) throw unavailable();
+    const current = api.origin === activeApi && api.origin === jmDownloadBase(Config.baseUrl)?.origin;
+    if (album === "memberGate" && current) {
+      // Only the active API may receive an existing session, and only after a
+      // recognizable membership response on that exact origin.
+      if (payload.useJwt === false) throw buildUnauthorizedError("请先登录禁漫账号");
+      const saved = await loadPluginSetting("auth.jwt", "", { strict: true });
+      const jwt = typeof saved === "string" ? saved.trim() : "";
+      if (!jwt || jwt === "null" || jwt === "undefined") throw buildUnauthorizedError("请先登录禁漫账号");
+      if (await readPin() || api.origin !== jmDownloadBase(Config.baseUrl)?.origin) throw unavailable();
+      album = await read(api, jwt);
+      if (await readPin() || api.origin !== jmDownloadBase(Config.baseUrl)?.origin) throw unavailable();
+      if (album === "memberGate") throw buildUnauthorizedError("登录过期，请重新登录");
+      if (album === "unavailable") throw unavailable();
+    }
+    if (album === "rateLimited") {
+      throw jmDownloadTransportError(429);
+    }
+    if (current && album === "notFound") throw terminal("notFound", "作品已不存在或已下架");
+    if (current && album === "restricted") {
+      throw terminal("sourceUnavailable", "来源暂时限制访问此作品");
+    }
+    if (typeof album === "string") continue;
+    if ("transportStatus" in album && typeof album.transportStatus === "number") {
+      lastTransportStatus = album.transportStatus;
+      continue;
+    }
+    if (current) return { album };
+    // Use the validated catalog only if it includes the queued episode.
+    try {
+      const verifiedSeries = normalizeJmFollowSeries(album, albumId);
+      const containsEpisode = verifiedSeries.length
+        ? verifiedSeries.some((chapter) => optionalJmCount(chapter.id) === chapterId)
+        : chapterId === albumId;
+      if (containsEpisode) return { album, verifiedSeries };
+    } catch (error) {
+      if (!(error instanceof JmFollowError)) throw error;
+    }
+  }
+  if (lastTransportStatus !== undefined) throw jmDownloadTransportError(lastTransportStatus);
+  throw unavailable();
+}
+
 async function getComicDetail(
   payload: ComicDetailPayload = {},
 ): Promise<ComicDetailContract> {
   const comicId = String(payload.comicId ?? "").trim();
+  const comicFollow = payload.extern?.comicFollow === true;
+  const requestedId = Number(comicId);
+  const validRequestedId = /^\d+$/.test(comicId) && Number.isSafeInteger(requestedId) && requestedId > 0;
+  if (comicFollow && !validRequestedId) throw new JmFollowError("invalidResponse");
   if (!comicId) {
     throw new Error("comicId 不能为空");
   }
 
+  const downloadAlbum = !comicFollow && payload.extern?.comicDownload === true && validRequestedId
+    ? await readAutomaticJmDownloadAlbum(payload, requestedId)
+    : null;
   const path = `${Config.baseUrl}/album`;
-
-  const response = unwrapJmAlbumPayload(await jmRequest({
-    path,
-    method: "GET",
-    params: { id: comicId },
-    useJwt: payload.useJwt ?? true,
-    jwtToken: payload.jwtToken,
-  }));
+  const response = downloadAlbum?.album ?? unwrapJmAlbumPayload(comicFollow
+    ? await readJmFollowAlbum(path, comicId)
+    : await jmRequest({
+        path,
+        method: "GET",
+        params: { id: comicId },
+        useJwt: payload.useJwt ?? true,
+        jwtToken: payload.jwtToken,
+      }));
 
   const responseId = optionalJmCount(response.id);
-  const requestedId = Number(comicId);
-  if (!/^\d+$/.test(comicId) || !Number.isSafeInteger(requestedId) || requestedId <= 0 ||
-      responseId === null || responseId !== requestedId ||
+  if (!validRequestedId || responseId === null || responseId !== requestedId ||
       typeof response.name !== "string" || !response.name.trim()) {
+    if (comicFollow) throw new JmFollowError("invalidResponse");
     throw new Error("作品详情暂时无法读取，请重试");
   }
   const totalViews = optionalJmCount(response.total_views);
   const totalLikes = optionalJmCount(response.likes);
   const totalComments = optionalJmCount(response.comment_total);
+  const totalPages = optionalJmCount(response.total_photos);
   const metricAvailability = {
     totalViews: totalViews !== null,
     totalLikes: totalLikes !== null,
@@ -2579,7 +2923,9 @@ async function getComicDetail(
   const publicTags = Array.isArray(response.tags)
     ? response.tags.filter((tag): tag is string => typeof tag === "string")
     : [];
-  const series = normalizeJmSeries(response.series as any[]);
+  const series = comicFollow
+    ? normalizeJmFollowSeries(response, requestedId)
+    : downloadAlbum?.verifiedSeries ?? normalizeJmSeries(response.series as any[]);
   const normalizedInfo = {
     ...response,
     id: toNum(response.id),
@@ -2593,7 +2939,7 @@ async function getComicDetail(
     tags: toStrList(publicTags),
     works: toStrList(response.works),
     actors: toStrList(response.actors),
-    related_list: Array.isArray(response.related_list)
+    related_list: !comicFollow && Array.isArray(response.related_list)
       ? response.related_list
       : [],
     liked: toBool(response.liked),
@@ -2606,18 +2952,18 @@ async function getComicDetail(
 
   const normal: ComicDetailNormal = {
     comicInfo: {
-      id: String(normalizedInfo.id),
+      id: comicFollow ? comicId : String(normalizedInfo.id),
       title: normalizedInfo.name,
       titleMeta: [
         ...(totalViews === null ? [] : [createActionItem(`浏览：${totalViews}`, {}, { metric: "totalViews" })]),
         ...(timestampToIso(normalizedInfo.addtime)
           ? [createActionItem(`更新：${timestampToIso(normalizedInfo.addtime).slice(0, 10)}`)]
           : []),
-        createActionItem(
-          `章节数：${normalizedInfo.series.length > 0 ? normalizedInfo.series.length : 1}`,
-        ),
-        ...(toNum(response.total_photos) > 0
-          ? [createActionItem(`页数：${toNum(response.total_photos)}`)]
+        ...(Array.isArray(response.series)
+          ? [createActionItem(`章节数：${normalizedInfo.series.length || 1}`)]
+          : []),
+        ...(totalPages !== null && totalPages > 0
+          ? [createActionItem(`页数：${totalPages}`)]
           : []),
       ],
       creator: {
@@ -2646,13 +2992,21 @@ async function getComicDetail(
           (item) =>
             createActionItem(
               item,
-              openSearchAction({ source: JM_PLUGIN_ID, keyword: item }),
+              openSearchAction({
+                source: JM_PLUGIN_ID,
+                keyword: item,
+                extern: { main_tag: 2 },
+              }),
             ),
         ),
         createMetadataActionList("tags", "标签", normalizedInfo.tags, (item) =>
           createActionItem(
             item,
-            openSearchAction({ source: JM_PLUGIN_ID, keyword: item }),
+            openSearchAction({
+              source: JM_PLUGIN_ID,
+              keyword: item,
+              extern: { main_tag: 3 },
+            }),
           ),
         ),
         createMetadataActionList(
@@ -2738,13 +3092,13 @@ async function getComicDetail(
     totalViews: totalViews ?? 0,
     totalLikes: totalLikes ?? 0,
     totalComments: totalComments ?? 0,
-    isFavourite: toBool(normalizedInfo.is_favorite),
-    isLiked: toBool(normalizedInfo.liked),
+    isFavourite: !comicFollow && toBool(normalizedInfo.is_favorite),
+    isLiked: !comicFollow && toBool(normalizedInfo.liked),
     allowComments: true,
     allowLike: true,
     allowCollected: true,
     allowDownload: true,
-    extern: { metricAvailability, fieldsMissing },
+    extern: { metricAvailability, fieldsMissing, canUnlike: false },
   };
 
   const scheme = {
@@ -2755,7 +3109,7 @@ async function getComicDetail(
 
   const data: ComicDetailData = {
     normal,
-    raw: {
+    raw: comicFollow ? {} : {
       comicInfo: normalizedInfo,
     },
   };
@@ -2774,6 +3128,7 @@ async function searchComic(payload: JmSearchPayload = {}) {
   const page = Math.max(1, toNum(payload.page, 1));
   const keyword = String(payload.keyword ?? extern.keyword ?? "").trim();
   const keywordLower = keyword.toLowerCase();
+  const scope = jmSearchScope(extern.main_tag);
   const order = String(extern.sort ?? sortByToOrder(extern.sortBy)).trim();
   const path =
     String(payload.path ?? extern.path ?? "").trim() ||
@@ -2813,7 +3168,11 @@ async function searchComic(payload: JmSearchPayload = {}) {
     };
   };
 
-  if ((Number(keyword) >= 100 || keywordLower.startsWith("jm")) && page === 1) {
+  if (
+    scope === 0 &&
+    (Number(keyword) >= 100 || keywordLower.startsWith("jm")) &&
+    page === 1
+  ) {
     const comicId = keywordLower.startsWith("jm")
       ? keyword.slice(2).trim()
       : keyword;
@@ -2854,6 +3213,7 @@ async function searchComic(payload: JmSearchPayload = {}) {
       search_query: keyword,
       page,
       o: order,
+      ...(scope === 0 ? {} : { main_tag: scope }),
     },
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
@@ -2971,7 +3331,7 @@ async function getHomeRecommendData(payload: JmHomePayload = {}) {
   const promote = await jmRequest({
     path: promotePath,
     method: "GET",
-    cache: true,
+    cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   });
@@ -3028,7 +3388,7 @@ async function getHomeLatestData(payload: JmHomePayload = {}) {
     path,
     method: "GET",
     params: { page: Math.max(0, page) },
-    cache: true,
+    cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   });
@@ -3055,7 +3415,11 @@ async function getHomeLatestData(payload: JmHomePayload = {}) {
 async function getRankingData(payload: JmRankingPayload = {}) {
   const page = Number.isFinite(Number(payload.page)) ? Number(payload.page) : 0;
   const extern = toStringMap(payload.extern);
-  const c = String(extern.type ?? extern.c ?? "");
+  const selected = String(extern.type ?? extern.c ?? "");
+  const scope = typeof extern.categoryScope === "string" ? extern.categoryScope : "";
+  const scoped = scope ? rankingCategoryForType(getJmRankingCategoryOptions(), scope) : undefined;
+  const c = !scope || selected === scope || rankingCategoryForType(scoped?.children ?? [], selected)
+    ? selected : scope;
   const o = String(extern.order ?? extern.o ?? "");
   const path = `${Config.baseUrl}/categories/filter`;
   const rankingPageSize = 80;
@@ -3064,7 +3428,7 @@ async function getRankingData(payload: JmRankingPayload = {}) {
     path,
     method: "GET",
     params: { page, c, o },
-    cache: true,
+    cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   });
@@ -3107,7 +3471,7 @@ async function getPromoteListData(payload: JmPromoteListPayload = {}) {
     path,
     method: "GET",
     params: { id, page },
-    cache: true,
+    cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   })) as Record<string, any>;
@@ -3147,6 +3511,7 @@ async function getLatestData(payload: JmRankingPayload = {}) {
       path: undefined,
       useJwt: payload.useJwt,
       jwtToken: payload.jwtToken,
+      refresh: payload.refresh,
     });
     const list = Array.isArray((latest as any)?.data?.suggestionItems)
       ? (latest as any).data.suggestionItems
@@ -3176,7 +3541,7 @@ async function getLatestData(payload: JmRankingPayload = {}) {
     path,
     method: "GET",
     params: { page: requestPage },
-    cache: true,
+    cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   });
@@ -3201,23 +3566,24 @@ async function getLatestData(payload: JmRankingPayload = {}) {
 }
 
 async function getCloudFavoriteData(payload: JmCloudFavoritePayload = {}) {
-  const page = Math.max(1, toNum(payload.page, 1));
+  const page = Math.max(1, optionalJmCount(payload.page) ?? 1);
   const extern = toStringMap(payload.extern);
   const folderId = String(payload.folderId ?? extern.folderId ?? "");
   const order = String(payload.order ?? extern.order ?? "mr") || "mr";
-  const path = `${Config.baseUrl}/favorite`;
-  const raw = (await jmRequest({
-    path,
+  const request = await openJmFavoriteRequest(payload);
+  const result = toStringMap(await request("/favorite", {
     method: "GET",
     params: { page, folder_id: folderId, o: order },
-    cache: false,
-    useJwt: payload.useJwt ?? true,
-    jwtToken: payload.jwtToken,
-  })) as Record<string, any>;
-
-  const list = Array.isArray(raw.list) ? raw.list : [];
-  const total = toNum(raw.total, 0);
-  const hasReachedMax = total > 0 ? page * 20 >= total : list.length < 20;
+  }));
+  const raw = Array.isArray(result.list) ? result : toStringMap(result.data);
+  const list = raw.list;
+  const total = optionalJmCount(raw.total);
+  const offset = (page - 1) * 20;
+  if (!Array.isArray(list) ||
+      (list.length === 0 ? total === null || total > offset : total !== null && total < offset + list.length) ||
+      list.some((item) => !optionalJmCount(toStringMap(item).id))) {
+    throw new JmRequestError("收藏资料读取不完整，请重试");
+  }
 
   return {
     source: JM_PLUGIN_ID,
@@ -3229,83 +3595,142 @@ async function getCloudFavoriteData(payload: JmCloudFavoritePayload = {}) {
     },
     data: {
       page,
-      total,
-      hasReachedMax,
-      items: list.map((item: any) => toComicItem(item)),
+      ...(total === null ? {} : { total }),
+      hasReachedMax: total !== null && page * 20 >= total,
+      items: list.map(toComicItem),
       raw,
     },
   };
 }
 
+function isJmLikeTransportFailure(error: unknown) {
+  if (isTransientError(error)) return true;
+  // QuickJS Fetch puts the native transport failure in a TypeError. Axios
+  // does not always attach a transport code to that error.
+  return axios.isAxiosError(error) && !error.response && error.name === "TypeError" &&
+    /^(?:Failed to (?:send HTTP request|parse HTTP response headers|read HTTP response body bytes)|发送 HTTP 请求失败|解析 HTTP 响应头失败|读取 HTTP 响应体字节失败)/i.test(error.message);
+}
+
 async function toggleLike(
   payload: JmLikePayload = {},
-): Promise<ToggleLikeResult> {
+): Promise<ToggleLikeResult & { verified: true; totalLikes?: number; likeDiagnostic?: JmLikeDiagnostic }> {
   const comicId = String(payload.comicId ?? "").trim();
-  if (!comicId) {
-    throw new Error("comicId 不能为空");
+  const requestedId = optionalJmCount(comicId);
+  if (requestedId === null || requestedId === 0) {
+    throw new JmRequestError("作品编号无效");
   }
 
-  const currentLiked = toBool(payload.currentLiked, false);
-  if (currentLiked) {
-    flutterTools.showToast({
-      message: "JM 暂不支持取消点赞",
-      level: "warning",
-    });
-    return {
-      liked: true,
-    };
+  if (toBool(payload.currentLiked, false)) {
+    throw new JmRequestError("禁漫暂不支持取消点赞");
   }
 
-  const path = `${Config.baseUrl}/like`;
-  await jmRequest({
-    path,
-    method: "POST",
-    formData: { id: comicId },
-    cache: false,
-    useJwt: payload.useJwt ?? true,
-    jwtToken: payload.jwtToken,
-  });
+  const revision = currentSessionRevision();
+  const baseUrl = Config.baseUrl;
+  await waitForSessionWrites(revision);
+  const useJwt = payload.useJwt !== false;
+  const configuredJwt = useJwt
+    ? String(payload.jwtToken ?? "").trim() ||
+      String(await loadPluginSetting("auth.jwt", "", { strict: true }) ?? "").trim()
+    : "";
+  const requestJwt = useJwt && !configuredJwt ? await getJwtToken(revision)
+    : configuredJwt === "null" || configuredJwt === "undefined" ? "" : configuredJwt;
+  assertCurrentSession(revision);
+  // Axios merges its request configuration. Use a callback to preserve one
+  // diagnostics object for both requests without exposing it in either request.
+  const diagnostic: JmLikeDiagnostic | undefined = payload.includeLikeDiagnostic === true ? {} : undefined;
+  const options = { cache: false, comicLike: true, useJwt, likeDiagnostic: diagnostic ? () => diagnostic : undefined };
+  try {
+    await jmRequest({
+      ...options,
+      path: `${baseUrl}/like`,
+      method: "POST",
+      formData: { id: comicId },
+    }, revision, requestJwt);
+  } catch (error) {
+    assertCurrentSession(revision);
+    const transport = isJmLikeTransportFailure(error);
+    if (!transport && !(error instanceof JmLikeUnconfirmedError)) throw error;
+    // The server may have applied a write whose receipt never reached us.
+    if (transport) recordJmLikeStage(diagnostic, "submit", "transport");
+  }
 
+  let album: Record<string, unknown>;
+  try {
+    album = unwrapJmAlbumPayload(await jmRequest({
+      ...options,
+      path: `${baseUrl}/album`,
+      method: "GET",
+      params: { id: comicId },
+    }, revision, requestJwt));
+  } catch (error) {
+    assertCurrentSession(revision);
+    if (!isJmLikeTransportFailure(error)) throw error;
+    recordJmLikeStage(diagnostic, "readback", "transport");
+    throw new JmLikeUnconfirmedError(diagnostic);
+  }
+  assertCurrentSession(revision);
+  const albumId = optionalJmCount(album.id);
+  const work = albumId === null ? "unknown" : albumId === requestedId ? "match" : "mismatch";
+  const hasLiked = Object.prototype.hasOwnProperty.call(album, "liked");
+  const likedField = album.liked;
+  const likedType = !hasLiked ? "missing" : likedField === null ? "null" :
+    Array.isArray(likedField) ? "array" : typeof likedField;
+  const liked = toBool(likedField) ? "true" : !toBool(likedField, true) ? "false" : "unknown";
+  const totalLikes = optionalJmCount(album.likes);
+  const previous = optionalJmCount(payload.previousTotalLikes);
+  const total = totalLikes !== null ? "present" :
+    Object.prototype.hasOwnProperty.call(album, "likes") ? "invalid" : "missing";
+  const totalChange = work !== "match" || totalLikes === null || previous === null ? "unknown" :
+    totalLikes === previous ? "unchanged" : "changed";
+  const result = work === "match" && liked === "true" ? "confirmed" : "unconfirmed";
+  if (diagnostic) diagnostic.verify = { result, work, likedType, liked, total, totalChange };
+  // Log only classifications. Never include raw fields, IDs, credentials, or URLs.
+  console.info(`[jm.like] verify result=${result} work=${work} likedType=${likedType} liked=${liked} total=${total} totalChange=${totalChange}`);
+  if (result !== "confirmed") {
+    throw new JmLikeUnconfirmedError(diagnostic);
+  }
   return {
     liked: true,
+    verified: true,
+    ...(diagnostic ? { likeDiagnostic: diagnostic } : {}),
+    ...(totalLikes === null ? {} : { totalLikes }),
   };
+}
+
+async function openJmFavoriteRequest(payload: { useJwt?: boolean; jwtToken?: string }) {
+  const revision = currentSessionRevision();
+  const baseUrl = Config.baseUrl;
+  await waitForSessionWrites(revision);
+  const useJwt = payload.useJwt !== false;
+  const configured = useJwt ? String(payload.jwtToken ?? "").trim() ||
+    String(await loadPluginSetting("auth.jwt", "", { strict: true }) ?? "").trim() : "";
+  const jwt = useJwt && !configured ? await getJwtToken(revision) : configured;
+  assertCurrentSession(revision);
+  if (!jwt || jwt === "null" || jwt === "undefined") {
+    throw buildUnauthorizedError("请先登录禁漫天堂");
+  }
+  return (route: string, options: RequestPayload) => jmRequest({
+    ...options, path: `${baseUrl}${route}`, comicFavorite: true, cache: false, useJwt,
+  }, revision, jwt);
 }
 
 async function toggleFavorite(
   payload: JmToggleFavoritePayload = {},
 ): Promise<ToggleFavoriteResult> {
   const comicId = String(payload.comicId ?? "").trim();
-  if (!comicId) {
-    throw new Error("comicId 不能为空");
-  }
+  if (!comicId) throw new Error("comicId 不能为空");
 
-  const path = `${Config.baseUrl}/favorite`;
-  const res = await jmRequest({
-    path,
-    method: "POST",
-    formData: { aid: comicId },
-    cache: false,
-    useJwt: payload.useJwt ?? true,
-    jwtToken: payload.jwtToken,
-  });
-
-
-  const result = toStringMap(res);
+  const request = await openJmFavoriteRequest(payload);
+  const result = toStringMap(await request("/favorite", {
+    method: "POST", formData: { aid: comicId },
+  }));
   const body = toStringMap(result.data);
-  const message = String(body.msg ?? result.msg ?? "");
-  if (/已[满滿]/.test(message)) {
-    throw new JmRequestError("收藏数已达上限");
-  }
   const status = body.status ?? result.status;
-  if (
-    status === false ||
-    status === 0 ||
-    ["error", "fail", "failed"].includes(String(status).toLowerCase())
-  ) {
-    throw new JmRequestError(message || "收藏操作未完成");
+  const type = body.type ?? result.type;
+  if (status !== "ok" || (type !== "add" && type !== "remove")) {
+    throw new JmRequestError("禁漫未确认收藏状态，请重新打开作品查看");
   }
-
-  const favorited = !toBool(payload.currentFavorite, false);
+  const favorited = type === "add";
 
   return {
     favorited,
@@ -3339,13 +3764,14 @@ async function moveFavoriteToFolder(payload: JmFavoriteFolderPayload = {}) {
   const comicId = String(payload.comicId ?? "").trim();
   const folderId = String(payload.folderId ?? "").trim();
   const folderName = String(payload.folderName ?? "").trim();
-  if (!comicId || !folderId) {
-    throw new Error("comicId 或 folderId 不能为空");
+  const id = optionalJmCount(comicId);
+  const target = optionalJmCount(folderId);
+  if (!id || !target) {
+    throw new Error("作品或收藏夹编号无效");
   }
 
-  const path = `${Config.baseUrl}/favorite_folder`;
-  await jmRequest({
-    path,
+  const request = await openJmFavoriteRequest(payload);
+  await request("/favorite_folder", {
     method: "POST",
     formData: {
       type: "move",
@@ -3353,14 +3779,22 @@ async function moveFavoriteToFolder(payload: JmFavoriteFolderPayload = {}) {
       folder_name: folderName,
       aid: comicId,
     },
-    cache: false,
-    useJwt: payload.useJwt ?? true,
-    jwtToken: payload.jwtToken,
   });
 
-  return {
-    ok: true,
-  };
+  // The move response has no known receipt identifying both work and folder.
+  // Look for positive membership in the selected folder with bounded reads.
+  for (let page = 1; page <= 2; page++) {
+    const result = toStringMap(await request("/favorite", {
+      method: "GET", params: { page, folder_id: folderId, o: "mr" },
+    }));
+    const folder = Array.isArray(result.list) ? result : toStringMap(result.data);
+    const rows = folder.list;
+    if (!Array.isArray(rows)) break;
+    if (rows.some((row) => optionalJmCount(toStringMap(row).id) === id)) return { ok: true };
+    const total = optionalJmCount(folder.total);
+    if (rows.length < 20 || (total !== null && total <= page * 20)) break;
+  }
+  throw new JmRequestError("暂时无法确认已移入收藏夹，请打开目标收藏夹查看");
 }
 
 function buildJmUserCover(photo: unknown): string {
@@ -3545,7 +3979,7 @@ async function submitJmComment(input: {
   if (!succeeded) {
     const message = msg || (status ? `评论发送失败 (${status})` : "评论发送失败");
     if (isJmLoginRequiredMessage(message)) {
-      throw await buildUnauthorizedError("登录已失效，请重新登录后再评论");
+      throw buildUnauthorizedError("登录已失效，请重新登录后再评论");
     }
     throw new Error(message);
   }
@@ -3650,7 +4084,7 @@ async function getWeekRankingData(payload: JmWeekRankingPayload = {}) {
     path,
     method: "GET",
     params: { date, type, page },
-    cache: true,
+    cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   });
@@ -3697,6 +4131,79 @@ async function getWeekRankingData(payload: JmWeekRankingPayload = {}) {
   };
 }
 
+async function selectDownloadChapter(payload: JmChapterPayload, chapterId: string) {
+  const excluded = downloadRouteExclusions(payload.downloadRoute);
+  if (!excluded) return null;
+  const revision = currentSessionRevision();
+  await waitForSessionWrites(revision);
+  const [apiSetting, imageSetting] = await Promise.all([
+    loadPluginSetting("network.apiBase", "", { strict: true }),
+    loadPluginSetting("network.imageBase", "", { strict: true }),
+  ]);
+  assertCurrentSession(revision);
+  if (typeof apiSetting !== "string" || typeof imageSetting !== "string") {
+    throw new Error("下载线路设置暂不可用，请重试");
+  }
+  const apiPin = apiSetting.trim();
+  const imagePin = imageSetting.trim();
+  if (apiPin && imagePin) return null;
+  const requestedId = optionalJmCount(chapterId);
+  if (!requestedId) throw new Error("下载章节编号无效");
+
+  const speed = await getEndpointSpeedCache().catch(() => null);
+  assertCurrentSession(revision);
+  const recent = speed && isRecentEndpointSpeed(speed) ? speed : null;
+  const activeApi = jmDownloadBase(Config.baseUrl)?.origin;
+  const apiBases = rankedDownloadBases(apiPin, Config.baseUrl, currentApiBases(), recent?.api ?? []);
+  const imageBases = rankedDownloadBases(imagePin, Config.imagesUrl, currentImageBases(), recent?.image ?? []);
+  const candidates = apiBases.flatMap((api) => {
+    for (const image of imageBases) {
+      const route = jmDownloadPair(api, image);
+      if (route && !excluded.has(route.key)) return [{ api, image, route }];
+    }
+    return [];
+  }).slice(0, 3);
+
+  const read = (api: URL, jwt?: string) => readJmDownloadChapter(api, requestedId, revision, jwt).catch(() => {
+    assertCurrentSession(revision);
+    return null;
+  });
+  let needsLogin = false;
+  let lastTransportStatus: number | undefined;
+  let attempted = false;
+  for (const { api, image, route } of candidates) {
+    attempted = true;
+    let chapter = await read(api);
+    if (chapter === "memberGate" && api.origin === activeApi && payload.useJwt !== false) {
+      const configured = String(payload.jwtToken || await loadPluginSetting("auth.jwt", "") || "").trim();
+      const jwt = configured && configured !== "null" && configured !== "undefined"
+        ? configured
+        : await getJwtToken(revision);
+      assertCurrentSession(revision);
+      if (jwt) chapter = await read(api, jwt);
+      needsLogin = chapter === "memberGate";
+    }
+    if (chapter === "restricted" || chapter === "notFound") {
+      throw new Error(JSON.stringify({
+        type: "comic_download_route_unavailable", retryable: false, reason: chapter,
+      }));
+    }
+    if (!chapter || chapter === "memberGate") continue;
+    if ("transportStatus" in chapter) {
+      if (chapter.transportStatus === 429) throw jmDownloadTransportError(429);
+      lastTransportStatus = chapter.transportStatus;
+      continue;
+    }
+    return { chapter, imageBase: image.origin, route };
+  }
+  if (needsLogin) throw buildUnauthorizedError("请先登录禁漫账号");
+  if (lastTransportStatus !== undefined) throw jmDownloadTransportError(lastTransportStatus);
+  throw new Error(JSON.stringify({
+    type: "comic_download_route_unavailable",
+    ...(attempted ? { retryable: false, reason: "unverified" } : { reason: "noCandidate" }),
+  }));
+}
+
 async function getChapter(payload: JmChapterPayload = {}) {
   const chapterId = String(payload.chapterId ?? "").trim();
   if (!chapterId) {
@@ -3704,7 +4211,8 @@ async function getChapter(payload: JmChapterPayload = {}) {
   }
 
   const path = `${Config.baseUrl}/chapter`;
-  const response = (await jmRequest({
+  const selected = await selectDownloadChapter(payload, chapterId);
+  const response = selected?.chapter ?? (await jmRequest({
     path,
     method: "GET",
     params: {
@@ -3717,17 +4225,37 @@ async function getChapter(payload: JmChapterPayload = {}) {
   })) as Record<string, any>;
 
   const images = Array.isArray(response.images) ? response.images : [];
-  const imageBase = String(Config.imagesUrl).trim();
-  const docs = images.map((image) => ({
-    name: String(image ?? ""),
-    path: String(image ?? ""),
-    url: imageBase
-      ? `${imageBase}/media/photos/${chapterId}/${String(image ?? "")}`
-      : "",
-    id: String(image ?? ""),
-  }));
+  const imageBase = selected?.imageBase ?? String(Config.imagesUrl).trim();
+  const docExtern = selected ? {
+    jmDownloadApiHost: selected.route.apiHost,
+    jmDownloadImageHost: selected.route.imageHost,
+  } : {};
+  const pages = images.map((image) => {
+    const name = String(image ?? "");
+    const url = imageBase
+      ? `${imageBase}/media/photos/${selected?.chapter.id ?? chapterId}/${name}`
+      : "";
+    const backgroundDownload = selected
+      ? jmBackgroundDownload(url, selected.route)
+      : undefined;
+    return {
+      name, path: name, url, id: name,
+      extern: backgroundDownload ? { ...docExtern, backgroundDownload } : docExtern,
+    };
+  });
 
-  const result = {
+  const chapter = {
+    id: String(response.id ?? chapterId),
+    requestId: selected ? chapterId : String(response.id ?? chapterId),
+    logicalKey: String(response.id ?? chapterId),
+    storageChapterId: String(response.id ?? chapterId),
+    name: String(response.name ?? ""),
+    order: 0,
+    pages,
+    extern: selected ? { downloadRoute: selected.route } : {},
+  };
+
+  return {
     source: JM_PLUGIN_ID,
     comicId: String(payload.comicId ?? ""),
     chapterId,
@@ -3737,36 +4265,9 @@ async function getChapter(payload: JmChapterPayload = {}) {
       type: "chapterContent",
       source: JM_PLUGIN_ID,
     },
-    data: {
-      chapter: {
-        id: String(response.id ?? chapterId),
-        requestId: String(response.id ?? chapterId),
-        logicalKey: String(response.id ?? chapterId),
-        storageChapterId: String(response.id ?? chapterId),
-        name: String(response.name ?? ""),
-        order: 0,
-        pages: docs.map((doc) => ({
-          ...doc,
-          extern: {},
-        })),
-        extern: {},
-      },
-    },
-    chapter: {
-      id: String(response.id ?? chapterId),
-      requestId: String(response.id ?? chapterId),
-      logicalKey: String(response.id ?? chapterId),
-      storageChapterId: String(response.id ?? chapterId),
-      name: String(response.name ?? ""),
-      order: 0,
-      pages: docs.map((doc) => ({
-        ...doc,
-        extern: {},
-      })),
-      extern: {},
-    },
+    data: { chapter },
+    chapter,
   };
-  return result;
 }
 
 async function getReadSnapshot(payload: JmReadSnapshotPayload = {}) {

@@ -1,8 +1,9 @@
-import { createBasicMetadata, toStringMap } from "./common";
+import { createBasicMetadata, nonnegativeInteger, toStringMap } from "./common";
 import { PLUGIN_ID } from "./config";
 import type { SearchApiComic } from "./types";
 
 export type CopyFilterOption = { label: string; value: string };
+export const COPY_THEME_SLUG = /^[a-zA-Z0-9_-]+$/;
 export const COPY_ORDER_OPTIONS: CopyFilterOption[] = [
   { label: "更新最新", value: "-datetime_updated" },
   { label: "更新最早", value: "datetime_updated" },
@@ -13,6 +14,23 @@ export const COPY_ORDER_OPTIONS: CopyFilterOption[] = [
 export function normalizeCopySearchScope(value: unknown) {
   const scope = String(value ?? "").trim();
   return ["", "name", "author", "local"].includes(scope) ? scope : "";
+}
+
+export function findCopySearchTopic(
+  topics: CopyFilterOption[],
+  keyword: unknown,
+  variants: unknown,
+): CopyFilterOption | null {
+  const normalize = (value: unknown) => typeof value === "string"
+    ? value.normalize("NFKC").trim().toLowerCase() : "";
+  const query = normalize(keyword);
+  if (!query) return null;
+  const names = new Set([query, ...(Array.isArray(variants) ? variants.map(normalize) : [])]);
+  names.delete("");
+  const matches = topics.filter(({ label, value }) =>
+    names.has(normalize(label)) || names.has(normalize(value)),
+  );
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 /** /update/newest and /recs wrap comics; /comics returns flat comic records. */
@@ -53,8 +71,7 @@ export function mapCopyComicListItem(value: unknown) {
     String(item.status?.display ?? "").trim() || String(item.status?.value ?? "").trim();
   const latest = String(item.last_chapter_name ?? "").trim();
   const path = `comic/${comicId}/cover.jpg`;
-  const popularity =
-    item.popular == null || String(item.popular).trim() === "" ? null : Number(item.popular);
+  const popularity = nonnegativeInteger(item.popular);
   return {
     source: PLUGIN_ID,
     id: comicId,
@@ -76,7 +93,7 @@ export function mapCopyComicListItem(value: unknown) {
       ...(authorNames.length ? [createBasicMetadata("author", "作者", authorNames)] : []),
       ...(themes.length ? [createBasicMetadata("categories", "题材", themes)] : []),
       ...(aliases.length ? [createBasicMetadata("aliases", "别名", aliases)] : []),
-      ...(popularity !== null && Number.isFinite(popularity) && popularity >= 0
+      ...(popularity !== null
         ? [createBasicMetadata("popularity", "热度", [String(popularity)])]
         : []),
       ...(statusText ? [createBasicMetadata("status", "状态", [statusText])] : []),
@@ -124,7 +141,7 @@ export function normalizeCopyThemeOptions(value: unknown): CopyFilterOption[] {
     const row = toStringMap(raw);
     const label = String(row.name ?? row.label ?? "").trim();
     const slug = String(row.path_word ?? row.value ?? "").trim();
-    if (!label || !/^[a-zA-Z0-9_-]+$/.test(slug) || seen.has(slug)) return [];
+    if (!label || !COPY_THEME_SLUG.test(slug) || seen.has(slug)) return [];
     seen.add(slug);
     return [{ label, value: slug }];
   });

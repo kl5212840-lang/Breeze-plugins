@@ -2,7 +2,11 @@ import { assertCurrentSession, currentSessionRevision, setJwtToken } from "./sta
 import type { JmRequestConfig, RequestPayload } from "./types";
 import { nowTs, toQueryString } from "./utils";
 
-export async function buildRequestConfig(input: RequestPayload, revision = currentSessionRevision()): Promise<{
+export async function buildRequestConfig(
+  input: RequestPayload,
+  revision = currentSessionRevision(),
+  requestJwt?: string,
+): Promise<{
   config: JmRequestConfig;
   cacheEnabled: boolean;
 }> {
@@ -15,7 +19,8 @@ export async function buildRequestConfig(input: RequestPayload, revision = curre
 
   const headers: Record<string, string> = {};
   const inputJwt = String(input.jwtToken || "").trim();
-  if (inputJwt) {
+  const protectSession = input.readOnlyProfile || input.comicFavorite;
+  if (inputJwt && !input.comicFollow && !input.comicLike && !protectSession) {
     await setJwtToken(inputJwt, revision);
   }
 
@@ -28,7 +33,7 @@ export async function buildRequestConfig(input: RequestPayload, revision = curre
       headers["content-type"] || "application/x-www-form-urlencoded";
   }
 
-  const cacheEnabled = input.cache === true;
+  const cacheEnabled = !input.comicFollow && !input.comicLike && !input.comicFavorite && input.cache === true;
   const config: JmRequestConfig = {
     method,
     url,
@@ -38,10 +43,23 @@ export async function buildRequestConfig(input: RequestPayload, revision = curre
     timeout: 10000,
     responseType: "arraybuffer",
     validateStatus: () => true,
+    ...((input.comicFollow || protectSession) && { withCredentials: false }),
+    ...(((input.comicFollow && requestJwt) || input.comicLike || protectSession) && {
+      maxRedirects: 0,
+      // Keep the redirect status available for like operations without
+      // sending the write or credentials to a Location target.
+      fetchOptions: { redirect: input.comicLike ? "manual" : "error" },
+    }),
     __jmMeta: {
       ts: nowTs(),
       cacheEnabled,
+      comicFollow: input.comicFollow,
+      comicLike: input.comicLike,
+      likeDiagnostic: input.likeDiagnostic,
+      comicFavorite: input.comicFavorite,
+      readOnlyProfile: input.readOnlyProfile,
       useJwt: input.useJwt !== false,
+      requestJwt,
       sessionRevision: revision,
     },
   };

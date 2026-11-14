@@ -4,12 +4,16 @@ import type {
   FilterBundleContract,
 } from "breeze-plugin-kit";
 import {
+  bikaSearchFieldParameter,
+  bikaSearchOverride,
+  bikaSearchSortBy,
   boolKeyList,
   getBikaRankingOptions,
   loadBlockedCategories,
 } from "./bika-comic-shared";
 import { BIKA_SEARCH_CATEGORY_OPTIONS } from "./bika-constants";
 import { toNum, toStringMap } from "./bika-utils";
+import { getApiBase } from "./client";
 import { BIKA_PLUGIN_ID } from "./info";
 
 export async function getCloudFavoriteFilterBundle(): Promise<FilterBundleContract> {
@@ -158,7 +162,12 @@ export async function getAdvancedSearchScheme(
   const blockedCategories = await loadBlockedCategories();
   const selectedCategories = boolKeyList(extern.categories);
   const selectedBlocked = boolKeyList(extern.blockedCategories);
-  const selectedSortBy = toNum(extern.sortBy, 1);
+  const override = String(extern.url ?? "").trim();
+  const scoped = bikaSearchOverride(override, await getApiBase());
+  const creator = extern.mode === "creator" && String(extern.creatorId ?? "").trim() !== "";
+  const canSort = !override || scoped?.pathname === "/comics";
+  const canSelectCategories = !override && !creator && !bikaSearchFieldParameter(extern.bikaSearchField);
+  const selectedSortBy = toNum(extern.sortBy, bikaSearchSortBy(scoped?.searchParams.get("s")));
 
   return {
     source: BIKA_PLUGIN_ID,
@@ -166,7 +175,7 @@ export async function getAdvancedSearchScheme(
       version: "1.0.0" as const,
       type: "advancedSearch" as const,
       fields: [
-        {
+        ...(canSort ? [{
           key: "sortBy",
           kind: "choice" as const,
           label: "排序",
@@ -176,8 +185,8 @@ export async function getAdvancedSearchScheme(
             { label: "最多喜欢", value: 3 },
             { label: "最多观看", value: 4 },
           ],
-        },
-        {
+        }] : []),
+        ...(canSelectCategories ? [{
           key: "categories",
           kind: "multiChoice" as const,
           label: "分类选择",
@@ -185,7 +194,7 @@ export async function getAdvancedSearchScheme(
             label: item,
             value: item,
           })),
-        },
+        }] : []),
         {
           key: "blockedCategories",
           kind: "multiChoice" as const,

@@ -17,3 +17,11 @@ test("personal tab replaces standalone cloud favorites and declares the real fee
   assert.equal(info.breezeExperience.profileCloudFavoriteFunction, "getCloudFavoriteData");
   assert.deepEqual(info.function?.map(item => item.id), ["recommend", "newest", "discover", "rank"]);
 });
+
+test("declares the versioned comic follow capability", () => {
+  assert.equal(buildPluginInfo().breezeExperience.comicFollow, 1);
+});
+
+test("declares the versioned Copy topic search capability", () => {
+  assert.equal(buildPluginInfo().breezeExperience.copyTopicSearch, 1);
+});

@@ -4,6 +4,7 @@ import { getApiBase } from "./client";
 import { BIKA_PLUGIN_ID } from "./info";
 import { loadPluginSetting } from "./plugin-config";
 import { assertBikaAuthRevision, currentBikaAuthRevision, BikaAccountChangedError } from "./bika-auth-session";
+import { notifyAutoCheckinCompleted } from "../../shared/auto-checkin-notice";
 export { assertBikaAuthRevision, beginBikaAuthChange, BikaAccountChangedError } from "./bika-auth-session";
 type Auth = { revision: number; authorization: string };
 async function readAuth(): Promise<Auth> {
@@ -97,21 +98,38 @@ export async function getCheckinStatus() {
   return { source: BIKA_PLUGIN_ID, data: profile.status };
 }
 
-const pending = new Map<string, Promise<Awaited<ReturnType<typeof performCheckin>>>>();
+const pending = new Map<string, {
+  task: ReturnType<typeof performCheckin>;
+  manualRequested: boolean;
+}>();
 const submittingAccounts = new Set<string>();
 export async function checkInToday(payload: { accountId?: unknown } = {}) {
+  return requestCheckin(payload, false);
+}
+
+export async function checkInAutomatically() {
+  return requestCheckin({}, true);
+}
+
+async function requestCheckin(payload: { accountId?: unknown }, automatic: boolean) {
   const auth = await readAuth();
   const key = `${auth.revision}:${auth.authorization}`;
-  const existing = pending.get(key);
-  if (existing) {
-    const result = await existing;
-    if (payload.accountId !== undefined && payload.accountId !== result.data.accountId)
-      throw new BikaAccountChangedError();
-    return result;
+  let current = pending.get(key);
+  if (current === undefined) {
+    const task = performCheckin(auth, payload.accountId).finally(() => pending.delete(key));
+    current = { task, manualRequested: !automatic };
+    pending.set(key, current);
   }
-  const task = performCheckin(auth, payload.accountId).finally(() => pending.delete(key));
-  pending.set(key, task);
-  return await task;
+  if (!automatic) current.manualRequested = true;
+  const { newlyConfirmed, ...result } = await current.task;
+  if (payload.accountId !== undefined && payload.accountId !== result.data.accountId)
+    throw new BikaAccountChangedError();
+  if (automatic && newlyConfirmed && !current.manualRequested && result.data.checkedInDate) {
+    assertBikaAuthRevision(auth.revision);
+    assertDate(result.data.checkedInDate);
+    void notifyAutoCheckinCompleted(result.data.accountId, result.data.checkedInDate);
+  }
+  return result;
 }
 
 async function performCheckin(auth: Auth, expectedId: unknown) {
@@ -121,6 +139,7 @@ async function performCheckin(auth: Auth, expectedId: unknown) {
   if (before.status.checkedIn !== false) {
     return {
       source: BIKA_PLUGIN_ID,
+      newlyConfirmed: false,
       data: {
         ...before.status,
         ok: before.status.checkedIn === true,
@@ -134,6 +153,7 @@ async function performCheckin(auth: Auth, expectedId: unknown) {
   if (submittingAccounts.has(before.status.accountId)) {
     return {
       source: BIKA_PLUGIN_ID,
+      newlyConfirmed: false,
       data: { ...before.status, ok: false, message: "签到正在处理，请稍后核对" },
     };
   }
@@ -160,6 +180,7 @@ async function performCheckin(auth: Auth, expectedId: unknown) {
     assertDate(before.date);
     return {
       source: BIKA_PLUGIN_ID,
+      newlyConfirmed: after.status.checkedIn === true,
       data: {
         ...after.status,
         ok: after.status.checkedIn === true,

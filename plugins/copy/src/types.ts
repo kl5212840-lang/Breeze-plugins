@@ -29,6 +29,7 @@ export type ComicDetailPayload = BasePayload & {
 export type ChapterPayload = BasePayload & {
   comicId?: string;
   chapterId?: string;
+  downloadRoute?: { version: number; excluded: readonly string[] };
 };
 
 export type ReadSnapshotPayload = {

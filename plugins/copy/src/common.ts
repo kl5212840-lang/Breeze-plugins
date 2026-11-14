@@ -10,6 +10,11 @@ export function toStringMap(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+export function nonnegativeInteger(value: unknown): number | null {
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) value = Number(value);
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 export function createActionItem(
   name: unknown,
   onTap: ComicInfoPageAction | null = null,

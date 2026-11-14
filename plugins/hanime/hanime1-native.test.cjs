@@ -55,7 +55,7 @@ test('declares a native catalog action', () => {
   assert.equal(info.function[0].action.type, 'openVideoCatalog');
   assert.deepEqual(manifest, info);
   assert.equal(info.uuid, '1e600cff-8ebe-4517-8aa4-6678aec46424');
-  assert.equal(info.version, '0.11.5');
+  assert.equal(info.version, '0.11.6');
   assert.equal(info.updateUrl, 'https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/hanime.json');
   assert.deepEqual(info.function[0].action.payload.tabs.map((item) => item.title),
     ['推荐', '排行', '订阅', '我的']);
@@ -194,7 +194,7 @@ test('a populated or multi-page document cannot masquerade as an empty result', 
   }
 });
 
-test('detail normalizes episodes, recommendations, and text', () => {
+test('detail normalizes the site playlist, recommendations, and text', () => {
   const result = getVideoDetail({
     watchUrl: 'https://hanime1.me/watch?v=408773',
     snapshot: {
@@ -208,7 +208,9 @@ test('detail normalizes episodes, recommendations, and text', () => {
   assert.equal(result.data.title, 'A title');
   assert.equal(result.data.description, 'Short summary');
   assert.deepEqual(result.data.tags, ['HD', '动画']);
-  assert.equal(result.data.episodes.length, 1);
+  assert.equal(result.data.sequenceKind, 'sitePlaylist');
+  assert.deepEqual(result.data.episodes, result.data.playlist);
+  assert.equal(result.data.playlist.length, 1);
   assert.equal(result.data.related.length, 1);
 });
 

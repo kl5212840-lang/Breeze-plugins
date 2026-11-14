@@ -2,7 +2,7 @@
   "key": "modu",
   "id": "b27083a4-a643-462a-8204-e6f42c19a5b9",
   "name": "魔都资源",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "home": "https://www.mdzyapi.com/",
   "apis": [
     "https://www.mdzyapi.com/api.php/provide/vod/"

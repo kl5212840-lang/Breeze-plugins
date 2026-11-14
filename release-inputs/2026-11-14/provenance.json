@@ -1,0 +1,34 @@
+{
+  "bika": {
+    "inputVersion": "0.1.32",
+    "sha256": "2108c0f4d243c752d5b950bf3fcdfd78a5949b9431b749e2d4a2c6dcb5ff308c"
+  },
+  "jm": {
+    "inputVersion": "0.3.22",
+    "sha256": "7daa0ab156d8f5a93bbcd61d3e5c609c37722ba3265259d05115d49ae404c448",
+    "migrationFrom": [
+      {
+        "version": "0.3.22",
+        "scriptSha256": "7daa0ab156d8f5a93bbcd61d3e5c609c37722ba3265259d05115d49ae404c448"
+      }
+    ]
+  },
+  "copy": {
+    "inputVersion": "0.1.27",
+    "sha256": "1a65a79f32298a1ec31d653b383dfd5163082fe6c9b4e86b0b1de4fc4d9fa34f"
+  },
+  "hanime": {
+    "inputVersion": "0.11.6",
+    "sha256": "251ba5ff201c6d3b6a941ce4894d9394708268ed5f83e17b552325de77fb4194",
+    "migrationFrom": [
+      {
+        "version": "0.11.6",
+        "scriptSha256": "14eca59937fef5c0a65c88549406d84cc5061bdd9b882e21a4d9e2c01b719235"
+      }
+    ]
+  },
+  "modu": {
+    "inputVersion": "0.1.3",
+    "sha256": "d581fed42ff38a0dd132effd39a5efe008881d72404f9acda570321d5dbab704"
+  }
+}

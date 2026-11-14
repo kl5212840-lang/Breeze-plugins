@@ -1,6 +1,7 @@
 import ky from "ky";
 import {
   COPY_AVATAR_LIMIT,
+  COPY_AVATAR_SIZE_MESSAGE,
   COPY_PROFILE_ORIGIN,
   type CopyAvatarImage,
   type CopyProfileTransport,
@@ -9,7 +10,7 @@ import {
 /** Decode a canonical base64 JPEG without depending on Node Buffer in the plugin runtime. */
 export function prepareCopyAvatarJpeg(value: unknown): CopyAvatarImage {
   if (typeof value === "string" && value.length > Math.ceil(COPY_AVATAR_LIMIT / 3) * 4) {
-    throw new Error("请选择小于 2MiB 的非空图片");
+    throw new Error(COPY_AVATAR_SIZE_MESSAGE);
   }
   if (
     typeof value !== "string" ||
@@ -21,7 +22,8 @@ export function prepareCopyAvatarJpeg(value: unknown): CopyAvatarImage {
   }
   const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
   const length = (value.length / 4) * 3 - padding;
-  if (!length || length >= COPY_AVATAR_LIMIT) throw new Error("请选择小于 2MiB 的非空图片");
+  if (!length) throw new Error("请选择非空图片");
+  if (length > COPY_AVATAR_LIMIT) throw new Error(COPY_AVATAR_SIZE_MESSAGE);
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const bytes = new Uint8Array(length);
   let bits = 0,
@@ -76,7 +78,7 @@ export const copyProfileTransport: CopyProfileTransport = async (request) => {
   const headers = Object.fromEntries(
     Object.entries(request.headers).filter(([name]) => name.toLowerCase() !== "cookie"),
   );
-  return ky(request.url, {
+  const response = await ky(request.url, {
     method: request.method,
     headers,
     body,
@@ -84,6 +86,17 @@ export const copyProfileTransport: CopyProfileTransport = async (request) => {
     cache: "no-store",
     redirect: "error",
     retry: 0,
-    timeout: 20_000,
-  }).json<unknown>();
+    timeout: request.timeoutMs ?? 20_000,
+    throwHttpErrors: false,
+  });
+  if (response.ok) return response.json<unknown>();
+  if (response.status < 400 || response.status >= 500) throw new Error("头像服务响应异常");
+  // Preserve the HTTP classification; the body may contain a policy message
+  // but may also be an HTML gateway page. Never trust a body code of 200 here.
+  try {
+    const body = await response.json<{ message?: unknown }>();
+    return { code: response.status, message: body?.message };
+  } catch {
+    return { code: response.status };
+  }
 };

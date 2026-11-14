@@ -42,3 +42,16 @@ export class JmRequestError extends RetryableRequestError {
     this.name = "JmRequestError";
   }
 }
+
+type JmFollowFailure =
+  | "network"
+  | "sourceUnavailable"
+  | "invalidResponse"
+  | "signInRequired"
+  | "notFound";
+
+export class JmFollowError extends Error {
+  constructor(readonly reason: JmFollowFailure, retryable = false) {
+    super(JSON.stringify({ type: "comic_follow_error", reason, retryable }));
+  }
+}

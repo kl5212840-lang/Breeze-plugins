@@ -93,7 +93,7 @@ test("account failures are not presented as a cached successful profile", async 
     await assert.rejects(plugin.getUserInfoBundle(), /unauthorized/);
     assert.equal(requests, 0);
     signedIn = true;
-    await assert.rejects(plugin.getUserInfoBundle(), /fixture service unavailable/);
+    await assert.rejects(plugin.getUserInfoBundle(), /无法读取拷贝账号资料/);
     assert.equal(requests, 1);
   } finally {
     globalThis.bridge = previousBridge;

@@ -16,6 +16,10 @@ function integer(value, fallback = 0) {
   const result = Number(value);
   return Number.isSafeInteger(result) && result >= 0 ? result : fallback;
 }
+function metricInteger(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !/^\d+$/.test(value))) return null;
+  return integer(value, null);
+}
 function credit(value, limit) {
   const result=text(value,limit);
   return ['', '暂无','未知','不详','内详','N/A'].includes(result) ? '' : result;
@@ -79,6 +83,20 @@ function normalize(raw, detail = false) {
   const id = itemId(raw.vod_id), title = text(raw.vod_name);
   if (!title) throw new Error('影片缺少名称');
   const score = Number(raw.vod_score), scoreCount = integer(raw.vod_score_num);
+  const validScore = Number.isFinite(score) && score > 0 && score <= 10 && scoreCount > 0;
+  const scoreSum = metricInteger(raw.vod_score_all);
+  // MacCMS publishes its average to one decimal. Keep the source's average,
+  // but do not present a contradictory vote count as its denominator.
+  const ratingCountConsistent = !validScore || scoreSum === null ||
+    Math.abs(score - scoreSum / scoreCount) <= 0.05 + Number.EPSILON * 10;
+  const clickTime = metricInteger(raw.vod_time_hits);
+  const totalClicks = metricInteger(raw.vod_hits);
+  const periods = Object.fromEntries(['day','week','month']
+    .map(key=>[key,metricInteger(raw['vod_hits_'+key])])
+    .filter(([, count])=>count !== null));
+  // Rows without any measured window often contain all three defaults.
+  const uninitializedPeriods = !clickTime && Object.keys(periods).length === 3 &&
+    Object.values(periods).every(count=>count === 0);
   return {
     id, title, detailUrl: new URL(config.detailPath(id), HOME).href,
     coverUrl: https(raw.vod_pic) || https(raw.vod_pic_thumb), description: text(raw.vod_content || raw.vod_blurb, detail ? 20000 : 1500),
@@ -93,16 +111,15 @@ function normalize(raw, detail = false) {
       ? Number(raw.vod_douban_score) : null,
     updatedAt: text(raw.vod_time, 80), releaseDate: text(raw.vod_pubdate, 80),
     plannedEpisodes: integer(raw.vod_total), finished: String(raw.vod_isend) === '1',
-    // These are the resource site's own counters, not player/user actions.
-    sourceViews: integer(raw.vod_hits) > 0 ? integer(raw.vod_hits) : null,
-    sourceCounters: Object.fromEntries(['day','week','month'].filter(key=>
-      Object.hasOwn(raw,'vod_hits_'+key) && /^\d+$/.test(String(raw['vod_hits_'+key])))
-      .map(key=>[key,integer(raw['vod_hits_'+key])])),
+    sourceViews: totalClicks === 0 && !clickTime ? null : totalClicks,
+    sourceViewsKind: 'clicks',
+    sourceCounters: uninitializedPeriods ? {} : periods,
     sourceDuration: credit(raw.vod_duration,200).replace(/^0(?:\.0+)?$/,''),
     sourceVersion: credit(raw.vod_version,100),
     sourceAddedAt: /^0+$/.test(String(raw.vod_time_add))?'':text(raw.vod_time_add,80), sourceStatus: credit(raw.vod_state,200),
-    sourceRating: Number.isFinite(score) && score > 0 && score <= 10 && scoreCount > 0 ? score : null,
+    sourceRating: validScore ? score : null,
     sourceRatingCount: scoreCount > 0 ? scoreCount : null,
+    ...(ratingCountConsistent ? {} : {sourceRatingCountConsistent: false}),
     ...(detail ? {lines: lines(raw, id)} : {}),
   };
 }
@@ -290,9 +307,7 @@ return {getInfo,getLibrary,getItem,getItems,getSession,getSettingsBundle};
 }
 
 
-const config = {"key":"modu","id":"b27083a4-a643-462a-8204-e6f42c19a5b9","name":"魔都资源","version":"0.1.2","home":"https://www.mdzyapi.com/","apis":["https://www.mdzyapi.com/api.php/provide/vod/"],"pageSize":20,"capabilities":{"search":"full","year":true,"recent":true},"iconUrl":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAIKADAAQAAAABAAAAIAAAAACshmLzAAAFDklEQVRYCe2WS2gdVRjHv5k8mtYQ02ollBKKIAqFIlVc+ciiEbXFoi60VTQFK7pQF8GKhBhEK6VSiaikIKUQFz4LDYRSRFC6iFXaNCKUtoi6kBBsjdcQYm5y5xx/35k5M3Nfyd3rwJ/vvOb8/9/jnBmR//oTNByASStipVsi6QG3gFCM/ColmaB9SXoD0/BeuYWNCZiyzZC9BF6BrAtIDvOIGGXuoDwYTOf2bqi5uoAfbQebHwcPQ6RCBCvOqhBtx4J+we4LS9YExvZKZLcEkW0NIztD+wvaZ4vPtlVFaXUBU1Y9fy/ncZ7UkzsbRDKvpEFkgAgWWMC4se/QPvTP82uXkJw+Ydqq1Ziy3ZC/mnrrQ69+VEArAJJ20Jq06etYMh7ZQeaeqqRZWYCRXRBtct5XEFYKEEOR5gCZ66tN0EwEhq4bnu/Mi6gv4LwNqfp7qokS7zUaiSgX5ozIEZL32KaidL3dTET25gU05ztlbUPBCd7X8xwHdc6F2Mpv2B/AT4B8S3tgZSv2LnAzcGKwIdHo7Tg8d3TuQIfu7EjUlj/n8J4XwWYnIOdtWTEaOSvWHiRSEzaQQrhs9ASEFJ1hXMk6we3gZbAL6NgW0AbhgpJWp+C8Xcf4ATb9PhERh7q8ACGQ02CnfSQch7itqWj2cqSOMzYWWHuM49dHajrAt+Ax8CIoQK7HWgW4pzwFk0xa+YwFO7Dxma+dAjyXPU3FqCCflp4gt0fwuAuLh+zr8i597HMNnKQ/wPqjkF8hgh8iUJ2cVQVZBCZd0emZfwA0p5WfD78XoyJ3BwXev5tcfwTppji/aa415xrum8BzrDmB95wm+zX9fqDc7skEiGxDZT/kccjr20U2ONn0SQkS2Y13evaTIqtjI3sva8aQp4JOwZNe2ZkAI49D3rmaADaYY820u0IpJiWPQ24L2GFQSvqVorZTF0//NbTeKJIA5FJgpMeR+2Lz1keCfny9ShsbtSuJekUUZrXqsV8S5jdo/5ysSyPJXNK2/RsGZ+tcRFqZ6UJeSM65F6WbqLdAye8vPdlCWzSnt1KAW3njBQRoRNZRZH6ts4lYbWsKelibPvkUnEsLT4VoBPI2CzXn3L7WMrrUtfRMqxT3rbnGV+5SWIxU0BAE3czHAtyHiHZmtTDvSNlpZMcwkjEI+0DV8eOleMPM6uXyzZpjiwN8fi9CwEfL7idqjzrRabTSqKk4B+bTO0CFZAIIJ5NfgYf8Jmr9izXsbYydgHQJNNNW71Kh8R5aoLA4xMXKmstK7J8sBfcFi4R9kMUz/iUtJpc/H9IcQY6Mz6878yl5bq5y7A/2Pu3J1WYCtLcjmGTBToRcjGsgzh9F5oToF64KiagGhOr1PXj1yMbflco/5QJ01IiK0F/MQ2AKzLhjpsfQpwQdrp1YFat9CJJw0/djxh3RafZ8m9MxqhT5Z8VfsvDzKAxLRq/ZCxTajblqzipbI1BKch/bCdadYUyP3ALtC9hTVw9vnMkT+/aKAnRRy8fLeq6/Y6NtGn4uoYy8uj1PFPYUBjvHuXBE74M/37rBc9W02SmoOc0gXoD3wQiecESJcwVc+A3/x4YiFjuuW82+uaHejmXj1TVQNi2yzGXD12wUknfBgpJVAkHTeKvkHxReX1+xw8rdVVPgX187sqBCtpOK/eBOcqxfQQrUnsHzkb8Hrq+ZY/9+PduwAL9B+/C8Vrre+Xr+F/m3K/vP9+v+t41G4F+SZd7nf/BxpAAAAABJRU5ErkJggg==","lineLabels":{"aosika":"奥斯卡","mdu":"魔都","modu":"魔都"},"description":"分类片库、详情与原生播放，本机收藏与续播。需配套支持视频协议 2 的 Breeze。","iconSourceUrl":"https://www.mdzyapi.com/favicon.ico"};
+const config = {"key":"modu","id":"b27083a4-a643-462a-8204-e6f42c19a5b9","name":"魔都资源","version":"0.1.3","home":"https://www.mdzyapi.com/","apis":["https://www.mdzyapi.com/api.php/provide/vod/"],"pageSize":20,"capabilities":{"search":"full","year":true,"recent":true},"iconUrl":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAIKADAAQAAAABAAAAIAAAAACshmLzAAAFDklEQVRYCe2WS2gdVRjHv5k8mtYQ02ollBKKIAqFIlVc+ciiEbXFoi60VTQFK7pQF8GKhBhEK6VSiaikIKUQFz4LDYRSRFC6iFXaNCKUtoi6kBBsjdcQYm5y5xx/35k5M3Nfyd3rwJ/vvOb8/9/jnBmR//oTNByASStipVsi6QG3gFCM/ColmaB9SXoD0/BeuYWNCZiyzZC9BF6BrAtIDvOIGGXuoDwYTOf2bqi5uoAfbQebHwcPQ6RCBCvOqhBtx4J+we4LS9YExvZKZLcEkW0NIztD+wvaZ4vPtlVFaXUBU1Y9fy/ncZ7UkzsbRDKvpEFkgAgWWMC4se/QPvTP82uXkJw+Ydqq1Ziy3ZC/mnrrQ69+VEArAJJ20Jq06etYMh7ZQeaeqqRZWYCRXRBtct5XEFYKEEOR5gCZ66tN0EwEhq4bnu/Mi6gv4LwNqfp7qokS7zUaiSgX5ozIEZL32KaidL3dTET25gU05ztlbUPBCd7X8xwHdc6F2Mpv2B/AT4B8S3tgZSv2LnAzcGKwIdHo7Tg8d3TuQIfu7EjUlj/n8J4XwWYnIOdtWTEaOSvWHiRSEzaQQrhs9ASEFJ1hXMk6we3gZbAL6NgW0AbhgpJWp+C8Xcf4ATb9PhERh7q8ACGQ02CnfSQch7itqWj2cqSOMzYWWHuM49dHajrAt+Ax8CIoQK7HWgW4pzwFk0xa+YwFO7Dxma+dAjyXPU3FqCCflp4gt0fwuAuLh+zr8i597HMNnKQ/wPqjkF8hgh8iUJ2cVQVZBCZd0emZfwA0p5WfD78XoyJ3BwXev5tcfwTppji/aa415xrum8BzrDmB95wm+zX9fqDc7skEiGxDZT/kccjr20U2ONn0SQkS2Y13evaTIqtjI3sva8aQp4JOwZNe2ZkAI49D3rmaADaYY820u0IpJiWPQ24L2GFQSvqVorZTF0//NbTeKJIA5FJgpMeR+2Lz1keCfny9ShsbtSuJekUUZrXqsV8S5jdo/5ysSyPJXNK2/RsGZ+tcRFqZ6UJeSM65F6WbqLdAye8vPdlCWzSnt1KAW3njBQRoRNZRZH6ts4lYbWsKelibPvkUnEsLT4VoBPI2CzXn3L7WMrrUtfRMqxT3rbnGV+5SWIxU0BAE3czHAtyHiHZmtTDvSNlpZMcwkjEI+0DV8eOleMPM6uXyzZpjiwN8fi9CwEfL7idqjzrRabTSqKk4B+bTO0CFZAIIJ5NfgYf8Jmr9izXsbYydgHQJNNNW71Kh8R5aoLA4xMXKmstK7J8sBfcFi4R9kMUz/iUtJpc/H9IcQY6Mz6878yl5bq5y7A/2Pu3J1WYCtLcjmGTBToRcjGsgzh9F5oToF64KiagGhOr1PXj1yMbflco/5QJ01IiK0F/MQ2AKzLhjpsfQpwQdrp1YFat9CJJw0/djxh3RafZ8m9MxqhT5Z8VfsvDzKAxLRq/ZCxTajblqzipbI1BKch/bCdadYUyP3ALtC9hTVw9vnMkT+/aKAnRRy8fLeq6/Y6NtGn4uoYy8uj1PFPYUBjvHuXBE74M/37rBc9W02SmoOc0gXoD3wQiecESJcwVc+A3/x4YiFjuuW82+uaHejmXj1TVQNi2yzGXD12wUknfBgpJVAkHTeKvkHxReX1+xw8rdVVPgX187sqBCtpOK/eBOcqxfQQrUnsHzkb8Hrq+ZY/9+PduwAL9B+/C8Vrre+Xr+F/m3K/vP9+v+t41G4F+SZd7nf/BxpAAAAABJRU5ErkJggg==","lineLabels":{"aosika":"奥斯卡","mdu":"魔都","modu":"魔都"},"description":"分类片库、详情与原生播放，本机收藏与续播。需配套支持视频协议 2 的 Breeze。","iconSourceUrl":"https://www.mdzyapi.com/favicon.ico"};
 config.detailPath = id => `/vod/${id}/`;
 config.webPlayback = (_id,_sid,_nid,url) => ['https://www.modujiexi66.com/?url='+url];
 module.exports = createCmsVideoPlugin(config);
-
-;(() => { const plugin = module.exports.default ?? module.exports; const original = plugin.getInfo; const metadata = {"version":"0.1.0","releaseSeries":1,"updateUrl":"https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/modu.json","npmName":"","requirements":{"version":1,"capabilities":{"videoLibraryProtocol":2}}}; plugin.getInfo = function(...args) { const result = original.apply(this, args); const decorate = info => ({...info, ...metadata}); return result && typeof result.then === 'function' ? result.then(decorate) : decorate(result); }; })();

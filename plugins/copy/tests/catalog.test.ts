@@ -6,6 +6,7 @@ import {
   resolveCopyDiscoverFilters,
   normalizeCopyThemeOptions,
   copyAuthorReferences,
+  findCopySearchTopic,
   normalizeCopySearchScope,
 } from "../src/catalog.ts";
 
@@ -60,6 +61,10 @@ test("zero popularity differs from unknown and absent detail data stays absent",
     unknown.metadata.some((m) => m.type === "status" || m.type === "latest"),
     false,
   );
+  for (const popular of [null, false, "", " ", "1.2", -1]) {
+    const invalid = mapCopyComicListItem({ ...comic, popular })!;
+    assert.equal(invalid.metadata.some((m) => m.type === "popularity"), false);
+  }
 });
 
 test("only verified mobile filters are sent and legacy theme slugs migrate", () => {
@@ -123,4 +128,18 @@ test("unknown or cross-source search scopes fall back instead of reaching the AP
     assert.equal(normalizeCopySearchScope(value), value);
   for (const value of ["categories", "random", "tag", null, { q: "author" }, 1])
     assert.equal(normalizeCopySearchScope(value), "");
+});
+
+test("topic search matches a complete label, host variant or slug without guessing ambiguity", () => {
+  const topics = [
+    { label: "冒險", value: "maoxian" },
+    { label: "LoveLive", value: "loveLive" },
+    { label: "競技", value: "jingji" },
+  ];
+  assert.deepEqual(findCopySearchTopic(topics, "冒险", ["冒險"]), topics[0]);
+  assert.deepEqual(findCopySearchTopic(topics, " ＬＯＶＥＬＩＶＥ ", []), topics[1]);
+  assert.deepEqual(findCopySearchTopic(topics, "JINGJI", []), topics[2]);
+  assert.equal(findCopySearchTopic(topics, "冒", []), null);
+  assert.equal(findCopySearchTopic(topics, "冒險漫畫", []), null);
+  assert.equal(findCopySearchTopic(topics, "競技", ["冒險"]), null);
 });

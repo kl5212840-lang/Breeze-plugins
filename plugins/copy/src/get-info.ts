@@ -4,6 +4,8 @@ import { PLUGIN_ID, PLUGIN_VERSION } from "./config";
 export function buildPluginInfo(): InfoContract & {
   websiteUrl: string;
   breezeExperience: {
+    comicFollow: 1;
+    copyTopicSearch: 1;
     profileTab: boolean;
     profileKind: string;
     profileCloudFavoriteFunction: string;
@@ -23,6 +25,8 @@ export function buildPluginInfo(): InfoContract & {
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/copy.json",
     npmName: "",
     breezeExperience: {
+      comicFollow: 1,
+      copyTopicSearch: 1,
       profileTab: true,
       profileKind: "generic",
       profileCloudFavoriteFunction: "getCloudFavoriteData",

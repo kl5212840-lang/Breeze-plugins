@@ -290,6 +290,7 @@ export type EndpointSpeedRecord = {
   ms: number | null;
   status: number | null;
   checkedAt: number;
+  failedAt?: "catalog" | "album";
 };
 
 export type EndpointSpeedCache = {
@@ -298,22 +299,8 @@ export type EndpointSpeedCache = {
   api: EndpointSpeedRecord[];
 };
 
-function parsePluginConfigValue(raw: unknown): unknown {
-  try {
-    const decoded = JSON.parse(String(raw));
-    if (decoded && typeof decoded === "object" && decoded.ok === true) {
-      return decoded.value;
-    }
-  } catch {
-    // noop
-  }
-  return null;
-}
-
 export async function getEndpointSpeedCache(): Promise<EndpointSpeedCache | null> {
-  const value = parsePluginConfigValue(
-    await pluginConfig.load("network.speed", ""),
-  );
+  const value = await cache.get<unknown>(scopedKey("runtime:speed:v3"), null);
   if (!value || typeof value !== "object") return null;
 
   const raw = value as Partial<EndpointSpeedCache>;
@@ -327,14 +314,17 @@ export async function getEndpointSpeedCache(): Promise<EndpointSpeedCache | null
             const entry = (item ?? {}) as Partial<EndpointSpeedRecord>;
             const url = String(entry.url || "").trim();
             if (!url) return null;
-            const ms = Number(entry.ms);
-            const status = Number(entry.status);
+            const ms = entry.ms;
+            const status = entry.status;
             return {
               url,
               ok: entry.ok === true,
-              ms: Number.isFinite(ms) ? ms : null,
-              status: Number.isFinite(status) ? status : null,
+              ms: typeof ms === "number" && Number.isFinite(ms) ? ms : null,
+              status: typeof status === "number" && Number.isFinite(status) ? status : null,
               checkedAt: Number(entry.checkedAt || 0) || measuredAt,
+              ...(entry.failedAt === "catalog" || entry.failedAt === "album"
+                ? { failedAt: entry.failedAt }
+                : {}),
             } satisfies EndpointSpeedRecord;
           })
           .filter((item): item is EndpointSpeedRecord => item !== null)
@@ -350,12 +340,12 @@ export async function getEndpointSpeedCache(): Promise<EndpointSpeedCache | null
 export async function setEndpointSpeedCache(
   input: Omit<EndpointSpeedCache, "measuredAt"> & { measuredAt?: number },
 ) {
-  await pluginConfig.save(
-    "network.speed",
-    JSON.stringify({
+  await cacheSet(
+    scopedKey("runtime:speed:v3"),
+    {
       measuredAt: Number(input.measuredAt || Date.now()),
       image: Array.isArray(input.image) ? input.image : [],
       api: Array.isArray(input.api) ? input.api : [],
-    }),
+    },
   );
 }

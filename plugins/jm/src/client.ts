@@ -1,8 +1,8 @@
 import type { AxiosResponse } from "axios";
 import axios from "axios";
-import { decodeResponsePayload } from "./codec";
+import { decodeResponsePayload, readJmJsonEnvelope, unwrapJmAlbumPayload } from "./codec";
 import { Config } from "./constants";
-import { JmRequestError, resolveServerMessage, toFriendlyError } from "./errors";
+import { JmFollowError, JmRequestError, resolveServerMessage, toFriendlyError } from "./errors";
 import {
   cacheKeyFromConfig,
   getCachedResponse,
@@ -12,47 +12,26 @@ import {
   assertCurrentSession,
   currentSessionRevision,
 } from "./state";
-import type { JmMeta, JmRequestConfig } from "./types";
+import type { JmLikeDiagnostic, JmLikeStage, JmMeta, JmRequestConfig } from "./types";
 import { getHost, md5Hex, nowTs } from "./utils";
-
-type UnauthorizedErrorPayload = {
-  type: "unauthorized";
-  source: string;
-  message: string;
-  scheme?: Record<string, unknown>;
-  data?: Record<string, unknown>;
-};
 
 const JM_PLUGIN_ID = "6886291b-f524-441c-844b-c2efae9899a9";
 
-let unauthorizedSchemeProvider:
-  | (() => Promise<Record<string, unknown> | undefined>)
-  | null = null;
-
-export function setUnauthorizedSchemeProvider(
-  provider: () => Promise<Record<string, unknown> | undefined>,
-) {
-  unauthorizedSchemeProvider = provider;
+export function buildUnauthorizedError(message = "登录过期，请重新登录"): Error {
+  return new Error(JSON.stringify({ type: "unauthorized", source: JM_PLUGIN_ID, message }));
 }
 
-export async function buildUnauthorizedError(
-  message = "登录过期，请重新登录",
-): Promise<Error> {
-  const payload: UnauthorizedErrorPayload = {
-    type: "unauthorized",
-    source: JM_PLUGIN_ID,
-    message,
-  };
-  try {
-    const bundle = await unauthorizedSchemeProvider?.();
-    if (bundle && typeof bundle === "object") {
-      payload.scheme = (bundle.scheme as Record<string, unknown>) ?? undefined;
-      payload.data = (bundle.data as Record<string, unknown>) ?? undefined;
-    }
-  } catch (_) {
-    // ignore scheme build errors
+export class JmLikeUnconfirmedError extends JmRequestError {
+  constructor(diagnostic?: JmLikeDiagnostic) {
+    const message = "暂时无法确认点赞状态，请重新打开作品详情查看";
+    super(diagnostic ? JSON.stringify({ type: "comic_like_unconfirmed", message, diagnostic }) : message);
   }
-  return new Error(JSON.stringify(payload));
+}
+
+export class JmLikeRejectedError extends JmRequestError {
+  constructor(message: string, diagnostic?: JmLikeDiagnostic) {
+    super(JSON.stringify({ type: "comic_like_rejected", message, diagnostic }));
+  }
 }
 
 function isLoginRequest(url: unknown): boolean {
@@ -69,6 +48,84 @@ function looksLikeCredentialError(message: string): boolean {
   );
 }
 
+const jmMembershipMessages = new Set([
+  "請先登入會員",
+  "请先登入会员",
+  "請先登錄會員",
+  "请先登录会员",
+]);
+
+export function hasJmMembershipGate(decoded: unknown): boolean {
+  const inner = (decoded as { data?: unknown } | null)?.data;
+  return [decoded, inner].some((value) => {
+    const message = resolveServerMessage(value, "").replace(/[。.!！]+$/, "").trim();
+    return jmMembershipMessages.has(message);
+  });
+}
+
+export function recordJmLikeStage(
+  diagnostic: JmLikeDiagnostic | undefined,
+  stage: "submit" | "readback",
+  result: JmLikeStage["result"],
+  status?: number,
+) {
+  const http = status !== undefined && Number.isInteger(status) && status >= 100 && status <= 599
+    ? status : undefined;
+  if (diagnostic) diagnostic[stage] = { http, result };
+  const line = `[jm.like] ${stage} http=${http ?? "unknown"} result=${result}`;
+  if (result === "readable") console.info(line);
+  else console.warn(line);
+}
+
+function validateJmLikeResponse(envelope: unknown, decoded: unknown, status: number, method: string, diagnostic?: JmLikeDiagnostic) {
+  const levels = [envelope, decoded, (decoded as { data?: unknown } | null)?.data];
+  const messages = levels.map((level) => resolveServerMessage(level, ""));
+  const stage = method === "GET" ? "readback" : "submit";
+  const httpRejected = status < 200 || status >= 300;
+  if (status === 401 || levels.some(hasJmMembershipGate) ||
+      levels.some((level) => Number((level as { code?: unknown } | null)?.code) === 401)) {
+    recordJmLikeStage(diagnostic, stage, "login-required", status);
+    throw buildUnauthorizedError();
+  }
+  if (httpRejected || levels.some(jmRejectedResponse)) {
+    const result = httpRejected ? "http-rejected" : "business-rejected";
+    recordJmLikeStage(diagnostic, stage, result, status);
+    if (method === "GET") throw new JmLikeUnconfirmedError(diagnostic);
+    const fallback = httpRejected ? `服务器响应异常 (${status || "unknown"})` : "点赞未成功";
+    const message = messages.find((message) => message) || fallback;
+    throw diagnostic ? new JmLikeRejectedError(message, diagnostic) : new JmRequestError(message);
+  }
+  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+    recordJmLikeStage(diagnostic, stage, "unreadable", status);
+    throw new JmLikeUnconfirmedError(diagnostic);
+  }
+  recordJmLikeStage(diagnostic, stage, "readable", status);
+}
+
+function jmRejectedResponse(level: unknown) {
+  if (level === false) return true;
+  if (!level || typeof level !== "object" || Array.isArray(level)) return false;
+  const { code, status, ok, success } = level as Record<string, unknown>;
+  return (code !== undefined && Number(code) !== 200) ||
+    status === false || status === 0 ||
+    ["0", "false", "error", "fail", "failed"].includes(String(status ?? "").trim().toLowerCase()) ||
+    ok === false || success === false;
+}
+
+function validateJmFavoriteResponse(envelope: unknown, decoded: unknown, status: number) {
+  const levels = [envelope, decoded, (decoded as { data?: unknown } | null)?.data];
+  if (status === 401 || levels.some(hasJmMembershipGate) ||
+      levels.some((level) => Number((level as { code?: unknown } | null)?.code) === 401)) {
+    throw buildUnauthorizedError();
+  }
+  if (levels.some((level) => /已[满滿]/.test(resolveServerMessage(level, "")))) {
+    throw new JmRequestError("收藏数已达上限");
+  }
+  if (status < 200 || status >= 300 || levels.some(jmRejectedResponse)) {
+    throw new JmRequestError("禁漫未确认收藏操作，请重新打开作品查看");
+  }
+}
+
 export function createJmClient() {
   const client = axios.create({
     timeout: 10000,
@@ -83,12 +140,44 @@ export function createJmClient() {
     const revision = meta?.sessionRevision ?? currentSessionRevision();
     assertCurrentSession(revision);
 
+    const envelope = meta?.comicLike || meta?.comicFavorite ? await readJmJsonEnvelope(response.data) : null;
     const decoded = await decodeResponsePayload(
-      response.data,
+      envelope ?? response.data,
       meta?.ts || nowTs(),
     );
     const status = Number(response.status || 0);
     assertCurrentSession(revision);
+
+    if (meta?.comicLike) {
+      // Decrypting string data can discard outer error fields. Check both
+      // layers without importing a returned token into the current session.
+      validateJmLikeResponse(envelope, decoded, status, String(cfg.method).toUpperCase(), meta.likeDiagnostic?.());
+      response.data = decoded;
+      return response;
+    }
+
+    if (meta?.comicFavorite) {
+      validateJmFavoriteResponse(envelope, decoded, status);
+      response.data = decoded;
+      return response;
+    }
+
+    if (meta?.comicFollow) {
+      const success = status >= 200 && status < 300;
+      if ((success || status === 401 || status === 403) && hasJmMembershipGate(decoded)) {
+        const album = success ? unwrapJmAlbumPayload(decoded) : {};
+        if (album.id == null || typeof album.name !== "string" || !album.name.trim()) {
+          throw new JmFollowError("signInRequired");
+        }
+      }
+      if (!success) {
+        if (status === 404 || status === 410) throw new JmFollowError("notFound");
+        if (status === 408) throw new JmFollowError("network", true);
+        throw new JmFollowError("sourceUnavailable");
+      }
+      response.data = decoded;
+      return response;
+    }
 
     if (status < 200 || status >= 300) {
       console.warn(`[jm.http] request failed status=${status || "unknown"}`);
@@ -103,7 +192,7 @@ export function createJmClient() {
         throw new JmRequestError(serverMsg || "登录失败", status === 429 || status >= 500);
       }
       if (status === 401 || serverMsg === "請先登入會員") {
-        const error = await buildUnauthorizedError("登录过期，请重新登录");
+        const error = buildUnauthorizedError("登录过期，请重新登录");
         assertCurrentSession(revision);
         throw error;
       }
@@ -118,7 +207,7 @@ export function createJmClient() {
       }
     }
 
-    if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) {
+    if (!meta?.readOnlyProfile && decoded && typeof decoded === "object" && !Array.isArray(decoded)) {
       const nextJwt = String(
         (decoded as Record<string, unknown>).jwttoken || "",
       ).trim();
@@ -174,7 +263,7 @@ export function createJmClient() {
     }
 
     if (meta.useJwt) {
-      const jwt = await getJwtToken(revision);
+      const jwt = meta.requestJwt ?? await getJwtToken(revision);
       if (jwt) {
         authHeaders.Authorization = `Bearer ${jwt}`;
       }

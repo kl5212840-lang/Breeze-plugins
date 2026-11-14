@@ -4,7 +4,7 @@ import { after, beforeEach, test } from "node:test";
 import { setImmediate } from "node:timers/promises";
 import { AxiosError, type InternalAxiosRequestConfig } from "axios";
 import client from "../src/client";
-import { beginBikaAuthChange } from "../src/bika-checkin";
+import { beginBikaAuthChange, checkInToday } from "../src/bika-checkin";
 import {
   clearPluginSession,
   loginWithPassword,
@@ -18,6 +18,7 @@ const config = new Map<string, unknown>();
 const cache = new Map<string, unknown>();
 const requests: InternalAxiosRequestConfig[] = [];
 const writes: Array<{ key: string; value: unknown }> = [];
+const checkinNotices: Array<{ name: string; payload: unknown }> = [];
 let respond: (request: InternalAxiosRequestConfig) => Promise<unknown>;
 let beforeSave: (key: string, value: unknown) => Promise<void>;
 let beforeLoad: (key: string) => Promise<void>;
@@ -47,7 +48,10 @@ Object.assign(globalThis, {
         cache.delete(key);
         return;
       }
-      if (name.toLowerCase().includes("toast")) return;
+      if (name === "flutter.showToast" || name === "breeze.checkin.completed") {
+        checkinNotices.push({ name, payload: JSON.parse(String(args[0])) });
+        return;
+      }
       throw new Error(`Unexpected fixture bridge operation ${name}`);
     },
   },
@@ -59,6 +63,7 @@ beforeEach(() => {
   cache.clear();
   requests.length = 0;
   writes.length = 0;
+  checkinNotices.length = 0;
   beforeSave = async () => {};
   beforeLoad = async () => {};
   respond = async (request) =>
@@ -273,6 +278,60 @@ test("concurrent automatic callers share one in-flight login and check-in", asyn
   gate.resolve({ code: 200, data: { token: "fixture-new-token" } });
   await Promise.all([first, second]);
   assert.deepEqual(requests.map(path), ["/auth/sign-in", "/users/profile"]);
+});
+
+test("an already checked-in account stays silent across repeated automatic runs", async () => {
+  credentials();
+  await runBikaAuthAndCheckInLoop();
+  await runBikaAuthAndCheckInLoop();
+  assert.deepEqual(requests.map(path), ["/auth/sign-in", "/users/profile", "/auth/sign-in", "/users/profile"]);
+  assert.deepEqual(checkinNotices, []);
+});
+
+test("newly confirmed automatic check-in emits only the account and observed date", async () => {
+  credentials();
+  let punched = false;
+  respond = async (request) => {
+    if (path(request) === "/auth/sign-in") return { code: 200, data: { token: "fixture-new-token" } };
+    if (path(request) === "/users/punch-in") {
+      punched = true;
+      return { code: 200, data: { status: "ok" } };
+    }
+    return { code: 200, data: { user: { _id: "fixture-user", isPunched: punched } } };
+  };
+  await runBikaAuthAndCheckInLoop();
+  await runBikaAuthAndCheckInLoop();
+  assert.equal(requests.filter(request => path(request) === "/users/punch-in").length, 1);
+  assert.deepEqual(checkinNotices, [{ name: "breeze.checkin.completed", payload: {
+    accountId: "fixture-user",
+    date: new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10),
+  } }]);
+});
+
+test("a manual caller sharing the automatic punch owns the feedback", async () => {
+  credentials();
+  const punchStarted = deferred<void>();
+  const finishPunch = deferred<void>();
+  let punched = false;
+  respond = async (request) => {
+    if (path(request) === "/auth/sign-in") return { code: 200, data: { token: "fixture-new-token" } };
+    if (path(request) === "/users/punch-in") {
+      punchStarted.resolve();
+      await finishPunch.promise;
+      punched = true;
+      return { code: 200, data: { status: "ok" } };
+    }
+    return { code: 200, data: { user: { _id: "fixture-user", isPunched: punched } } };
+  };
+  const automatic = runBikaAuthAndCheckInLoop();
+  await punchStarted.promise;
+  const manual = checkInToday();
+  await setImmediate();
+  finishPunch.resolve();
+  await automatic;
+  assert.equal((await manual).data.ok, true);
+  assert.equal(requests.filter(request => path(request) === "/users/punch-in").length, 1);
+  assert.deepEqual(checkinNotices, []);
 });
 
 test("logout during backoff cancels the old generation before another request", async (context) => {

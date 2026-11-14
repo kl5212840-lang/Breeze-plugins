@@ -607,7 +607,7 @@ test('playlist creation uses a verified refreshed form and remembers confirmed m
 });
 
 // Derived from the 2026-10-24 first-party watch forms; identities and values are synthetic.
-const ajaxVote = (liked = '', disliked = '', polarity = '1') => `<form id="video-like-form" action="/like">${csrf}${hidden('like-user-id','7')}${hidden('like-foreign-id','42')}${hidden('like-is-positive',polarity)}${hidden('like-status',liked)}${hidden('unlike-status',disliked)}${hidden('likes-count','100')}${hidden('unlikes-count','2')}</form>`;
+const ajaxVote = (liked = '', disliked = '', polarity = '1', positive = '100', negative = '2', label = '') => `<form id="video-like-form" action="/like">${csrf}${hidden('like-user-id','7')}${hidden('like-foreign-id','42')}${hidden('like-is-positive',polarity)}${hidden('like-status',liked)}${hidden('unlike-status',disliked)}${hidden('likes-count',positive)}${hidden('unlikes-count',negative)}<button id="video-like-btn"><i class="material-icons-outlined">thumb_up</i>${label}</button></form>`;
 const ajaxFollow = (status = '') => `<form id="video-subscribe-form" action="/subscribe">${csrf}${hidden('subscribe-user-id','7')}${hidden('subscribe-artist-id','12')}${hidden('subscribe-status',status)}</form>`;
 const ajaxCreate = `<form id="video-create-playlist-form" action="/createPlaylist">${csrf}${hidden('create-playlist-video-id','42')}<input name="playlist-title"><textarea name="playlist-description"></textarea></form>`;
 const ajaxSave = (checked = false) => `<form id="video-save-form" action="/save">${csrf}${hidden('playlist-video-id','42')}<input class="playlist-checkbox" type="checkbox" id="save" ${checked ? 'checked' : ''}><input class="playlist-checkbox" type="checkbox" id="abc"></form>`;
@@ -634,6 +634,91 @@ test('first-party vote wire keeps both current states and counts while choosing 
   });
   const r=await operation(env,watch,'dislike',{enabled:true});
   assert.equal(r.status,'ok');assert.equal(r.disliked,true);assert.equal(writes,1);
+});
+test('vote uses the first-party replacement tally when independent GET confirms selection but returns the old tally', async () => {
+  let liked = false, writes = 0, reads = 0;
+  const env = browser(ajaxWatch(),watch,async (_,init) => {
+    if (init.method === 'POST') {
+      writes++;
+      liked = true;
+      return response(JSON.stringify({likeBtn:ajaxVote('1','','1','107','2','98% (109)')}));
+    }
+    reads++;
+    assert.equal(init.cache, 'no-store');
+    return response(ajaxWatch(liked ? '1' : ''));
+  });
+  const result = await operation(env, watch, 'like', {enabled:true});
+  assert.equal(result.status, 'ok');
+  assert.equal(result.liked, true);
+  assert.equal(result.positiveVotes, 107);
+  assert.equal(result.negativeVotes, 2);
+  assert.equal(result.totalVotes, 109);
+  assert.equal(result.ratingPercentRaw, '98%');
+  assert.equal((await operation(env, watch, 'refreshState')).positiveVotes, 107);
+  assert.equal(writes, 1);
+  assert.equal(reads, 3);
+  assert.doesNotMatch(JSON.stringify(result), /browser-only-csrf|<form/);
+});
+
+test('confirmed vote keeps an unchanged tally without another GET or POST', async () => {
+  const requests = [];
+  const env = browser(ajaxWatch(), watch, async (_, init) => {
+    requests.push(init.method ?? 'GET');
+    if (init.method === 'POST') {
+      assert.equal(init.headers['X-CSRF-TOKEN'], 'fresh-vote-csrf');
+      assert.equal(init.body.get('_token'), 'fresh-vote-csrf');
+      return response(JSON.stringify({likeBtn: ajaxVote('1', '', '1', '100', '2', '98% (102)')}));
+    }
+    const view = ajaxWatch(requests.includes('POST') ? '1' : '');
+    return response(view.replaceAll('browser-only-csrf', 'fresh-vote-csrf'));
+  });
+  const result = await operation(env, watch, 'like', {enabled: true});
+  assert.equal(result.status, 'ok');
+  assert.equal(result.liked, true);
+  assert.equal(result.positiveVotes, 100);
+  assert.equal(result.totalVotes, 102);
+  assert.deepEqual(requests, ['GET', 'POST', 'GET']);
+  assert.doesNotMatch(JSON.stringify(result), /fresh-vote-csrf/);
+});
+test('vote fragment must match the independently confirmed video, actor and vote state', async () => {
+  for (const fragment of [
+    ajaxVote('1','','1','107','2','98% (109)').replace('name="like-foreign-id" value="42"', 'name="like-foreign-id" value="91"'),
+    ajaxVote('1','','1','107','2','98% (109)').replace('name="like-user-id" value="7"', 'name="like-user-id" value="9"'),
+    ajaxVote('','1','1','107','2','98% (109)'),
+  ]) {
+    let liked = false;
+    const env = browser(ajaxWatch(),watch,async (_,init) => {
+      if (init.method === 'POST') { liked = true; return response(JSON.stringify({likeBtn:fragment})); }
+      return response(ajaxWatch(liked ? '1' : ''));
+    });
+    const result = await operation(env, watch, 'like', {enabled:true});
+    assert.equal(result.status, 'ok');
+    assert.equal(result.positiveVotes, 100);
+    assert.equal(result.ratingPercentRaw ?? null, null);
+  }
+});
+
+test('vote keeps a newer independent tally and rejects selection still absent after POST', async () => {
+  for (const persisted of [true, false]) {
+    let writes = 0;
+    const env = browser(ajaxWatch(),watch,async (_,init) => {
+      if (init.method === 'POST') {
+        writes++;
+        return response(JSON.stringify({likeBtn:ajaxVote('1','','1','107','2','98% (109)')}));
+      }
+      return response(writes ? account + ajaxVote(persisted ? '1' : '', '', '1', '110', '2', '99% (112)') : ajaxWatch());
+    });
+    const result = await operation(env, watch, 'like', {enabled:true});
+    if (persisted) {
+      assert.equal(result.status, 'ok');
+      assert.equal(result.positiveVotes, 110);
+      assert.equal(result.ratingPercentRaw, '99%');
+    } else {
+      assert.equal(result.status, 'unconfirmed');
+      assert.equal(result.positiveVotes, undefined);
+    }
+    assert.equal(writes, 1);
+  }
 });
 test('current OTP-gated comment branch remains readable with a separate optional publish gate', async () => {
   const html='<div id="comment-create-form-wrapper"><div data-toggle="modal" data-target="#otpVerificationModal"><input></div></div><div id="comment-start"></div>';

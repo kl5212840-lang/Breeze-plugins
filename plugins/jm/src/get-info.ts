@@ -25,11 +25,12 @@ export function buildPluginInfo(input: BuildPluginInfoInput) {
       describe: "https://github.com/mumushu0501-boop/Breeze-plugin-JmComic-change",
     },
     describe: "禁漫天堂插件：个人页、收藏、签到与多线路回退",
-    version: "0.3.9",
+    version: "0.3.22",
     home: "https://github.com/kl5212840-lang/Breeze-plugin-JmComic-change",
     updateUrl:
       "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/jm.json",
     breezeExperience: {
+      comicFollow: 1,
       profileTab: true,
       profileKind: "jm",
       profileCheckinFunction: "checkInToday",

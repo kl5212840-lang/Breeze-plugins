@@ -93,7 +93,7 @@ test("cancelled selection and invalid bytes perform no requests", async () => {
   assert.equal(await helper.update(null), null);
   for (const bad of [
     { ...image, bytes: new Uint8Array() },
-    { ...image, bytes: new Uint8Array(COPY_AVATAR_LIMIT) },
+    { ...image, bytes: new Uint8Array(COPY_AVATAR_LIMIT + 1) },
     { ...image, mime: "image/gif" } as CopyAvatarImage,
     { ...image, mime: "image/png" } as CopyAvatarImage,
     { ...image, filename: "bad\r\nname.jpg" },
@@ -102,7 +102,7 @@ test("cancelled selection and invalid bytes perform no requests", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("PNG and just-under-limit JPEG are accepted; invalid birthday is never sent", async () => {
+test("PNG and JPEG at the avatar page limit are accepted; invalid birthday is never sent", async () => {
   for (const candidate of [
     {
       bytes: Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]),
@@ -110,7 +110,7 @@ test("PNG and just-under-limit JPEG are accepted; invalid birthday is never sent
       filename: "avatar.png",
     },
     {
-      bytes: Uint8Array.from({ length: COPY_AVATAR_LIMIT - 1 }, (_, i) => image.bytes[i] ?? 0),
+      bytes: Uint8Array.from({ length: COPY_AVATAR_LIMIT }, (_, i) => image.bytes[i] ?? 0),
       mime: "image/jpeg",
       filename: "large.jpg",
     },
@@ -209,14 +209,15 @@ test("settings separate concise labels from explanations without changing values
         ["api.platform", "请求标识", "saveSettings"],
       ],
     );
-    assert.equal(fields[0].description, undefined);
+    assert.match(fields[0].description ?? "", /目录、公开详情和章节列表.*测速通过后，再选耗时最短的线路.*详情和首批章节.*封面和账号各自连接/);
+    assert.match(fields[1].description ?? "", /默认用 1.*测速沿用当前值.*账号请求固定用 1/);
     assert.ok(fields[1].description?.includes("客户端"));
     assert.deepEqual(
       fields[1].options?.map((o) => o.value),
       ["1", "2", "3", "4", "5", "", " "],
     );
     assert.equal(bundle.data.values?.["api.platform"], "1");
-    assert.equal(bundle.data.values?.["api.domain"], "国际服2");
+    assert.equal(bundle.data.values?.["api.domain"], "大陆专线2");
   } finally {
     globalThis.bridge = oldBridge;
   }

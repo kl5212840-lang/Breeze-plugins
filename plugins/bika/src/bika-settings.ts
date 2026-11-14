@@ -24,7 +24,7 @@ import {
 import { BIKA_PLUGIN_ID } from "./info";
 import { loadPluginSetting, savePluginSetting } from "./plugin-config";
 import { assertBikaAuth, assertBikaAuthRevision, beginBikaAuthChange, BikaAccountChangedError,
-  checkInToday, readBikaProfile } from "./bika-checkin";
+  checkInAutomatically, readBikaProfile } from "./bika-checkin";
 
 import { APP_CHANNEL_SETTING_KEY, APP_CHANNELS, loadAppChannel } from "./bika-network";
 import { IMAGE_QUALITY_SETTING_KEY, isBikaImageQuality, loadBikaImageQuality } from "./bika-image-quality";
@@ -549,20 +549,12 @@ async function performAutomaticAuth() {
       async () => {
         await performLoginWithRevision({ account, password }, revision);
         assertBikaAuthRevision(revision);
-        return checkInToday();
+        return checkInAutomatically();
       },
       () => assertBikaAuthRevision(revision),
     );
-    if (result.data.ok === true) {
-      console.info("[bika.init] checkin confirmed");
-      try {
-        flutterTools.showToast({
-          message: "哔咔签到成功",
-          seconds: 3,
-          level: "success",
-        });
-      } catch {}
-    } else console.warn("[bika.init] checkin not confirmed");
+    if (result.data.ok === true) console.info("[bika.init] checkin confirmed");
+    else console.warn("[bika.init] checkin not confirmed");
   } catch (error) {
     if (error instanceof BikaAccountChangedError) return;
     console.warn("[bika.init] login/checkin incomplete; stopped");

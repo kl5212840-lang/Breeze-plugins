@@ -8,18 +8,23 @@ import axios, { type InternalAxiosRequestConfig } from "axios";
 let cached = new Map<string, unknown>();
 let settings = new Map<string, unknown>();
 let requests: InternalAxiosRequestConfig[] = [];
+let checkinNotices: unknown[] = [];
 let storageGate: ((name: string, key: string, value: unknown) => Promise<void>) | null = null;
+let malformedSetting: string | null = null;
 let respond: (config: InternalAxiosRequestConfig) => Promise<{ status: number; data: unknown }>;
 
 (globalThis as any).bridge = {
   call: async (name: string, key: string, value: unknown) => {
     if (storageGate) await storageGate(name, key, value);
     switch (name) {
+      case "breeze.checkin.completed": checkinNotices.push(JSON.parse(key)); return true;
       case "opencc.convert": return (key as any).text;
       case "cache.get": return cached.get(key) ?? value ?? null;
       case "cache.set": cached.set(key, value); return true;
       case "cache.delete": cached.delete(key); return true;
-      case "load_plugin_config": return JSON.stringify({ ok: true, value: settings.get(key) ?? JSON.parse(value as string) });
+      case "load_plugin_config": return key === malformedSetting
+        ? JSON.stringify({ ok: true })
+        : JSON.stringify({ ok: true, value: settings.get(key) ?? JSON.parse(value as string) });
       case "save_plugin_config": settings.set(key, JSON.parse(value as string)); return true;
     }
     if (name.includes("md5")) return "fixture-hash";
@@ -51,10 +56,12 @@ function storedCredentials() {
 
 beforeEach(async () => {
   storageGate = null;
+  malformedSetting = null;
   await plugin.clearPluginSession();
   settings = new Map();
   cached = new Map();
   requests = [];
+  checkinNotices = [];
   respond = async () => ({ status: 200, data: {} });
 });
 
@@ -201,12 +208,14 @@ test("a rejected clear operation waits for its delayed blank JWT before a new lo
 });
 
 test("full favorites fail without claiming selection or opening a folder step", async () => {
+  settings.set("auth.jwt", "fixture-token");
   respond = async () => ({ status: 200, data: { msg: "收藏已满" } });
   await assert.rejects(plugin.toggleFavorite({ comicId: "fixture-id", currentFavorite: false }), /收藏数已达上限/);
   assert.equal(requests.length, 1);
 });
 
 test("traditional and nested favorite refusals keep the original selection", async () => {
+  settings.set("auth.jwt", "fixture-token");
   for (const data of [{ msg: "收藏已滿" }, { data: { msg: "收藏已滿" } }, { status: false, msg: "收藏失敗" }]) {
     respond = async () => ({ status: 200, data });
     await assert.rejects(plugin.toggleFavorite({ comicId: "fixture-id", currentFavorite: false }), /收藏/);
@@ -214,13 +223,117 @@ test("traditional and nested favorite refusals keep the original selection", asy
 });
 
 test("successful favorite and removal retain their existing next-step contract", async () => {
-  respond = async () => ({ status: 200, data: { status: "ok" } });
-  assert.deepEqual(await plugin.toggleFavorite({ comicId: "fixture-id", currentFavorite: false }), {
+  settings.set("auth.jwt", "fixture-token");
+  respond = async () => ({ status: 200, data: { status: "ok", type: "add" } });
+  assert.deepEqual(await plugin.toggleFavorite({ comicId: "fixture-id", currentFavorite: true }), {
     favorited: true, nextStep: "selectFolder",
   });
-  assert.deepEqual(await plugin.toggleFavorite({ comicId: "fixture-id", currentFavorite: true }), {
+  respond = async () => ({ status: 200, data: { status: "ok", type: "remove" } });
+  assert.deepEqual(await plugin.toggleFavorite({ comicId: "fixture-id", currentFavorite: false }), {
     favorited: false, nextStep: "none",
   });
+});
+
+test("favorite rejects a missing action, or an outer rejection hiding inner success", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const data of [
+    {}, { status: "ok" }, { status: "ok", type: "other" },
+    { code: 403, data: JSON.stringify({ status: "ok", type: "add" }) },
+    { status: false, data: { status: "ok", type: "add" } },
+  ]) {
+    respond = async () => ({ status: 200, data });
+    await assert.rejects(plugin.toggleFavorite({ comicId: "123", currentFavorite: false }), /未确认收藏/);
+  }
+  assert.equal(requests.length, 5);
+  assert.ok(requests.every((request) => request.method === "post"));
+});
+
+test("favorite refuses to commit after the account changes while its receipt is in flight", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const started = deferred<void>();
+  const receipt = deferred<{ status: number; data: unknown }>();
+  respond = async () => { started.resolve(); return receipt.promise; };
+  const result = plugin.toggleFavorite({ comicId: "123", currentFavorite: false });
+  const rejected = assert.rejects(result, state.SessionChangedError);
+  await started.promise;
+  await plugin.clearPluginSession();
+  receipt.resolve({ status: 200, data: { status: "ok", type: "add", jwttoken: "stale-token" } });
+  await rejected;
+  assert.equal(requests.length, 1);
+  assert.equal(await state.getJwtToken(), "");
+});
+
+test("move confirms the exact target work on a bounded target-folder read with one pinned JWT", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  respond = async (request) => ({ status: 200, data: request.method === "post"
+    ? { jwttoken: "unexpected-token" }
+    : request.params.page === 1
+      ? { total: "21", list: Array.from({ length: 20 }, (_, index) => ({ id: String(index + 1000) })) }
+      : { total: "21", list: [{ id: 123 }], jwttoken: "other-token" },
+  });
+  assert.deepEqual(await plugin.moveFavoriteToFolder({ comicId: "123", folderId: "9" }), { ok: true });
+  assert.equal(requests.length, 3);
+  assert.ok(requests[0]!.url?.endsWith("/favorite_folder"));
+  assert.equal(requests[0]!.method, "post");
+  assert.equal(requests[0]!.fetchOptions?.redirect, "error");
+  assert.deepEqual(requests.slice(1).map((request) => request.params), [
+    { page: 1, folder_id: "9", o: "mr" }, { page: 2, folder_id: "9", o: "mr" },
+  ]);
+  assert.ok(requests.every((request) => request.headers.Authorization === "Bearer fixture-token"));
+  assert.equal(await state.getJwtToken(), "");
+  assert.equal(settings.get("auth.jwt"), "fixture-token");
+});
+
+test("an unreadable or refused folder move never reports success or repeats its write", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  respond = async (request) => ({ status: 200, data: request.method === "post" ? {} : { list: [], total: 0 } });
+  await assert.rejects(plugin.moveFavoriteToFolder({ comicId: "123", folderId: "9" }), /无法确认已移入/);
+  assert.deepEqual(requests.map((request) => request.method), ["post", "get"]);
+
+  requests.length = 0;
+  respond = async () => ({ status: 200, data: { code: 403, data: JSON.stringify({ status: "ok" }) } });
+  await assert.rejects(plugin.moveFavoriteToFolder({ comicId: "123", folderId: "9" }), /未确认收藏操作/);
+  assert.deepEqual(requests.map((request) => request.method), ["post"]);
+
+  requests.length = 0;
+  respond = async () => { throw new axios.CanceledError("fixture cancelled"); };
+  await assert.rejects(plugin.moveFavoriteToFolder({ comicId: "123", folderId: "9" }), /fixture cancelled/);
+  assert.deepEqual(requests.map((request) => request.method), ["post"]);
+});
+
+test("cloud favorite reads accept real zero and preserve a known nonzero count", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  respond = async () => ({ status: 200, data: { list: [], total: "0" } });
+  const empty = await plugin.getCloudFavoriteData();
+  assert.equal(empty.data.total, 0);
+  assert.equal(empty.data.hasReachedMax, true);
+  assert.deepEqual(empty.data.items, []);
+
+  respond = async () => ({ status: 200, data: { code: 200, data: {
+    list: [{ id: "123", name: "fixture-work" }], total: "21",
+  } } });
+  const populated = await plugin.getCloudFavoriteData();
+  assert.equal(populated.data.total, 21);
+  assert.equal(populated.data.hasReachedMax, false);
+  assert.deepEqual(populated.data.items.map((item) => item.id), ["123"]);
+
+  respond = async () => ({ status: 200, data: { list: [{ id: "123", name: "fixture-work" }] } });
+  const unknown = await plugin.getCloudFavoriteData();
+  assert.equal("total" in unknown.data, false);
+  assert.equal(unknown.data.hasReachedMax, false);
+  assert.deepEqual(unknown.data.items.map((item) => item.id), ["123"]);
+});
+
+test("cloud favorite reads reject malformed or failed replies rather than replacing the collection", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const data of [
+    {}, { list: [] }, { total: 0 }, { list: [], total: null }, { list: [], total: true },
+    { list: [], total: 1 }, { list: [{ id: "123" }], total: 0 }, { list: [{}], total: 1 },
+    { code: 403, data: JSON.stringify({ list: [], total: 0 }) },
+  ]) {
+    respond = async () => ({ status: 200, data });
+    await assert.rejects(plugin.getCloudFavoriteData(), /收藏/);
+  }
 });
 
 for (const status of [200, 401, 403]) {
@@ -316,6 +429,55 @@ test("clearing a session stops a pending retry from starting another login", asy
 });
 
 
+for (const [message, shouldNotify] of [
+  ["签到成功", true], ["Jcoin:10 EXP:10", true],
+  ["今天已经签到过了", false], ["今天已經簽到過了", false],
+  ["签到失败", false],
+] as const) {
+  test(`automatic check-in only notifies for a new completion (${message})`, async () => {
+    storedCredentials();
+    respond = async (request) => {
+      const path = new URL(request.url!).pathname;
+      if (path === "/login") return { status: 200, data: loginData };
+      if (path === "/daily_list/filter") return { status: 200, data: { list: [{ id: "fixture-day" }] } };
+      assert.equal(path, "/daily_chk");
+      return { status: 200, data: { msg: message } };
+    };
+    await runJmAuthAndCheckInLoop();
+    const firstRequestPaths = requests.map(request => new URL(request.url!).pathname);
+    assert.deepEqual(firstRequestPaths, ["/login", "/daily_list/filter", "/daily_chk"]);
+    if (shouldNotify) await runJmAuthAndCheckInLoop();
+    assert.deepEqual(checkinNotices, shouldNotify ? [{
+      accountId: loginData.uid,
+      date: new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10),
+    }] : []);
+  });
+}
+
+test("a manual caller sharing the automatic check-in owns the feedback", async () => {
+  storedCredentials();
+  const checkinStarted = deferred<void>();
+  const finishCheckin = deferred<void>();
+  respond = async (request) => {
+    const path = new URL(request.url!).pathname;
+    if (path === "/login") return { status: 200, data: loginData };
+    if (path === "/daily_list/filter") return { status: 200, data: { list: [{ id: "fixture-day" }] } };
+    assert.equal(path, "/daily_chk");
+    checkinStarted.resolve();
+    await finishCheckin.promise;
+    return { status: 200, data: { msg: "签到成功" } };
+  };
+  const automatic = runJmAuthAndCheckInLoop();
+  await checkinStarted.promise;
+  const manual = plugin.checkInToday();
+  await setImmediate();
+  finishCheckin.resolve();
+  await automatic;
+  assert.equal((await manual).data.ok, true);
+  assert.equal(requests.filter(request => request.url?.endsWith("/daily_chk")).length, 1);
+  assert.deepEqual(checkinNotices, []);
+});
+
 for (const message of ["签到成功", "今天已经签到过了", "今天已經簽到過了", "Jcoin:10 EXP:10", "Jcoin:40 EXP:40"]) {
   test(`confirmed check-in receipt survives profile refresh (${message})`, async () => {
     settings.set("auth.userInfo", loginData);
@@ -330,6 +492,7 @@ for (const message of ["签到成功", "今天已经签到过了", "今天已經
     assert.equal((await plugin.getUserInfoBundle()).data.extern?.checkedIn, true);
     await plugin.checkInToday();
     assert.equal(requests.length, 2);
+    assert.deepEqual(checkinNotices, []);
     settings.set("auth.userInfo", { ...loginData, uid: "another-account" });
     assert.equal((await plugin.getUserInfoBundle()).data.extern?.checkedIn, null);
     await plugin.clearPluginSession();
@@ -428,6 +591,60 @@ for (const failure of ["ERR_NETWORK", "ECONNABORTED"]) {
 function dailyRecord(signed: unknown, date = "01") {
   return { daily_id: 72, record: [[{ date, signed, bonus: false }]] };
 }
+
+test("cold profile reports typed sign-out without exposing partial credentials", async () => {
+  for (const partial of [{}, { "auth.account": "private-fixture-account" },
+    { "auth.password": "private-fixture-password" }]) {
+    settings = new Map(Object.entries(partial));
+    await assert.rejects(plugin.getUserInfoBundle(), (error: Error) => {
+      const payload = JSON.parse(error.message);
+      assert.deepEqual(Object.keys(payload).sort(), ["message", "source", "type"]);
+      assert.equal(payload.source, "6886291b-f524-441c-844b-c2efae9899a9");
+      assert.equal(payload.type, "unauthorized");
+      assert.doesNotMatch(error.message, /private-fixture/);
+      return true;
+    });
+  }
+  assert.equal(requests.length, 0);
+});
+
+test("cold profile with usable saved credentials restores its existing session", async () => {
+  storedCredentials();
+  respond = async (config) => ({ status: 200,
+    data: new URL(config.url!).pathname === "/login" ? loginData : dailyRecord(false) });
+  const profile = await plugin.getUserInfoBundle();
+  assert.equal(profile.data.avatar?.id, loginData.uid);
+  assert.equal(settings.get("auth.jwt"), loginData.jwttoken);
+  assert.deepEqual(requests.map((request) => [request.method, new URL(request.url!).pathname]),
+    [["post", "/login"], ["get", "/daily"]]);
+});
+
+test("cold profile preserves retry for incomplete receipts, malformed restore and transport", async () => {
+  const retry = { name: "JmRequestError", retryable: true };
+  settings.set("auth.userInfo", { uid: loginData.uid });
+  await assert.rejects(plugin.getUserInfoBundle(), retry);
+  settings.delete("auth.userInfo");
+  settings.set("auth.jwt", loginData.jwttoken);
+  await assert.rejects(plugin.getUserInfoBundle(), retry);
+  settings.delete("auth.jwt");
+  await state.setJwtToken(loginData.jwttoken);
+  await assert.rejects(plugin.getUserInfoBundle(), retry);
+  assert.equal(requests.length, 0);
+
+  storedCredentials();
+  await assert.rejects(plugin.getUserInfoBundle(), retry);
+  respond = async () => ({ status: 200, data: null });
+  await assert.rejects(plugin.getUserInfoBundle(), retry);
+  respond = async () => { throw new Error("fixture transport unavailable"); };
+  await assert.rejects(plugin.getUserInfoBundle(), /fixture transport unavailable/);
+  assert.equal(requests.length, 3);
+});
+
+test("cold profile does not infer sign-out from a malformed configuration response", async () => {
+  malformedSetting = "auth.userInfo";
+  await assert.rejects(plugin.getUserInfoBundle(), { name: "JmRequestError", retryable: true });
+  assert.equal(requests.length, 0);
+});
 
 test("profile reads today's server record without posting a check-in", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 10, 1, 4) });
@@ -690,14 +907,65 @@ test("failed or conflicting calendar recheck never erases confirmed receipt or f
   assert.deepEqual(settings.get("auth.checkin"), receipt);
 });
 
+test("profile verification requires a persisted JWT and keeps invalid storage distinct from rejection", async () => {
+  settings.set("auth.userInfo", loginData);
+  storedCredentials();
+  respond = async () => ({ status: 200, data: { nickName: "fixture nickname", aboutMe: "" } });
+  await state.setJwtToken("synthetic-stale-cache-token");
+  await assert.rejects(plugin.getUserProfileDetails(), (error: Error) => {
+    assert.deepEqual(Object.keys(JSON.parse(error.message)).sort(), ["message", "source", "type"]);
+    assert.equal(JSON.parse(error.message).type, "unauthorized");
+    return true;
+  });
+  assert.equal(requests.length, 0);
+
+  settings.set("auth.jwt", loginData.jwttoken);
+  for (const key of ["auth.userInfo", "auth.jwt"]) {
+    malformedSetting = key;
+    await assert.rejects(plugin.getUserProfileDetails(), /账号资料读取失败/);
+  }
+  malformedSetting = null;
+  settings.set("auth.userInfo", { uid: {} });
+  await assert.rejects(plugin.getUserProfileDetails(), /账号资料读取失败/);
+  assert.equal(requests.length, 0);
+});
+
+test("unauthorized profile responses expose no login data, and login returns only its public result", async () => {
+  settings.set("auth.userInfo", loginData);
+  settings.set("auth.jwt", loginData.jwttoken);
+  storedCredentials();
+  respond = async () => ({ status: 401, data: { message: "expired fixture" } });
+  await assert.rejects(plugin.getUserProfileDetails(), (error: Error) => {
+    const payload = JSON.parse(error.message);
+    assert.deepEqual(Object.keys(payload).sort(), ["message", "source", "type"]);
+    assert.equal(payload.type, "unauthorized");
+    return true;
+  });
+
+  respond = async () => ({ status: 200, data: loginData });
+  const result = await plugin.loginWithPassword(loginPayload);
+  assert.deepEqual(result, { source: "6886291b-f524-441c-844b-c2efae9899a9",
+    data: { account: loginPayload.account } });
+  assert.equal(settings.get("auth.jwt"), loginData.jwttoken);
+  assert.equal(settings.get("auth.password"), loginPayload.password);
+  assert.deepEqual(settings.get("auth.userInfo"), loginData);
+});
+
 test("explicit profile completion returns only public nickname/aboutMe and no cached balance claims", async () => {
   settings.set("auth.userInfo", loginData);
+  settings.set("auth.jwt", loginData.jwttoken);
+  storageGate = async (name, key) => {
+    if (name === "cache.get" && key === "JmComic::ua") {
+      cached.set("JmComic::jwt", "synthetic-concurrent-cache-token");
+    }
+  };
   respond = async () => ({ status: 200, data: { nickName: "fixture nickname", aboutMe: "fixture about",
     password: "private-fixture", password_confirm: "private-fixture", birthday: "private-fixture", coin: 99, photo: "private-fixture" } });
   const result = await plugin.getUserProfileDetails();
   assert.deepEqual(Object.keys(result.data).sort(), ["aboutMe", "accountId", "checkedAt", "nickname", "profileDataSource"]);
   assert.equal(result.data.nickname, "fixture nickname");
   assert.equal(result.data.profileDataSource, "serverUserEdit");
+  assert.equal(requests[0]!.headers.Authorization, `Bearer ${loginData.jwttoken}`);
   assert.deepEqual(requests.map((request) => [request.method, new URL(request.url!).pathname]), [["get", `/useredit/${loginData.uid}`]]);
   assert.deepEqual(settings.get("auth.userInfo"), loginData);
 });
@@ -712,6 +980,7 @@ test("read-only account probes never log in from stored credentials when user in
 
 test("a late public profile read cannot cross an account change", async () => {
   settings.set("auth.userInfo", loginData);
+  settings.set("auth.jwt", loginData.jwttoken);
   const response = deferred<{ status: number; data: unknown }>();
   respond = () => response.promise;
   const loading = plugin.getUserProfileDetails().catch((error) => error);
@@ -778,6 +1047,7 @@ test("an old-day confirmed receipt expires during an explicit calendar read acro
 
 test("official zero unread counts are known while failed public profile reads preserve cached account data", async () => {
   settings.set("auth.userInfo", loginData);
+  settings.set("auth.jwt", loginData.jwttoken);
   respond = async () => ({ status: 200, data: { comic_follow: 0, site_notice: 0 } });
   const count = await plugin.getNotificationUnreadCount();
   assert.equal(count.data.total, 0);

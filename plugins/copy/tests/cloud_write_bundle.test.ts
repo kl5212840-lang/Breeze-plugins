@@ -26,13 +26,17 @@ const member = (updated = false) => ({
 });
 
 async function withRuntime(
-  run: (calls: Request[], state: { token: string; rejectWrite: boolean }) => Promise<void>,
+  run: (calls: Request[], state: {
+    token: string;
+    rejectWrite: boolean;
+    queryResults: Array<Record<string, unknown>>;
+  }) => Promise<void>,
 ) {
   const oldFetch = globalThis.fetch;
   const oldBridge = globalThis.bridge;
   const calls: Request[] = [];
   const values = new Map<string, unknown>();
-  const state = { token: "fixture-token", rejectWrite: false };
+  const state = { token: "fixture-token", rejectWrite: false, queryResults: [] as Array<Record<string, unknown>> };
   let saved = false;
   globalThis.bridge = {
     call: async (fn: string, key: string, value: unknown) => {
@@ -72,7 +76,7 @@ async function withRuntime(
         });
       if (state.rejectWrite) return json({ code: 400, message: "fixture rejected write" });
     }
-    if (path.endsWith("/query")) return json({ code: 200, results: { collect: 37 } });
+    if (path.endsWith("/query")) return json({ code: 200, results: state.queryResults.shift() ?? { collect: 37 } });
     if (path.includes("/comic2/"))
       return json({ code: 200, results: { comic: { uuid: "fixture-comic-uuid" } } });
     if (path.endsWith("/collect/comic") || path.endsWith("/collect/comics"))
@@ -119,7 +123,8 @@ test("built CJS cloud add sends form media type and fields instead of text/plain
 
 for (const action of ["removeAll", "removeFromTarget"] as const) {
   test(`built CJS ${action} keeps DELETE form media type and collection ID`, async () => {
-    await withRuntime(async (calls) => {
+    await withRuntime(async (calls, state) => {
+      state.queryResults.push({ collect: 37 }, { collect: 38 });
       const result = await plugin.startFavoriteAction({
         comicId: "fixture-comic",
         action,
@@ -127,6 +132,7 @@ for (const action of ["removeAll", "removeFromTarget"] as const) {
       });
       assert.equal(result.status, "completed", result.message);
       assert.equal(result.committed, true);
+      assert.equal(calls.filter((request) => request.method === "GET").length, 1);
       const writes = calls.filter((request) => request.method === "DELETE");
       assert.equal(writes.length, 1);
       const request = writes[0];
@@ -139,6 +145,32 @@ for (const action of ["removeAll", "removeFromTarget"] as const) {
     });
   });
 }
+
+test("cloud remove distinguishes a verified absent entry from an unreadable collection ID", async () => {
+  await withRuntime(async (calls, state) => {
+    for (const action of ["removeAll", "removeFromTarget"] as const) {
+      const remove = () => plugin.startFavoriteAction({
+        comicId: "fixture-comic", action, context: { target: { id: "37" } },
+      });
+      for (const collect of [null, 0]) {
+        state.queryResults.push({ collect });
+        assert.deepEqual(await remove(), { status: "completed", favorited: false, committed: false });
+      }
+      for (const invalid of [{}, { collect: false }, { collect: "" }, { collect: 37.5 }, { collect: -1 }]) {
+        state.queryResults.push(invalid);
+        const result = await remove();
+        assert.equal(result.status, "failed");
+        assert.equal(result.committed, false);
+      }
+    }
+    state.queryResults.push({ collect: 38 });
+    const mismatched = await plugin.startFavoriteAction({
+      comicId: "fixture-comic", action: "removeFromTarget", context: { target: { id: "37" } },
+    });
+    assert.equal(mismatched.errorCode, "TARGET_MISMATCH");
+    assert.equal(calls.some((request) => request.method === "DELETE"), false);
+  });
+});
 
 test("built CJS login keeps encoded form fields and its explicit media type", async () => {
   await withRuntime(async (calls) => {

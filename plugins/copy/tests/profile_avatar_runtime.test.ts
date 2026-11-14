@@ -1,8 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import plugin from "../src/index.ts";
+import { createRequire } from "node:module";
+import sourcePlugin from "../src/index.ts";
 import { prepareCopyAvatarJpeg, copyProfileTransport } from "../src/profile-avatar-runtime.ts";
 import { COPY_AVATAR_LIMIT } from "../src/profile-avatar.ts";
+
+const bundle = process.env.BREEZE_COPY_AVATAR_BUNDLE;
+const plugin: typeof sourcePlugin = bundle ? createRequire(import.meta.url)(bundle).default : sourcePlugin;
 
 const bytes = Uint8Array.from([255, 216, 255, 224, 0, 16, 74, 70, 73, 70]);
 const base64 = Buffer.from(bytes).toString("base64");
@@ -22,6 +26,8 @@ const profile = (updated = false) => ({
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 
+type FailedRequest = { path: string; status: number; body: unknown };
+
 async function withRuntime(
   run: (
     calls: Request[],
@@ -30,7 +36,10 @@ async function withRuntime(
       status: number;
       token: string;
       memberUsername: string;
+      lineChoices: string[];
+      avatarReadDelayMs: number;
       confirmation: "ok" | "fail" | "unchanged";
+      failedRequest?: FailedRequest;
     },
   ) => Promise<void>,
 ) {
@@ -42,12 +51,18 @@ async function withRuntime(
     status: 200,
     token: "fixture-token",
     memberUsername: "fixture-account",
+    lineChoices: [] as string[],
+    avatarReadDelayMs: 0,
     confirmation: "ok" as "ok" | "fail" | "unchanged",
+    failedRequest: undefined as FailedRequest | undefined,
   };
   globalThis.bridge = {
     call: async (fn: string, key: string, fallback: unknown) => {
-      if (fn === "load_plugin_config")
-        return JSON.stringify({ ok: true, value: key === "auth.token" ? state.token : fallback });
+      if (fn === "load_plugin_config") {
+        const value = key === "auth.token" ? state.token
+          : key === "api.domain" ? state.lineChoices.shift() ?? fallback : fallback;
+        return JSON.stringify({ ok: true, value });
+      }
       return null;
     },
   } as typeof globalThis.bridge;
@@ -57,14 +72,28 @@ async function withRuntime(
     if (state.status !== 200)
       return json({ code: state.status, message: "private account/token payload" }, state.status);
     const path = new URL(request.url).pathname;
+    if (state.failedRequest?.path === path) {
+      const { status, body } = state.failedRequest;
+      return typeof body === "string" ? new Response(body, { status }) : json(body, status);
+    }
     if (path.endsWith("/member/info")) return json({ code: 200, results: {
       user_id: "fixture-member", username: state.memberUsername, nickname: "Original name",
       avatar: "https://images.example/old.jpg",
     } });
-    if (path.endsWith("/update/info"))
+    if (path.endsWith("/update/info")) {
+      if (state.avatarReadDelayMs) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, state.avatarReadDelayMs);
+          request.signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(request.signal.reason);
+          }, { once: true });
+        });
+      }
       return state.saved && state.confirmation === "fail"
         ? json({ code: 503 }, 503)
         : json(profile(state.saved && state.confirmation !== "unchanged"));
+    }
     if (path.endsWith("/upload/image")) return json({ code: 200, results: "opaque-server-handle" });
     if (path.endsWith("/me/edit")) {
       state.saved = true;
@@ -79,6 +108,54 @@ async function withRuntime(
     globalThis.bridge = oldBridge;
   }
 }
+
+test("member URL and headers stay in the Copy account service when reading Hot", async () => {
+  await withRuntime(async (calls, state) => {
+    state.lineChoices = ["热辣漫画线路1", "国际服2"];
+    const result = await plugin.getUserInfoBundle();
+    const member = calls[0];
+    assert.equal(new URL(member.url).host, "mapi.copy2000.site");
+    assert.equal(member.headers.get("origin"), "https://2025copy.com");
+    assert.equal(member.headers.get("version"), "2025.05.09");
+    assert.equal(member.redirect, "error");
+    assert.equal(result.data.extern?.userId, "fixture-member");
+  });
+});
+
+test("slow optional web avatar read does not delay verified account details", async () => {
+  await withRuntime(async (calls, state) => {
+    state.avatarReadDelayMs = 3600;
+    const start = performance.now();
+    const result = await plugin.getUserInfoBundle();
+    assert.ok(performance.now() - start < 3000, "member info waited for the slow website");
+    assert.equal(result.data.extern?.userId, "fixture-member");
+    assert.equal(result.data.avatar.url, "https://images.example/old.jpg");
+    assert.equal(calls.length, 2);
+  });
+});
+
+test("only a structured member rejection on the account line requests login", async () => {
+  await withRuntime(async (calls, state) => {
+    for (const [status, code] of [[401, 401], [401, undefined], [403, 403]]) {
+      state.failedRequest = {
+        path: "/api/v3/member/info",
+        status,
+        body: { code, message: "private response marker" },
+      };
+      await assert.rejects(plugin.getUserInfoBundle(), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.doesNotMatch(error.message, /private response marker|fixture-token/);
+        if (code === 401) {
+          assert.equal(JSON.parse(error.message).type, "unauthorized");
+        } else {
+          assert.match(error.message, /无法读取拷贝账号资料/);
+        }
+        return true;
+      });
+    }
+    assert.equal(calls.length, 3, "an authentication failure must not read the avatar website");
+  });
+});
 
 test("real wrapper serializes multipart JPEG bytes, preserves fields, and confirms before success", async () => {
   await withRuntime(async (calls) => {
@@ -128,17 +205,19 @@ test("wrapper rejects malformed, oversized or non-JPEG input before requests and
     ]) {
       await assert.rejects(plugin.updateAvatar({ jpegBase64: value }));
     }
-    const exactLimit = new Uint8Array(COPY_AVATAR_LIMIT);
-    exactLimit.set(bytes);
+    const tooLarge = new Uint8Array(COPY_AVATAR_LIMIT + 1);
+    tooLarge.set(bytes);
     await assert.rejects(
-      plugin.updateAvatar({ jpegBase64: Buffer.from(exactLimit).toString("base64") }),
+      plugin.updateAvatar({ jpegBase64: Buffer.from(tooLarge).toString("base64") }),
+      /500 KB/,
     );
     assert.deepEqual(await plugin.updateAvatar({ cancelled: true }), {
       ok: false,
       cancelled: true,
     });
     state.token = "";
-    await assert.rejects(plugin.updateAvatar({ jpegBase64: base64 }), /请先登录/);
+    const signedOut = await plugin.updateAvatar({ jpegBase64: base64 });
+    assert.equal("avatarRestriction" in signedOut && signedOut.avatarRestriction, "signIn");
     assert.equal(calls.length, 0);
   });
 });
@@ -169,10 +248,44 @@ test("transport rejects alternate origins and unexpected paths before invoking f
   });
 });
 
-test("base64 decoder accepts just-under-limit canonical JPEG without a Node runtime dependency", () => {
-  const large = new Uint8Array(COPY_AVATAR_LIMIT - 1);
+test("base64 decoder accepts canonical JPEG at the avatar page limit without Node Buffer", () => {
+  const large = new Uint8Array(COPY_AVATAR_LIMIT);
   large.set(bytes);
   assert.deepEqual(prepareCopyAvatarJpeg(Buffer.from(large).toString("base64")).bytes, large);
+});
+
+test("official cooldown, general rate limit and image rejection are distinct terminal results", async () => {
+  for (const [failedRequest, restriction, writes] of [
+    [{ path: "/api/v2/web/me/edit", status: 400,
+      body: { code: 400, message: "頭像30 天只能修改一次 private-marker" } }, "cooldown", 2],
+    [{ path: "/api/v2/web/me/edit", status: 200,
+      body: { code: 400, message: "头像30天内不能重复修改 private-marker" } }, "cooldown", 2],
+    [{ path: "/api/v2/web/me/edit", status: 429,
+      body: { code: 200, message: "请求过于频繁 private-marker" } }, "rateLimit", 2],
+    [{ path: "/api/v1/upload/image", status: 413, body: "<html>private-marker</html>" }, "image", 1],
+    [{ path: "/api/v2/web/me/edit", status: 400, body: { code: 400 } }, "rejected", 2],
+  ] as const) {
+    await withRuntime(async (calls, state) => {
+      state.failedRequest = failedRequest;
+      const result = await plugin.updateAvatar({ jpegBase64: base64 });
+      assert.equal(result.ok, false);
+      assert.equal("avatarRestriction" in result && result.avatarRestriction, restriction);
+      assert.doesNotMatch(JSON.stringify(result), /private-marker|fixture-token/);
+      assert.equal(calls.filter((req) => req.method === "POST").length, writes);
+      assert.equal(calls.filter((req) => req.method === "GET").length, 1);
+    });
+  }
+});
+
+test("HTTP 5xx or invalid success body after save never permits another write", async () => {
+  for (const status of [503, 200]) {
+    await withRuntime(async (calls, state) => {
+      state.failedRequest = { path: "/api/v2/web/me/edit", status, body: "<html>gateway error</html>" };
+      const result = await plugin.updateAvatar({ jpegBase64: base64 });
+      assert.equal("submitted" in result && result.submitted, true);
+      assert.deepEqual(calls.map((call) => call.method), ["GET", "POST", "POST"]);
+    });
+  }
 });
 
 for (const confirmation of ["fail", "unchanged"] as const) {

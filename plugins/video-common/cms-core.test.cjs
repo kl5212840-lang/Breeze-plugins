@@ -60,3 +60,44 @@ test('source counters retain known zero and missing values stay absent', async()
     assert.equal(item.sourceDuration,'120分钟');assert.equal(item.sourceVersion,'高清');
   }finally{global.fetch=original;}
 });
+
+test('CMS defaults and contradictory vote counts are identified independently', async () => {
+  const original = global.fetch;
+  const fixtures = [
+    {
+      ...row(10172, 10),
+      vod_hits: 17, vod_hits_day: 0, vod_hits_week: '0', vod_hits_month: 0, vod_time_hits: 0,
+      vod_score: '1.1', vod_score_all: 215, vod_score_num: 611,
+    },
+    {
+      ...row(42, 10),
+      vod_hits: '0', vod_hits_day: 0, vod_hits_week: 0, vod_hits_month: 0, vod_time_hits: 1700000000,
+      vod_score: '8.1', vod_score_all: 809, vod_score_num: 100,
+    },
+  ];
+  global.fetch = async url => {
+    const id = new URL(url).searchParams.get('ids');
+    return {ok: true, text: async () => JSON.stringify({
+      code: 1, list: fixtures.filter(value => String(value.vod_id) === id),
+    })};
+  };
+  try {
+    const adapter = plugin();
+    const uninitialized = (await adapter.getItem({clientProtocol: 2, id: '10172'})).data;
+    assert.equal(uninitialized.sourceViews, 17);
+    assert.equal(uninitialized.sourceViewsKind, 'clicks');
+    assert.deepEqual(uninitialized.sourceCounters, {});
+    assert.equal(uninitialized.sourceRating, 1.1);
+    assert.equal(uninitialized.sourceRatingCount, 611);
+    assert.equal(uninitialized.sourceRatingCountConsistent, false);
+
+    const observed = (await adapter.getItem({clientProtocol: 2, id: '42'})).data;
+    assert.equal(observed.sourceViews, 0);
+    assert.deepEqual(observed.sourceCounters, {day: 0, week: 0, month: 0});
+    assert.equal(observed.sourceRating, 8.1);
+    assert.equal(observed.sourceRatingCount, 100);
+    assert.equal(observed.sourceRatingCountConsistent, undefined);
+  } finally {
+    global.fetch = original;
+  }
+});

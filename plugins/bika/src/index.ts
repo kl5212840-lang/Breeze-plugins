@@ -3,6 +3,8 @@ import { getBikaAccessLineState, checkBikaAccessLines, cancelBikaAccessLineCheck
 import { getBikaVideoCatalog, getBikaVideoDetail, getBikaVideoPlayback } from "./bika-video";
 import { checkInToday, getCheckinStatus } from "./bika-checkin";
 import { getChapter, getComicDetail, getReadSnapshot } from "./bika-comic-detail";
+import { getComicFollowDetail } from "./bika-comic-follow";
+import type { ComicDetailPayload } from "./bika-types";
 import {
   getFavoriteData,
   getFunctionPage,
@@ -59,7 +61,8 @@ export default {
   getBikaVideoPlayback,
   init,
   bikaRequest,
-  getComicDetail,
+  getComicDetail: (payload?: ComicDetailPayload) =>
+    payload?.extern?.comicFollow === true ? getComicFollowDetail(payload) : getComicDetail(payload),
   getSettingsBundle,
   saveSettings,
   getUserInfoBundle,

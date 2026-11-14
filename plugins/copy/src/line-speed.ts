@@ -1,14 +1,33 @@
+import { normalizeCopyComicRow } from "./catalog";
+import {
+  CopyFollowError, copyChapterGroupUrl, copyChapterProbeGroup, readCopyPublicApi,
+  readCopyPublicDetail, type CopyPublicRequest,
+} from "./follow-metadata";
+import type { ChapterApiData } from "./types";
+
 export const COPY_SPEED_KEY = "network.speed.v1";
-export type RouteProbe = {
-  choice: string;
-  host: string;
+export const COPY_AUTO_CHOICE = "auto";
+export type ProbeResult = {
   ok: boolean;
   ms: number | null;
   status: number | null;
 };
+export type RouteProbe = ProbeResult & {
+  choice: string;
+  host: string;
+  account?: ProbeResult;
+  failedAt?: "directory" | "detail" | "chapters";
+};
+const PROBE_VERSION = 4;
+const ACCOUNT_PROBE_VERSIONS = new Set([2, 3, PROBE_VERSION]);
+const SPEED_TTL_MS = 20 * 60_000;
+const routeProbeBudgetMs = 6500;
+const qualifiedRouteLimitMs = 8500;
+const qualifiedReadingWindowMs = 5500;
 export type SpeedContext = { choice: string; platform: string };
 type SpeedState = {
   version: 1;
+  probeVersion?: number;
   revision: string;
   measuredAt: number;
   context: SpeedContext;
@@ -18,6 +37,7 @@ export type SpeedStore = { load(): Promise<unknown>; save(value: string): Promis
 export type SpeedResult = {
   ok: boolean;
   stale: boolean;
+  revision: string | null;
   measuredAt: number;
   results: RouteProbe[];
   message: string;
@@ -41,91 +61,212 @@ function object(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/** The fallback platform argument is source metadata, not an account or proxy.
- * This probe intentionally never calls the authenticated Copy API helpers. */
+type ProbeOptions = {
+  fetch?: typeof fetch;
+  now?: () => number;
+  timeoutMs?: number;
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
+};
+
+const maxBodyBytes = 512 * 1024;
+
+async function probeCopyJson(
+  urls: URL[],
+  headers: Record<string, string>,
+  options: ProbeOptions,
+  validate: (data: Record<string, unknown>, response: Response) => boolean,
+  method = "GET",
+): Promise<ProbeResult> {
+  const now =
+    options.now ?? (() => (typeof performance === "undefined" ? Date.now() : performance.now()));
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  if (options.signal?.aborted) cancel();
+  options.signal?.addEventListener("abort", cancel, { once: true });
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 6000);
+  let status: number | null = null;
+  try {
+    for (const url of urls) {
+      const started = now();
+      const response = await (options.fetch ?? globalThis.fetch)(new Request(url, {
+        method,
+        credentials: "omit",
+        redirect: "error",
+        signal: controller.signal,
+        headers,
+      }));
+      status = response.status;
+      if (response.redirected || (response.url && new URL(response.url).origin !== url.origin)) break;
+      if (status === 429 || status >= 500) break;
+      const length = Number(response.headers.get("content-length"));
+      if (Number.isFinite(length) && length > maxBodyBytes) break;
+      const text = await response.text();
+      if (text.length > maxBodyBytes || controller.signal.aborted) break;
+      let data: unknown;
+      try { data = JSON.parse(text); } catch {}
+      if (validate(object(data), response)) {
+        return { ok: true, ms: Math.max(0, Math.round(now() - started)), status };
+      }
+    }
+  } catch {
+    // No useful response was obtained within the shared deadline.
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", cancel);
+    cancel();
+  }
+  return { ok: false, ms: null, status };
+}
+
+/** Qualify the directory and rank the successful detail and first chapter page. */
 export async function probeCopyRoute(
   choice: string,
   base: string,
   platform: string,
-  options: {
-    fetch?: typeof fetch;
-    now?: () => number;
-    timeoutMs?: number;
-    headers?: Record<string, string>;
-  } = {},
+  options: ProbeOptions & Pick<CopyPublicRequest, "appHeaders" | "isAppGate"> & { tryNewest?: boolean } = {},
 ): Promise<RouteProbe> {
-  const url = new URL(`${base}/comics`);
-  url.search = new URLSearchParams({
-    limit: "1",
-    offset: "0",
-    free_type: "1",
-    platform,
-  }).toString();
-  const host = url.hostname,
-    now =
-      options.now ?? (() => (typeof performance === "undefined" ? Date.now() : performance.now())),
-    started = now();
+  const directory = new URL(`${base}/comics`);
+  directory.search = new URLSearchParams({ limit: "2", offset: "0", free_type: "1", platform }).toString();
+  const urls = [directory];
+  if (options.tryNewest) {
+    const newest = new URL(`${base}/update/newest`);
+    newest.search = new URLSearchParams({ limit: "2", offset: "0", platform: "3" }).toString();
+    urls.unshift(newest);
+  }
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 6000);
-  let status: number | null = null;
+  const cancel = () => controller.abort();
+  if (options.signal?.aborted) cancel();
+  options.signal?.addEventListener("abort", cancel, { once: true });
+  const now = options.now ?? (() => (typeof performance === "undefined" ? Date.now() : performance.now()));
+  const probeStarted = now();
+  let timer = setTimeout(cancel, options.timeoutMs ?? routeProbeBudgetMs);
+  let hasReadingWindow = false;
+  const request: CopyPublicRequest = {
+    headers: options.headers ?? {
+      Accept: "application/json",
+      version: "2025.05.09",
+      Origin: "https://2025copy.com",
+      region: "0",
+      webp: "0",
+      ...(platform ? { platform } : {}),
+    },
+    ...(options.appHeaders ? { appHeaders: options.appHeaders } : {}),
+    ...(options.isAppGate ? { isAppGate: options.isAppGate } : {}),
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+    signal: controller.signal,
+  };
+  const route = { choice, host: directory.hostname };
+  const { appHeaders, ...withoutFallback } = request;
+  const appRequest = appHeaders ? { ...withoutFallback, headers: appHeaders } : request;
+  const sampled = new Set<string>();
+  let failure: Pick<RouteProbe, "failedAt" | "status"> = { failedAt: "directory", status: null };
+  function record(stage: NonNullable<RouteProbe["failedAt"]>, status: number | null) {
+    const stages = ["directory", "detail", "chapters"] as const;
+    if (stages.indexOf(stage) >= stages.indexOf(failure.failedAt!)) failure = { failedAt: stage, status };
+  }
   try {
-    const response = await (options.fetch ?? globalThis.fetch)(
-      new Request(url, {
-        method: "GET",
-        credentials: "omit",
-        redirect: "error",
-        signal: controller.signal,
-        headers: options.headers ?? {
-          Accept: "application/json",
-          version: "2025.05.09",
-          Origin: "https://2025copy.com",
-          region: "0",
-          webp: "0",
-          ...(platform ? { platform } : {}),
-        },
-      }),
-    );
-    status = response.status;
-    if (
-      !response.ok ||
-      response.redirected ||
-      (response.url && new URL(response.url).origin !== url.origin)
-    )
-      throw new Error("invalid response");
-    const length = Number(response.headers.get("content-length"));
-    if (Number.isFinite(length) && length > 512 * 1024) throw new Error("oversized response");
-    const text = await response.text();
-    if (text.length > 512 * 1024 || controller.signal.aborted) throw new Error("invalid response");
-    const data = object(JSON.parse(text)),
-      result = object(data.results);
-    const list = result.list;
-    // HTTP 200/login pages/empty objects are not proof of a usable content API.
-    if (
-      Number(data.code) !== 200 ||
-      !Array.isArray(list) ||
-      list.length < 1 ||
-      list.length > 50 ||
-      !Number.isInteger(result.total) ||
-      Number(result.total) < list.length ||
-      !list.every((entry) => {
-        const comic = object(entry);
-        return (
-          typeof comic.path_word === "string" &&
-          /^[A-Za-z0-9_-]{1,200}$/.test(comic.path_word) &&
-          typeof comic.name === "string" &&
-          comic.name.trim().length > 0 &&
-          comic.name.length <= 500
-        );
-      })
-    )
-      throw new Error("invalid content");
-    return { choice, host, ok: true, ms: Math.max(0, Math.round(now() - started)), status };
-  } catch {
-    return { choice, host, ok: false, ms: null, status };
+    for (const url of urls) {
+      if (controller.signal.aborted || sampled.size >= 2) break;
+      let comicIds: string[];
+      try {
+        const { data, status } = await readCopyPublicApi(url, request);
+        record("directory", status);
+        const result = object(data.results);
+        const list = result.list;
+        if (!Array.isArray(list) || list.length < 1 || list.length > 50 ||
+            (result.total != null && (!Number.isSafeInteger(Number(result.total)) || Number(result.total) < list.length))) continue;
+        comicIds = list.flatMap((entry) => {
+          const comic = normalizeCopyComicRow(entry);
+          return typeof comic?.path_word === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(comic.path_word) &&
+            typeof comic.name === "string" && comic.name.trim() ? [comic.path_word] : [];
+        });
+      } catch (error) {
+        if (error instanceof CopyFollowError) {
+          record("directory", error.status);
+          if (!error.retryable) break;
+        }
+        continue;
+      }
+      if (!hasReadingWindow && comicIds.length && !controller.signal.aborted) {
+        hasReadingWindow = true;
+        // Slow discovery should leave time for a real reading sample. Only a
+        // qualified directory can extend the deadline, once and up to the cap.
+        if (options.timeoutMs === undefined) {
+          const elapsed = Math.max(0, now() - probeStarted);
+          const totalBudget = Math.min(qualifiedRouteLimitMs,
+            Math.max(routeProbeBudgetMs, elapsed + qualifiedReadingWindowMs));
+          if (totalBudget > routeProbeBudgetMs) {
+            clearTimeout(timer);
+            timer = setTimeout(cancel, Math.max(0, totalBudget - elapsed));
+          }
+        }
+      }
+      for (const comicId of comicIds) {
+        if (controller.signal.aborted || sampled.size >= 2) break;
+        if (sampled.has(comicId)) continue;
+        sampled.add(comicId);
+        let stage: "detail" | "chapters" = "detail";
+        // Match a fresh detail load, including any App-profile negotiation.
+        // Directory discovery and failed works are availability checks only.
+        const started = now();
+        try {
+          const { detail, status, usedApp } = await readCopyPublicDetail(base, comicId, request, { requireSummary: true });
+          const group = copyChapterProbeGroup(detail.results);
+          record(stage, status);
+          if (!group) continue;
+          stage = "chapters";
+          const { data, status: chapterStatus } = await readCopyPublicApi<ChapterApiData>(
+            copyChapterGroupUrl(base, comicId, group, 0, 1), usedApp ? appRequest : request,
+          );
+          record(stage, chapterStatus);
+          const rows = data.results?.list;
+          if (!Array.isArray(rows) || rows.length === 0) continue;
+          const first = rows[0];
+          const total = data.results?.total, offset = data.results?.offset;
+          if (!first || typeof first.uuid !== "string" || !first.uuid.trim() ||
+              (total != null && (!Number.isSafeInteger(Number(total)) || Number(total) < rows.length)) ||
+              (offset != null && Number(offset) !== 0) ||
+              (first.comic_path_word != null && first.comic_path_word !== comicId)) continue;
+          return { ...route, ok: true, ms: Math.max(0, Math.round(now() - started)), status: chapterStatus };
+        } catch (error) {
+          if (error instanceof CopyFollowError) {
+            record(stage, error.status);
+            if (!error.retryable && error.reason === "sourceUnavailable" && !error.restricted) {
+              return { ...route, ok: false, ms: null, ...failure };
+            }
+          }
+        }
+      }
+    }
+    return { ...route, ok: false, ms: null, ...failure };
   } finally {
     clearTimeout(timer);
-    controller.abort();
+    options.signal?.removeEventListener("abort", cancel);
+    cancel();
   }
+}
+
+/** A Copy-style anonymous challenge proves the account endpoint answered. */
+export function probeCopyAccount(base: string, options: ProbeOptions): Promise<ProbeResult> {
+  return probeCopyJson(
+    [new URL(`${base}/member/info?platform=1`)],
+    options.headers ?? {},
+    options,
+    (data, response) => (response.ok || response.status === 401) && Number(data.code) === 401,
+  );
+}
+
+/** The app API advertises its login method without receiving any credentials. */
+export function probeCopyLogin(base: string, options: ProbeOptions): Promise<ProbeResult> {
+  return probeCopyJson(
+    [new URL(`${base}/login`)],
+    options.headers ?? {},
+    options,
+    (_data, response) => (response.ok || response.status === 405) &&
+      (response.headers.get("allow") ?? "").split(",").some((value) => value.trim().toUpperCase() === "POST"),
+    "OPTIONS",
+  );
 }
 
 /** Only measurements are persisted. This class cannot select or change a route. */
@@ -148,8 +289,8 @@ export class CopyLineSpeedTest {
   private now() {
     return (this.options.now ?? Date.now)();
   }
-  private same(a: SpeedContext, b: SpeedContext) {
-    return a.choice === b.choice && a.platform === b.platform;
+  private sameRequest(a: SpeedContext, b: SpeedContext) {
+    return a.platform === b.platform;
   }
   private async read(): Promise<SpeedState | null> {
     const raw = unbox(await this.options.store.load());
@@ -160,7 +301,8 @@ export class CopyLineSpeedTest {
     if (
       typeof state.revision !== "string" ||
       typeof context.choice !== "string" ||
-      !Object.prototype.hasOwnProperty.call(this.options.bases, context.choice) ||
+      (context.choice !== COPY_AUTO_CHOICE &&
+        !Object.prototype.hasOwnProperty.call(this.options.bases, context.choice)) ||
       typeof context.platform !== "string" ||
       typeof state.measuredAt !== "number" ||
       !Number.isFinite(state.measuredAt) ||
@@ -191,6 +333,7 @@ export class CopyLineSpeedTest {
     }
     return {
       version: 1,
+      ...(typeof state.probeVersion === "number" ? { probeVersion: state.probeVersion } : {}),
       revision: state.revision,
       measuredAt: state.measuredAt,
       context: { choice: context.choice, platform: context.platform },
@@ -199,9 +342,17 @@ export class CopyLineSpeedTest {
   }
   async snapshot() {
     const state = await this.read();
+    const now = this.now();
+    const expired = state != null && (now < state.measuredAt || now - state.measuredAt > SPEED_TTL_MS);
     return state == null
       ? null
-      : { ...state, stale: !this.same(state.context, await this.options.context()) };
+      : {
+          ...state,
+          stale: state.probeVersion !== PROBE_VERSION ||
+            !this.sameRequest(state.context, await this.options.context()) ||
+            expired,
+          accountStale: expired || !ACCOUNT_PROBE_VERSIONS.has(state.probeVersion ?? 0),
+        };
   }
   measure(): Promise<SpeedResult> {
     if (this.flight) return this.flight;
@@ -239,11 +390,13 @@ export class CopyLineSpeedTest {
       complete = results.filter(Boolean);
     let stale =
       !current() ||
-      !this.same(context, await this.options.context()) ||
+      !this.sameRequest(context, await this.options.context()) ||
       (await this.read())?.revision !== before?.revision;
+    let revision: string | null = null;
     if (!stale) {
       const state: SpeedState = {
         version: 1,
+        probeVersion: PROBE_VERSION,
         revision: `${measuredAt}-${Math.random().toString(36).slice(2, 14)}`,
         measuredAt,
         context,
@@ -253,17 +406,19 @@ export class CopyLineSpeedTest {
       const saved = await this.read();
       if (JSON.stringify(saved) !== JSON.stringify(state))
         throw new Error("线路测试记录未保存，请重试。");
-      stale = !current() || !this.same(context, await this.options.context());
+      stale = !current() || !this.sameRequest(context, await this.options.context());
+      revision = state.revision;
     }
     const available = complete.filter((row) => row.ok).length;
     return {
       ok: !stale && available > 0,
       stale,
+      revision,
       measuredAt,
       results: complete,
       message: stale
         ? "线路选择或请求标识已变化，本次结果未应用。"
-        : `测试完成：${available} 条可用，${complete.length - available} 条失败。`,
+        : `阅读测速：${available} 条通过目录、详情及章节验证，${complete.length - available} 条未通过。`,
     };
   }
 }

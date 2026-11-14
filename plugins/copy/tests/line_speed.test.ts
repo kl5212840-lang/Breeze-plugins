@@ -11,28 +11,43 @@ const payload = () => ({
   code: 200,
   results: { total: 1, list: [{ path_word: "public-comic", name: "Public comic" }] },
 });
+const detail = () => ({
+  code: 200,
+  results: {
+    comic: { path_word: "public-comic", name: "Public comic", last_chapter: { uuid: "chapter-1", name: "第1话" } },
+    groups: { default: { path_word: "default", count: 1 } },
+  },
+});
+const chapters = () => ({ code: 200, results: { total: 1, list: [{ uuid: "chapter-1", comic_path_word: "public-comic" }] } });
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-test("probe validates a real public payload and includes response-body time without sending credentials", async () => {
+test("probe qualifies directory and measures the complete detail and first chapter responses without credentials", async () => {
   let now = 100;
+  const paths: string[] = [];
   const result = await probeCopyRoute("Mainland 3", "https://api.2025copy.com/api/v3", "1", {
     now: () => now,
     fetch: async (input) => {
       const request = input as Request,
         url = new URL(request.url);
       assert.equal(request.method, "GET");
-      assert.equal(request.redirect, "error");
+      assert.equal(request.redirect, "manual");
       assert.equal(request.credentials, "omit");
       assert.equal(request.body, null);
-      assert.equal(url.pathname, "/api/v3/comics");
-      assert.equal(url.searchParams.get("limit"), "1");
-      assert.equal(url.searchParams.get("platform"), "1");
+      paths.push(url.pathname);
+      if (url.pathname === "/api/v3/comics") {
+        assert.equal(url.searchParams.get("limit"), "2");
+        assert.equal(url.searchParams.get("platform"), "1");
+      } else if (url.pathname.includes("/comic2/")) {
+        assert.equal(url.searchParams.get("platform"), "1");
+      } else {
+        assert.equal(url.searchParams.get("limit"), "1");
+      }
       assert.equal(request.headers.get("authorization"), null);
       assert.equal(request.headers.get("cookie"), null);
-      const response = json(payload()),
+      const response = json(url.pathname === "/api/v3/comics" ? payload() : url.pathname.includes("/comic2/") ? detail() : chapters()),
         text = response.text.bind(response);
       response.text = async () => {
-        now = 175;
+        now += url.pathname === "/api/v3/comics" ? 950 : 25;
         return text();
       };
       return response;
@@ -42,9 +57,70 @@ test("probe validates a real public payload and includes response-body time with
     choice: "Mainland 3",
     host: "api.2025copy.com",
     ok: true,
-    ms: 75,
+    ms: 50,
     status: 200,
   });
+  assert.deepEqual(paths, [
+    "/api/v3/comics", "/api/v3/comic2/public-comic", "/api/v3/comic/public-comic/group/default/chapters",
+  ]);
+});
+
+test("failed samples stay outside the score and the successful detail includes its App-profile gate", async () => {
+  let now = 100;
+  const calls: string[] = [];
+  const result = await probeCopyRoute("Mainland", "https://a.example/api/v3", "1", {
+    now: () => now,
+    appHeaders: { "User-Agent": "fixture-app" },
+    isAppGate: (message) => message === "use app",
+    fetch: async (input) => {
+      const request = input as Request;
+      const { pathname } = new URL(request.url);
+      const app = request.headers.get("user-agent") === "fixture-app";
+      calls.push(`${pathname}:${app ? "app" : "default"}`);
+      if (pathname === "/api/v3/comics") {
+        now += 400;
+        if (!app) return json({ code: 210, message: "use app" }, 210);
+        return json({ code: 200, results: { total: 2, list: [
+          { path_word: "closed-comic", name: "Closed work" },
+          { path_word: "public-comic", name: "Public work" },
+        ] } });
+      }
+      if (pathname.endsWith("/closed-comic")) {
+        now += 500;
+        return json({ code: 403, message: "该作品有地区限制" }, 403);
+      }
+      if (pathname.endsWith("/public-comic")) {
+        now += app ? 60 : 30;
+        return app ? json(detail()) : json({ code: 210, message: "use app" }, 210);
+      }
+      assert.ok(app);
+      now += 20;
+      return json(chapters());
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.ms, 110);
+  assert.deepEqual(calls, [
+    "/api/v3/comics:default", "/api/v3/comics:app", "/api/v3/comic2/closed-comic:default",
+    "/api/v3/comic2/public-comic:default", "/api/v3/comic2/public-comic:app",
+    "/api/v3/comic/public-comic/group/default/chapters:app",
+  ]);
+});
+
+test("a directory-only or chapter-list-only false success cannot win", async () => {
+  for (const stage of ["detail", "chapters"] as const) {
+    const result = await probeCopyRoute("Mainland 4000", "https://api.copy4000.com/api/v3", "1", {
+      fetch: async (input) => {
+        const { pathname } = new URL((input as Request).url);
+        if (pathname === "/api/v3/comics") return json(payload());
+        if (pathname.includes("/comic2/")) return stage === "detail" ? new Response("error") : json(detail());
+        return json({ code: 200, results: { list: [{ path_word: "directory-row", name: "wrong schema" }] } });
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.ms, null);
+    assert.equal(result.failedAt, stage);
+  }
 });
 for (const [name, body, status] of [
   ["HTTP 200 with a login response", { code: 401, message: "login" }, 200],
@@ -214,10 +290,12 @@ for (const reason of ["manual", "platform", "runtime", "newer-record"] as const)
     assert.equal(state.writes.length, 0);
   });
 }
-test("stored records show stale context after a later hand selection; all failures keep that selection", async () => {
+test("stored records survive hand selection but become stale for a different request identifier", async () => {
   const state = fixture();
   await state.speed.measure();
   state.context.choice = "c";
+  assert.equal((await state.speed.snapshot())!.stale, false);
+  state.context.platform = "3";
   assert.equal((await state.speed.snapshot())!.stale, true);
   const failed = fixture(async (choice, base) => ({
     choice,
@@ -233,6 +311,22 @@ test("stored records show stale context after a later hand selection; all failur
     (await failed.speed.snapshot())!.results.every((row) => !row.ok),
     true,
   );
+});
+
+test("prior reading scores become stale without discarding valid independent account measurements", async () => {
+  for (const probeVersion of [2, 3]) {
+    const state = fixture();
+    state.setRaw({
+      version: 1, probeVersion, revision: "old-reading-metric", measuredAt: 12345,
+      context: { ...state.context, platform: "3" },
+      results: [{ ...ok("a", bases.a!), account: { ok: true, ms: 15, status: 401 } }],
+    });
+    const snapshot = await state.speed.snapshot();
+    assert.equal(snapshot?.stale, true);
+    assert.equal(snapshot?.accountStale, false);
+    assert.equal(snapshot?.results[0]?.account?.ms, 15);
+    assert.deepEqual(state.writes, []);
+  }
 });
 test("future record versions and failed readback never report saved measurement", async () => {
   const state = fixture();
@@ -261,6 +355,7 @@ for (const length of [8, 14]) {
     });
     const snapshot = await speed.snapshot();
     assert.equal(snapshot?.results.length, length);
+    assert.equal(snapshot?.stale, true);
     assert.deepEqual(snapshot?.results.map(row => row.choice), results.map(row => row.choice));
   });
 }
