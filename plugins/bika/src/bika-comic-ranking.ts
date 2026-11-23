@@ -26,6 +26,7 @@ export async function getRankingData(
     cache: true,
     cacheArray: [type === "creator" ? "users" : "comics"],
     refresh: payload.refresh === true,
+    readScope: payload.__breezeReadScope,
   });
 
   const rawData = toStringMap(toStringMap(raw).data);

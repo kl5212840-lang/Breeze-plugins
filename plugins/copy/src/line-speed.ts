@@ -1,4 +1,5 @@
 import { normalizeCopyComicRow } from "./catalog";
+import { isCopyAutoChoice } from "./copy-routes";
 import {
   CopyFollowError, copyChapterGroupUrl, copyChapterProbeGroup, readCopyPublicApi,
   readCopyPublicDetail, type CopyPublicRequest,
@@ -6,7 +7,6 @@ import {
 import type { ChapterApiData } from "./types";
 
 export const COPY_SPEED_KEY = "network.speed.v1";
-export const COPY_AUTO_CHOICE = "auto";
 export type ProbeResult = {
   ok: boolean;
   ms: number | null;
@@ -301,7 +301,7 @@ export class CopyLineSpeedTest {
     if (
       typeof state.revision !== "string" ||
       typeof context.choice !== "string" ||
-      (context.choice !== COPY_AUTO_CHOICE &&
+      (!isCopyAutoChoice(context.choice) &&
         !Object.prototype.hasOwnProperty.call(this.options.bases, context.choice)) ||
       typeof context.platform !== "string" ||
       typeof state.measuredAt !== "number" ||
@@ -416,9 +416,7 @@ export class CopyLineSpeedTest {
       revision,
       measuredAt,
       results: complete,
-      message: stale
-        ? "线路选择或请求标识已变化，本次结果未应用。"
-        : `阅读测速：${available} 条通过目录、详情及章节验证，${complete.length - available} 条未通过。`,
+      message: stale ? "本次测速已取消" : available === 0 ? "暂未找到可用线路" : `${available} 条线路可用`,
     };
   }
 }

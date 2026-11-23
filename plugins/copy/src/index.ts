@@ -1,5 +1,4 @@
 import {
-  COPY_AUTO_CHOICE,
   COPY_SPEED_KEY,
   CopyLineSpeedTest,
   probeCopyRoute,
@@ -12,10 +11,13 @@ import { copyProfileTransport, prepareCopyAvatarJpeg } from "./profile-avatar-ru
 import { readAccountCredentials, saveAccountCredentials } from "./account-credentials";
 import {
   COPY_API_ROUTES,
+  COPY_AUTO_CHOICE,
+  COPY_AUTO_SPEED_CHOICE,
   COPY_DEFAULT_CHOICE,
   accountBaseForOrigin,
   isCopyAccountBase,
   isCopyAccountChoice,
+  isCopyAutoChoice,
   isCopyRouteChoice,
   isHotMangaApiBase,
 } from "./copy-routes";
@@ -57,7 +59,7 @@ import {
   readLoginValues,
   runtime,
 } from "breeze-plugin-kit";
-import ky, { isHTTPError, type Options } from "ky";
+import ky, { isHTTPError, isNetworkError, isTimeoutError, type Options } from "ky";
 import { safeCopyLoginReason } from "./login-error";
 import {
   NOT_FOUND_IMAGE_URL,
@@ -86,6 +88,7 @@ import {
   resolveCopyDiscoverFilters,
 } from "./catalog";
 import { loadCopyThemeOptions } from "./catalog_theme_cache";
+import { responseCacheGeneration, writeResponseCache } from "../../shared/response-cache";
 import { loadCopyChapterPages } from "./catalog_chapters";
 import { COPY_FALLBACK_THEMES } from "./catalog_themes";
 import {
@@ -99,7 +102,6 @@ import {
 } from "./follow-metadata";
 import type {
   CachedChapterContent,
-  CachedGetChapterResult,
   ChapterApiData,
   ChapterContentInfo,
   ChapterContentItem,
@@ -199,6 +201,44 @@ const lineSpeedTest = new CopyLineSpeedTest({
 async function readLineSpeeds() {
   try { return await lineSpeedTest.snapshot(); } catch { return null; }
 }
+
+function fastestReadingChoice(
+  speed: Pick<SpeedResult, "results" | "stale"> | null,
+  eligible: (choice: string) => boolean,
+) {
+  let winner: string | undefined;
+  let fastest = Infinity;
+  if (speed && !speed.stale) {
+    for (const row of speed.results) {
+      if (row.ok && row.ms !== null && row.ms < fastest && eligible(row.choice)) {
+        winner = row.choice;
+        fastest = row.ms;
+      }
+    }
+  }
+  return winner;
+}
+
+function publicReadingChoice(
+  mode: string,
+  preferred: string,
+  speed: Pick<SpeedResult, "results" | "stale"> | null,
+) {
+  if (mode !== COPY_AUTO_CHOICE) return preferred;
+  // A verified mirror is a public reading fallback only. It never becomes
+  // the saved account-capable preference, nor a destination for credentials.
+  return fastestReadingChoice(speed, isCopyAccountChoice) ??
+    fastestReadingChoice(speed, isCopyRouteChoice) ?? preferred;
+}
+
+async function measuredCopyAccountReadingChoices() {
+  const speed = await readLineSpeeds();
+  return speed && !speed.stale
+    ? speed.results.filter((row) => isCopyAccountChoice(row.choice) && row.ok && row.ms !== null)
+      .sort((left, right) => left.ms! - right.ms!).map((row) => row.choice)
+    : [];
+}
+
 let routeRevision = 0;
 let routeWrites = Promise.resolve();
 
@@ -213,8 +253,10 @@ async function readRouteSelection() {
   const [choice, platform] = await Promise.all([
     resolveApiDomainChoice(), resolvePlatformValue(),
   ]);
-  const effective = choice === COPY_AUTO_CHOICE ? await readAutoRoute() : choice;
-  return { revision, choice, platform, effective };
+  const preferred = isCopyAutoChoice(choice) ? await readAutoRoute(choice) : choice;
+  const effective = publicReadingChoice(choice, preferred,
+    choice === COPY_AUTO_CHOICE ? await readLineSpeeds() : null);
+  return { revision, choice, platform, preferred, effective };
 }
 
 async function applyAutoMeasurement(
@@ -224,7 +266,7 @@ async function applyAutoMeasurement(
   return writeRoute(async () => {
     const current = await readRouteSelection();
     if (result.stale || owner.revision !== current.revision ||
-        owner.choice !== COPY_AUTO_CHOICE || current.choice !== COPY_AUTO_CHOICE ||
+        !isCopyAutoChoice(owner.choice) || owner.choice !== current.choice ||
         owner.platform !== current.platform) {
       return { effective: current.effective, changed: false };
     }
@@ -232,17 +274,13 @@ async function applyAutoMeasurement(
     if (saved === null || saved.stale || saved.revision !== result.revision) {
       return { effective: current.effective, changed: false };
     }
-    let fastest = current.effective;
-    let fastestMs = Infinity;
-    for (const row of saved.results) {
-      if (isCopyAccountChoice(row.choice) && row.ok && row.ms !== null && row.ms < fastestMs) {
-        fastest = row.choice;
-        fastestMs = row.ms;
-      }
+    const preferred = fastestReadingChoice(saved, (choice) =>
+      isEligibleAutoReadingChoice(current.choice, choice)) ?? current.preferred;
+    if (preferred !== current.preferred) {
+      await saveRoutePreference(AUTO_ROUTE_KEY, preferred);
     }
-    if (fastest === current.effective) return { effective: fastest, changed: false };
-    await saveRoutePreference(AUTO_ROUTE_KEY, fastest);
-    return { effective: fastest, changed: true };
+    const effective = publicReadingChoice(current.choice, preferred, saved);
+    return { effective, changed: effective !== owner.effective };
   });
 }
 
@@ -265,14 +303,7 @@ async function testLineSpeeds() {
   const owner = await writeRoute(readRouteSelection);
   const { revision, ...result } = await lineSpeedTest.measure();
   const { effective, changed } = await applyAutoMeasurement(owner, { revision, ...result });
-  const accountCount = result.results.filter((row) => row.account?.ok).length;
-  const autoStatus = owner.choice === COPY_AUTO_CHOICE && !result.stale
-    ? ` 当前首选线路：${copyRouteName(effective)}。`
-    : "";
-  const message = result.stale
-    ? result.message
-    : `${result.message} 账号入口 ${accountCount} 条有响应。${autoStatus}`;
-  return { source: PLUGIN_ID, ok: true, message,
+  return { source: PLUGIN_ID, ok: true, message: result.message,
     data: { ...result, ok: true, anyAvailable: result.ok, ...routeResult(effective, changed) } };
 }
 
@@ -315,15 +346,19 @@ async function saveRoutePreference(key: string, value: string) {
   if (saved !== value) throw new Error("线路设置未保存，请重试。");
 }
 
-async function readAutoRoute() {
+function isEligibleAutoReadingChoice(mode: string, choice: string) {
+  return mode === COPY_AUTO_SPEED_CHOICE ? isCopyRouteChoice(choice) : isCopyAccountChoice(choice);
+}
+
+async function readAutoRoute(mode: string) {
   const raw = await pluginConfig.load(AUTO_ROUTE_KEY, "").catch(() => "");
   const choice = String(unwrapStoredValue(raw) ?? "").trim();
-  return isCopyAccountChoice(choice) ? choice : COPY_DEFAULT_CHOICE;
+  return isEligibleAutoReadingChoice(mode, choice) ? choice : COPY_DEFAULT_CHOICE;
 }
 
 async function saveApiDomainChoice(choice: string) {
   await saveRoutePreference(API_DOMAIN_CONFIG_KEY, choice);
-  if (choice === COPY_AUTO_CHOICE) return;
+  if (isCopyAutoChoice(choice)) return;
   await Promise.allSettled([
     cache.set(API_DOMAIN_CONFIG_KEY, choice),
     cache.set(API_BASE_CACHE_KEY, apiBaseFromChoice(choice)),
@@ -341,7 +376,7 @@ async function savePlatformValue(platform: string) {
 async function resolveApiDomainChoice() {
   const stored = await pluginConfig.load(API_DOMAIN_CONFIG_KEY, "").catch(() => "");
   const choice = String(unwrapStoredValue(stored) ?? "").trim();
-  if (choice === COPY_AUTO_CHOICE || isCopyRouteChoice(choice)) return choice;
+  if (isCopyAutoChoice(choice) || isCopyRouteChoice(choice)) return choice;
 
   // Older installations may have only the derived base or the cached choice.
   const cached = await cache.get(API_BASE_CACHE_KEY, "").catch(() => "");
@@ -356,7 +391,9 @@ async function resolveApiDomainChoice() {
 
 async function resolveApiBase() {
   const choice = await resolveApiDomainChoice();
-  return apiBaseFromChoice(choice === COPY_AUTO_CHOICE ? await readAutoRoute() : choice);
+  const preferred = isCopyAutoChoice(choice) ? await readAutoRoute(choice) : choice;
+  return apiBaseFromChoice(publicReadingChoice(choice, preferred,
+    choice === COPY_AUTO_CHOICE ? await readLineSpeeds() : null));
 }
 
 async function resolvePlatformValue() {
@@ -505,7 +542,17 @@ function normalizeGroups(value: unknown): DetailApiGroup[] {
     .filter((item) => Boolean(String(item.path_word ?? "").trim()));
 }
 
-async function fetchCopyApi<T>(url: string, options?: Pick<Options, "retry" | "timeout">) {
+function copyReadScopeOptions(scope?: string): Pick<Options, "fetch" | "retry"> {
+  if (!scope) return {};
+  return {
+    retry: 0,
+    fetch: (request, init) => globalThis.fetch(request, {
+      ...init, breezeReadScope: scope,
+    } as RequestInit),
+  };
+}
+
+async function fetchCopyApi<T>(url: string, options?: Pick<Options, "retry" | "timeout" | "fetch">) {
   console.log(`[api] fetchCopyApi url="${url}"`);
   try {
     const json = (await ky
@@ -546,10 +593,12 @@ const copyAccountRequest = {
   retry: 0,
 } as const;
 
-async function fetchCopyApiWithHeaders<T>(url: string, headers: Record<string, string>, anonymousFallback = false) {
+async function fetchCopyApiWithHeaders<T>(url: string, headers: Record<string, string>, anonymousFallback = false, readScope?: string, timeoutMs?: number) {
   const json = await ky.get(url, {
     headers,
     ...(headers.authorization || anonymousFallback ? copyAccountRequest : {}),
+    ...copyReadScopeOptions(readScope),
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs, retry: 0 }),
   }).json<CopyApiResponse<T>>();
   if (Number(json.code ?? 0) !== 200) {
     throw new Error(json.message || "请求失败");
@@ -663,13 +712,14 @@ async function loadAccountRoutes(token: string) {
   const effective = isCopyAccountChoice(route.effective) ? apiBaseFromChoice(route.effective) : undefined;
   const pinned = pinnedAccountBase(route);
   const defaultBase = apiBaseFromChoice(COPY_DEFAULT_CHOICE);
-  const [measured] = route.choice === COPY_AUTO_CHOICE ? await measuredAccountBases() : [];
+  const automatic = isCopyAutoChoice(route.choice);
+  const [measured] = automatic ? await measuredAccountBases() : [];
   const first = verified ?? pinned ?? issuedBase ?? measured ?? effective ?? defaultBase;
   const fallback = uniqueBases(issuedBase, pinned, measured, effective, defaultBase)
     .find((base) => base !== first);
   return {
     first,
-    fallback: route.choice === COPY_AUTO_CHOICE || issuedBase ? fallback : undefined,
+    fallback: automatic || issuedBase ? fallback : undefined,
     choice: route.choice,
     authoritativeBase: issuedBase ?? verified ?? pinned,
     username,
@@ -739,7 +789,10 @@ async function queryFavoriteCollectId(
 }
 
 async function loadWorkAccountRequest() {
-  if (!isCopyAccountBase(await resolveApiBase())) throw new Error("该阅读线路不支持拷贝账号收藏");
+  const choice = await resolveApiDomainChoice();
+  if (!isCopyAutoChoice(choice) && !isCopyAccountChoice(choice)) {
+    throw new Error("该阅读线路不支持拷贝账号收藏");
+  }
   return loadAccountRequest();
 }
 
@@ -935,13 +988,13 @@ async function isTaskGroupCancelled(taskGroupKey: string) {
   }
 }
 
-function buildChapterCacheKey(comicId: string, groups: DetailApiGroup[]) {
+function buildChapterCacheKey(comicId: string, groups: DetailApiGroup[], route: PublicComicRoute) {
   const groupKey = groups
     .map((group) => String(group.path_word ?? "").trim())
     .filter(Boolean)
     .sort()
     .join(",");
-  return `copyComic:chapters:v2:${comicId}:${groupKey}`;
+  return `copyComic:chapters:v3:${JSON.stringify([copyChapterRouteKey(route), comicId, groupKey])}`;
 }
 
 async function readChapterCache(cacheKey: string): Promise<MappedEpItem[] | null> {
@@ -971,9 +1024,9 @@ async function readChapterCache(cacheKey: string): Promise<MappedEpItem[] | null
   }
 }
 
-async function writeChapterCache(cacheKey: string, eps: MappedEpItem[]) {
+async function writeChapterCache(cacheKey: string, eps: MappedEpItem[], generation?: number) {
   try {
-    await cache.set(cacheKey, {
+    await writeResponseCache(cacheKey, {
       ts: Date.now(),
       eps: eps.map(
         (ep) =>
@@ -988,22 +1041,22 @@ async function writeChapterCache(cacheKey: string, eps: MappedEpItem[]) {
             extern: ep.extern,
           }) as ChapterSummary,
       ),
-    });
+    }, generation);
   } catch {
     // ignore cache write errors
   }
 }
 
-function buildChapterContentCacheKey(comicId: string, chapterId: string) {
-  return `copyComic:chapterContent:v1:${comicId}:${chapterId}`;
+function chapterPageCacheKey(scope: string | null, comicId: string, chapterId: string) {
+  return scope == null ? null : `copyComic:chapterContent:v2:${JSON.stringify([scope, comicId, chapterId])}`;
 }
 
 async function readChapterContentCache(
-  comicId: string,
-  chapterId: string,
+  key: string | null,
 ): Promise<CachedChapterContent | null> {
+  if (key == null) return null;
   try {
-    const raw = await cache.get(buildChapterContentCacheKey(comicId, chapterId), null);
+    const raw = await cache.get(key, null);
     const data = toStringMap(raw);
     const ts = Number(data.ts ?? 0);
     if (!Number.isFinite(ts) || ts <= 0) return null;
@@ -1027,60 +1080,46 @@ async function readChapterContentCache(
 }
 
 async function writeChapterContentCache(
-  comicId: string,
-  chapterId: string,
+  key: string | null,
   chapter: CachedChapterContent,
+  generation?: number,
 ) {
+  if (key == null) return;
   try {
-    await cache.set(buildChapterContentCacheKey(comicId, chapterId), {
+    await writeResponseCache(key, {
       ts: Date.now(),
       chapter,
-    });
+    }, generation);
   } catch {
     // ignore cache write errors
   }
 }
 
-function buildGetChapterCacheKey(comicId: string, chapterId: string) {
-  return `copyComic:getChapter:v1:${comicId}:${chapterId}`;
+type PublicComicRoute = {
+  apiBase: string;
+  platform: string;
+  fallback: boolean;
+  preferApp?: boolean;
+  cacheGeneration?: number;
+  recovery?: {
+    deadline: number;
+    anonymousMirror: boolean;
+    assertCurrent: () => Promise<void>;
+  };
+};
+
+const publicMirrorWindowMs = 4500;
+
+function copyChapterRouteKey(route: PublicComicRoute) {
+  return JSON.stringify([route.apiBase, route.platform, route.fallback, route.preferApp === true]);
 }
 
-async function readGetChapterCache(
-  comicId: string,
-  chapterId: string,
-): Promise<CachedGetChapterResult | null> {
-  try {
-    const raw = await cache.get(buildGetChapterCacheKey(comicId, chapterId), null);
-    const data = toStringMap(raw);
-    const ts = Number(data.ts ?? 0);
-    if (!Number.isFinite(ts) || ts <= 0) return null;
-    if (Date.now() - ts > CHAPTER_CACHE_TTL_MS) return null;
-    const chapter = toStringMap(data.chapter);
-    if (!chapter || !Array.isArray(chapter.docs) || chapter.docs.length === 0) {
-      return null;
-    }
-    return { chapter };
-  } catch {
-    return null;
-  }
+function copyRouteReadTimeout(route: PublicComicRoute, defaultMs: number) {
+  if (!route.recovery) return defaultMs;
+  const remaining = route.recovery.deadline - Date.now() - (route.recovery.anonymousMirror ? 0 : publicMirrorWindowMs);
+  if (remaining <= 0) throw new CopyFollowError("network");
+  return Math.min(remaining, defaultMs);
 }
-
-async function writeGetChapterCache(
-  comicId: string,
-  chapterId: string,
-  chapter: Record<string, unknown>,
-) {
-  try {
-    await cache.set(buildGetChapterCacheKey(comicId, chapterId), {
-      ts: Date.now(),
-      chapter,
-    });
-  } catch {
-    // ignore cache write errors
-  }
-}
-
-type PublicComicRoute = { apiBase: string; platform: string; fallback: boolean; preferApp?: boolean };
 
 async function loadTrustedCopyChapterToken(apiBase: string) {
   if (!isCopyAccountBase(apiBase)) return "";
@@ -1090,14 +1129,25 @@ async function loadTrustedCopyChapterToken(apiBase: string) {
   return !stored || accountBaseForOrigin(stored.origin) ? token : "";
 }
 
-async function readChapterContent(comicId: string, chapterId: string, route: PublicComicRoute) {
+async function prepareCopyChapterRead(route: PublicComicRoute) {
   const { apiBase, platform } = route;
   const headers = getPublicCopyRequest(apiBase, platform, route.preferApp).headers;
   if (!route.fallback) {
     const token = await loadTrustedCopyChapterToken(apiBase);
     if (token) headers.authorization = `Token ${token}`;
   }
-  return getChapterContentWithCache(comicId, chapterId, apiBase, headers, platform, route.fallback);
+  // A token-authorized reply may contain private media URLs. Only anonymous
+  // responses are reusable after a route or account transition.
+  return { headers, cacheScope: headers.authorization ? null : copyChapterRouteKey(route) };
+}
+
+async function readChapterContent(
+  comicId: string, chapterId: string, route: PublicComicRoute,
+) {
+  const { headers, cacheScope } = await prepareCopyChapterRead(route);
+  const key = chapterPageCacheKey(cacheScope, comicId, chapterId);
+  return getChapterContentWithCache(comicId, chapterId, route.apiBase, headers, route.platform, route.fallback, key, route.cacheGeneration,
+    route.recovery ? () => copyRouteReadTimeout(route, 4500) : undefined);
 }
 
 async function getChapterContentWithCache(
@@ -1107,8 +1157,11 @@ async function getChapterContentWithCache(
   headers: Record<string, string>,
   platform: string,
   anonymousFallback: boolean,
+  cacheKey: string | null,
+  generation?: number,
+  timeout?: () => number,
 ) {
-  const cached = await readChapterContentCache(comicId, chapterId);
+  const cached = await readChapterContentCache(cacheKey);
   if (cached) return cached;
 
   const chapterParams = new URLSearchParams({
@@ -1127,6 +1180,8 @@ async function getChapterContentWithCache(
         buildChapterUrl(primaryChapterPath),
         chapterHeaders,
         anonymousFallback,
+        undefined,
+        timeout?.(),
       );
     } catch (error) {
       const status = Number((error as { response?: { status?: unknown } })?.response?.status ?? 0);
@@ -1137,6 +1192,8 @@ async function getChapterContentWithCache(
         buildChapterUrl(secondaryChapterPath),
         chapterHeaders,
         anonymousFallback,
+        undefined,
+        timeout?.(),
       );
     }
     return chapterResp;
@@ -1171,7 +1228,7 @@ async function getChapterContentWithCache(
     words,
   };
   if (result.contents.length > 0) {
-    await writeChapterContentCache(comicId, chapterId, result);
+    await writeChapterContentCache(cacheKey, result, generation);
   }
   return result;
 }
@@ -1182,7 +1239,7 @@ async function fetchAllGroupChapters(
 ) {
   const { apiBase, platform } = route;
   if (!groups.length) return [];
-  const cacheKey = buildChapterCacheKey(comicId, groups);
+  const cacheKey = buildChapterCacheKey(comicId, groups, route);
   const cached = await readChapterCache(cacheKey);
   if (cached && cached.length > 0 && (!summary ||
       (summary.chapterCount === cached.length && cached.some((ep) => ep.id === summary.latestChapterId)))) {
@@ -1199,9 +1256,10 @@ async function fetchAllGroupChapters(
     let chapterList;
     try {
       chapterList = await loadCopyChapterPages(async (offset, limit) => {
+        await route.recovery?.assertCurrent();
         const { data } = await readCopyPublicApi<ChapterApiData>(
           copyChapterGroupUrl(apiBase, comicId, groupPathWord, offset, limit),
-          { ...getPublicCopyRequest(apiBase, platform, route.preferApp), timeoutMs: 6500 },
+          { ...getPublicCopyRequest(apiBase, platform, route.preferApp), timeoutMs: copyRouteReadTimeout(route, 6500) },
         );
         if (Array.isArray(data.results?.list) && data.results.list.some((chapter) => {
           const reported = String(chapter?.comic_path_word ?? "").trim();
@@ -1240,7 +1298,7 @@ async function fetchAllGroupChapters(
     }
   }
 
-  await writeChapterCache(cacheKey, list);
+  await writeChapterCache(cacheKey, list, route.cacheGeneration);
   return list;
 }
 
@@ -1674,12 +1732,13 @@ async function getHomeDiscover(payload: RecommendPayload = {}): Promise<ComicPag
 const _themeRequests = new Map<string, Promise<Array<{ label: string; value: string }>>>();
 
 async function getDiscoverThemeOptions(apiBase: string) {
+  const generation = await responseCacheGeneration();
   const current = _themeRequests.get(apiBase);
   if (current) return current;
   const key = `copyComic:themes:v1:${new URL(apiBase).host}`;
   const request = loadCopyThemeOptions({
     read: async () => unwrapStoredValue(await cache.get(key, null)),
-    write: (value) => cache.set(key, value),
+    write: (value) => writeResponseCache(key, value, generation),
     fetch: async () => {
       const response = await ky
         .get(`${apiBase}/theme/comic/count`, {
@@ -1805,7 +1864,7 @@ async function getAdvancedSearchScheme(): Promise<AdvancedSearchContract> {
   };
 }
 
-async function searchComic(payload: SearchPayload = {}): Promise<SearchResultContract> {
+async function searchComic(payload: SearchPayload & { __breezeReadScope?: string } = {}): Promise<SearchResultContract> {
   const apiBase = await resolveApiBase();
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, Number(payload.page ?? 1) || 1);
@@ -1828,8 +1887,8 @@ async function searchComic(payload: SearchPayload = {}): Promise<SearchResultCon
       theme,
       platform: await resolvePlatformValue(),
     });
-    const json = await fetchCopyApi<SearchApiData>(`${apiBase}/comics?${params.toString()}`);
-    return copySearchResponse(page, payload.extern, toStringMap(json.results));
+    const json = await fetchCopyApi<SearchApiData>(`${apiBase}/comics?${params.toString()}`, copyReadScopeOptions(payload.__breezeReadScope));
+    return copySearchResponse(page, payload.extern, toStringMap(json.results), SEARCH_PAGE_SIZE);
   }
   const externSearchType = String(extern.searchType ?? "").trim();
   const externPathWord = String(extern.pathWord ?? "").trim();
@@ -1874,19 +1933,21 @@ async function searchComic(payload: SearchPayload = {}): Promise<SearchResultCon
         });
         return `${apiBase}/search/comic?${params.toString()}`;
       })();
-  const json = await fetchCopyApi<SearchApiData>(apiUrl);
+  const json = await fetchCopyApi<SearchApiData>(apiUrl, copyReadScopeOptions(payload.__breezeReadScope));
 
   if (Number(json.code ?? 0) !== 200) {
     throw new Error(json.message || "搜索失败");
   }
 
-  return copySearchResponse(page, payload.extern, toStringMap(json.results));
+  const requestedLimit = Number(new URL(apiUrl).searchParams.get("limit"));
+  return copySearchResponse(page, payload.extern, toStringMap(json.results), requestedLimit);
 }
 
 function copySearchResponse(
   page: number,
   extern: SearchPayload["extern"],
   data: Record<string, unknown>,
+  limit = SEARCH_PAGE_SIZE,
 ): SearchResultContract {
   if (!Array.isArray(data.list)) {
     throw new Error("搜索结果格式错误");
@@ -1899,12 +1960,19 @@ function copySearchResponse(
     return item;
   });
 
-  const totalValue = Number(data.total ?? items.length);
-  const total = Number.isFinite(totalValue) ? totalValue : items.length;
-  const limitValue = Number(data.limit ?? SEARCH_PAGE_SIZE);
-  const limit = Number.isFinite(limitValue) && limitValue > 0 ? limitValue : SEARCH_PAGE_SIZE;
-  const pageCount = Math.max(1, Math.ceil(total / limit));
-  const paging = createPagingInfo(page, pageCount, total);
+  const offset = (page - 1) * limit;
+  if ((data.offset != null && nonnegativeInteger(data.offset) !== offset) ||
+      (data.limit != null && nonnegativeInteger(data.limit) !== limit) || items.length > limit) {
+    throw new Error("搜索分页返回不一致，请重试");
+  }
+  const total = nonnegativeInteger(data.total);
+  const observedEnd = offset + items.length;
+  if (total !== null && (items.length === 0 ? offset < total : observedEnd !== Math.min(offset + limit, total))) {
+    throw new Error("搜索分页返回不完整，请重试");
+  }
+  const paging = total === null
+    ? { page, pages: page, total: 0, hasReachedMax: items.length < limit }
+    : createPagingInfo(page, Math.ceil(total / limit), total);
 
   return {
     source: PLUGIN_ID,
@@ -1926,45 +1994,115 @@ function copySearchResponse(
 
 async function readOnPublicComicRoute<T>(
   read: (route: PublicComicRoute) => Promise<T>,
-  download = false,
+  { download, follow, allowMirrorRecovery }: { download: boolean; follow: boolean; allowMirrorRecovery: boolean },
 ) {
   const selected = await readRouteSelection();
+  const hasPublicWinner = isCopyAutoChoice(selected.choice) && !isCopyAccountChoice(selected.effective);
+  const readerToken = hasPublicWinner && !download && !follow ? await loadAuthToken() : "";
+  const useAccountRoute = hasPublicWinner && (download || Boolean(readerToken));
+  const measured = useAccountRoute ? await measuredCopyAccountReadingChoices() : undefined;
+  const preferred = useAccountRoute ? measured?.[0] ?? COPY_DEFAULT_CHOICE : selected.effective;
   const deadline = Date.now() + 12_000;
-  const context = (choice: string): PublicComicRoute => ({
+  const speed = readerToken && allowMirrorRecovery ? await readLineSpeeds() : null;
+  const verifiedMirror = Boolean(speed && !speed.stale && speed.results.some((row) =>
+    row.choice === selected.effective && row.ok && row.ms !== null));
+  const assertCurrent = async () => {
+    const current = await readRouteSelection();
+    if (current.revision !== selected.revision || current.choice !== selected.choice ||
+        current.platform !== selected.platform || current.effective !== selected.effective ||
+        await loadAuthToken() !== readerToken || routeRevision !== selected.revision) {
+      throw new CopyFollowError("sourceUnavailable", false);
+    }
+  };
+  const assertMirrorCurrent = async () => {
+    const current = await readLineSpeeds();
+    if (!current || current.stale || current.revision !== speed?.revision) {
+      throw new CopyFollowError("sourceUnavailable", false);
+    }
+    await assertCurrent();
+  };
+  const context = (choice: string, recover: boolean): PublicComicRoute => ({
     apiBase: apiBaseFromChoice(choice), platform: selected.platform,
-    fallback: choice !== selected.effective,
+    fallback: choice !== preferred,
+    ...(recover ? { recovery: {
+      deadline, anonymousMirror: choice === selected.effective,
+      assertCurrent: choice === selected.effective ? assertMirrorCurrent : assertCurrent,
+    } } : {}),
   });
+  const attempt = async (choice: string, recover: boolean) => {
+    const route = context(choice, recover);
+    const assertFresh = route.recovery?.assertCurrent ?? (verifiedMirror ? assertCurrent : undefined);
+    await assertFresh?.();
+    const result = await read(route);
+    await assertFresh?.();
+    return result;
+  };
   const accessDenied = (error: CopyFollowError) =>
     download && [401, 403, 451].includes(error.status ?? 0);
   try {
-    return await read(context(selected.effective));
+    return await attempt(preferred, verifiedMirror);
   } catch (error) {
-    if (selected.choice !== COPY_AUTO_CHOICE || !(error instanceof CopyFollowError) ||
+    if (!isCopyAutoChoice(selected.choice) || !(error instanceof CopyFollowError) ||
         !error.retryable || accessDenied(error) || routeRevision !== selected.revision || Date.now() >= deadline) {
       throw error;
     }
-    const speed = await readLineSpeeds();
-    const measured = speed && !speed.stale
-      ? speed.results
-          .filter((row) => isCopyAccountChoice(row.choice) && row.ok && row.ms !== null)
-          .sort((a, b) => a.ms! - b.ms!).map((row) => row.choice)
-      : [];
-    const candidates = [...new Set([
-      ...measured, COPY_DEFAULT_CHOICE, "官方App线路", "大陆专线1",
-    ])].filter((choice) => choice !== selected.effective).slice(0, 2);
+    let recover = verifiedMirror && temporaryCopyReadFailure(error);
+    const passing = measured ?? await measuredCopyAccountReadingChoices();
+    const candidates = [...new Set(recover ? passing : [
+      ...passing, COPY_DEFAULT_CHOICE, "官方App线路", "大陆专线1",
+    ])].filter((choice) => choice !== preferred).slice(0, 2);
     for (const candidate of candidates) {
       if (routeRevision !== selected.revision || Date.now() >= deadline) break;
+      // Leave one normal public request window for the verified mirror.
+      if (recover && deadline - Date.now() <= publicMirrorWindowMs) break;
       try {
-        const result = await read(context(candidate));
+        const result = await attempt(candidate, recover);
         if (routeRevision === selected.revision) return result;
         break;
       } catch (alternateError) {
         // An alternate cannot impose a different access policy or turn a
         // temporary failure into a work removal on the selected route.
+        recover &&= temporaryCopyReadFailure(alternateError);
         if (!(alternateError instanceof CopyFollowError)) break;
         if (download && (!alternateError.retryable || accessDenied(alternateError))) throw alternateError;
         if (!alternateError.retryable) break;
       }
+    }
+    if (recover && Date.now() < deadline) return attempt(selected.effective, true);
+    throw error;
+  }
+}
+
+function isTemporaryCopyStatus(status: number | null) {
+  return status === 408 || status === 425 || (status != null && status >= 500 && status <= 599);
+}
+
+function temporaryCopyReadFailure(error: unknown) {
+  return error instanceof CopyFollowError && error.retryable && !error.restricted &&
+    (error.reason === "network" ||
+      (error.reason === "sourceUnavailable" && isTemporaryCopyStatus(error.status)));
+}
+
+async function readCopyReaderChapter(comicId: string, chapterId: string, route: PublicComicRoute) {
+  const recovery = route.recovery!;
+  if (recovery.anonymousMirror) {
+    const chapter = await readCopyDownloadChapter(
+      route.apiBase, comicId, chapterId, getPublicCopyRequest(route.apiBase, route.platform, route.preferApp),
+      recovery.deadline, undefined, isHotMangaApiBase(route.apiBase) ? "chapter" : "chapter2",
+    );
+    return { name: chapter.chapterName, contents: chapter.imageUrls.map((url) => ({ url })), words: [] };
+  }
+  try {
+    return await readChapterContent(comicId, chapterId, route);
+  } catch (error) {
+    if (isTimeoutError(error) ||
+        (isNetworkError(error) && !/redirect|abort|cancel/i.test(String((error as Error & { cause?: unknown }).cause)))) {
+      throw new CopyFollowError("network");
+    }
+    if (isHTTPError(error) && isTemporaryCopyStatus(error.response.status) &&
+        !error.response.headers.has("retry-after") &&
+        ![210, 401, 403, 404, 410, 429, 451].includes(Number(toStringMap(error.data).code))) {
+      throw new CopyFollowError("sourceUnavailable", true, error.response.status);
     }
     throw error;
   }
@@ -2006,22 +2144,34 @@ function copyDownloadRouteUnavailable(error?: CopyFollowError) {
   }));
 }
 
-async function getComicDetailResult(payload: ComicDetailPayload): Promise<{
+async function getComicDetailResult(payload: ComicDetailPayload, options: {
+  reader?: { chapterId: string; extern: Record<string, unknown> };
+  allowMirrorRecovery?: boolean;
+} = {}): Promise<{
   detail: ComicDetailContract;
   route: PublicComicRoute;
+  preparedChapter?: { target: MappedEpItem; content: CachedChapterContent };
 }> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
   }
   const follow = toStringMap(payload.extern).comicFollow === true;
-  const { detail: detailResp, summary: detailSummary, eps, route } = await readOnPublicComicRoute(async (candidate) => {
+  const download = payload.extern?.comicDownload === true;
+  const reader = options.reader;
+  let resolvedChapterId = "";
+  const cacheGeneration = follow ? undefined : await responseCacheGeneration();
+  const { detail: detailResp, summary: detailSummary, eps, route, preparedChapter } = await readOnPublicComicRoute(async (candidate) => {
     const { apiBase, platform, fallback } = candidate;
-    const publicDetail = await readCopyPublicDetail(apiBase, comicId, getPublicCopyRequest(apiBase, platform), {
+    const publicDetail = await readCopyPublicDetail(apiBase, comicId, {
+      ...getPublicCopyRequest(apiBase, platform),
+      timeoutMs: copyRouteReadTimeout(candidate, 4500),
+    }, {
       requireSummary: follow, strictIdentity: follow || fallback,
     });
-    const route = { ...candidate, preferApp: publicDetail.usedApp };
-    if (follow) return { ...publicDetail, route, eps: [] };
+    await candidate.recovery?.assertCurrent();
+    const route = { ...candidate, preferApp: publicDetail.usedApp, cacheGeneration };
+    if (follow) return { ...publicDetail, route, eps: [], preparedChapter: undefined };
     const result = toStringMap(publicDetail.detail.results);
     const comic = toStringMap(result.comic);
     const raw = result.groups ?? comic.groups;
@@ -2034,11 +2184,21 @@ async function getComicDetailResult(payload: ComicDetailPayload): Promise<{
     }
     const workSlug = String(comic.path_word ?? comicId).trim();
     const eps = await fetchAllGroupChapters(comicId, groups, route, publicDetail.summary, workSlug);
-    return { ...publicDetail, route, eps };
-  }, payload.extern?.comicDownload === true).catch((error: unknown) => {
+    if (!reader || !route.recovery || !eps.length) return { ...publicDetail, route, eps, preparedChapter: undefined };
+    const target = pickTargetChapter(eps, resolvedChapterId || reader.chapterId, reader.extern)!;
+    const matchesRequest = !reader.chapterId || target.id === reader.chapterId ||
+      (/^\d+$/.test(reader.chapterId) && target.order === Number(reader.chapterId));
+    if (route.recovery.anonymousMirror &&
+        (!matchesRequest || (resolvedChapterId && target.id !== resolvedChapterId))) {
+      throw new CopyFollowError("invalidResponse", false);
+    }
+    resolvedChapterId = target.id;
+    await route.recovery.assertCurrent();
+    const content = await readCopyReaderChapter(comicId, target.id, route);
+    return { ...publicDetail, route, eps, preparedChapter: { target, content } };
+  }, { follow, download, allowMirrorRecovery: options.allowMirrorRecovery !== false }).catch((error: unknown) => {
     if (!follow && error instanceof CopyFollowError) {
-      throw payload.extern?.comicDownload === true
-        ? copyDownloadReadError(error) : detailReadError(error);
+      throw download ? copyDownloadReadError(error) : detailReadError(error);
     }
     throw error;
   });
@@ -2140,6 +2300,14 @@ async function getComicDetailResult(payload: ComicDetailPayload): Promise<{
   const [isFavourite, totalComments] = follow
     ? [false, null] as const
     : await Promise.all([resolveIsFavourite(), fetchCommentTotal()]);
+  if (route.recovery) {
+    try {
+      await route.recovery.assertCurrent();
+    } catch (error) {
+      if (error instanceof CopyFollowError) throw detailReadError(error);
+      throw error;
+    }
+  }
 
   const normal = {
     comicInfo: {
@@ -2234,6 +2402,7 @@ async function getComicDetailResult(payload: ComicDetailPayload): Promise<{
 
   return {
     route,
+    preparedChapter,
     detail: { source: PLUGIN_ID, comicId, extern: payload.extern ?? null, scheme, data },
   };
 }
@@ -2250,10 +2419,10 @@ async function getReadSnapshot(payload: ReadSnapshotPayload = {}): Promise<ReadS
   const extern = toStringMap(payload.extern);
   const inputChapterId = String(payload.chapterId ?? extern.chapterId ?? "").trim();
 
-  const { detail, route } = await getComicDetailResult({
+  const { detail, route, preparedChapter } = await getComicDetailResult({
     comicId,
     extern: payload.extern,
-  });
+  }, { reader: { chapterId: inputChapterId, extern } });
   const normal = toStringMap(toStringMap(detail.data).normal);
   const comicInfo = toStringMap(normal.comicInfo);
   const eps = (Array.isArray(normal.eps) ? normal.eps : [])
@@ -2272,10 +2441,10 @@ async function getReadSnapshot(payload: ReadSnapshotPayload = {}): Promise<ReadS
   if (eps.length === 0) {
     throw new Error("未找到可阅读章节");
   }
-  const targetChapter = pickTargetChapter(eps, inputChapterId, extern);
+  const targetChapter = preparedChapter?.target ?? pickTargetChapter(eps, inputChapterId, extern);
   const chapterId = targetChapter.id;
 
-  const chapterContent = await readChapterContent(comicId, chapterId, route);
+  const chapterContent = preparedChapter?.content ?? await readChapterContent(comicId, chapterId, route);
   const imageUrls = sortChapterImageUrls(chapterContent.contents, chapterContent.words);
   const pages = imageUrls.map((imageUrl, index) => {
     const name = extractImageName(imageUrl, index);
@@ -2348,16 +2517,13 @@ async function getDownloadChapter(
     throw error;
   }
   const deadline = Date.now() + copyDownloadRouteBudgetMs;
-  const automatic = selected.choice === COPY_AUTO_CHOICE;
-  const speed = automatic ? await readLineSpeeds() : null;
-  const measured = speed && !speed.stale
-    ? speed.results.filter((row) => isCopyAccountChoice(row.choice) && row.ok && row.ms !== null)
-      .sort((left, right) => left.ms! - right.ms!).map((row) => row.choice)
-    : [];
+  const automatic = isCopyAutoChoice(selected.choice);
+  const measured = automatic ? await measuredCopyAccountReadingChoices() : [];
   const choices = automatic ? [
     selected.effective, ...measured, COPY_DEFAULT_CHOICE, "官方App线路", "大陆专线1", "官方国际线路",
   ] : [selected.choice];
-  const candidates = [...new Set(choices.filter(isCopyAccountChoice).map(apiBaseFromChoice))]
+  const compatibleBases = choices.filter(isCopyAccountChoice).map(apiBaseFromChoice);
+  const candidates = [...new Set(compatibleBases)]
     .filter((base) => !excluded.has(copyDownloadRouteKey(base)))
     .slice(0, copyDownloadRouteCandidateLimit);
 
@@ -2369,7 +2535,7 @@ async function getDownloadChapter(
     if (current.choice !== selected.choice || current.platform !== selected.platform ||
         current.revision !== selected.revision || routeRevision !== selected.revision) throw changed();
   };
-  const selectedBase = apiBaseFromChoice(selected.effective);
+  const selectedBase = compatibleBases[0];
   let lastFailure: CopyFollowError | undefined;
   for (const base of candidates) {
     if (routeRevision !== selected.revision) throw changed();
@@ -2455,7 +2621,7 @@ async function getChapter(payload: ChapterPayload = {}): Promise<ChapterContentC
     // ID. Keep catalog resolution for those tasks until an exact ID is known.
     const fixedWithExactId = isCopyAccountChoice(selected.choice) &&
       inputChapterId !== "" && !/^\d+$/.test(inputChapterId);
-    if (selected.choice === COPY_AUTO_CHOICE || fixedWithExactId) {
+    if (isCopyAutoChoice(selected.choice) || fixedWithExactId) {
       return getDownloadChapter(payload, selected, comicId, inputChapterId);
     }
   }
@@ -2463,7 +2629,7 @@ async function getChapter(payload: ChapterPayload = {}): Promise<ChapterContentC
   const { detail, route } = await getComicDetailResult({
     comicId,
     extern: payload.extern,
-  });
+  }, { allowMirrorRecovery: false });
   const normal = toStringMap(toStringMap(detail.data).normal);
   const eps = (Array.isArray(normal.eps) ? normal.eps : [])
     .map((item) => toStringMap(item))
@@ -2483,96 +2649,6 @@ async function getChapter(payload: ChapterPayload = {}): Promise<ChapterContentC
   }
   const targetChapter = pickTargetChapter(eps, inputChapterId, extern);
   const chapterId = targetChapter.id;
-
-  const cached = await readGetChapterCache(comicId, chapterId);
-  if (cached) {
-    const cc = cached.chapter as Record<string, unknown>;
-    const cachedChapter: ChapterWithPages = {
-      id: (cc["id"] ?? cc["epId"] ?? "").toString(),
-      requestId: (cc["requestId"] ?? cc["id"] ?? "").toString(),
-      logicalKey: (cc["logicalKey"] ?? cc["id"] ?? "").toString(),
-      storageChapterId: (cc["storageChapterId"] ?? cc["id"] ?? "").toString(),
-      name: (cc["name"] ?? cc["epName"] ?? "").toString(),
-      order: Number(cc["order"] ?? 0),
-      groupTitle:
-        cc["groupTitle"] == null || String(cc["groupTitle"]).trim() === ""
-          ? null
-          : String(cc["groupTitle"]),
-      pages: (Array.isArray(cc["pages"])
-        ? cc["pages"]
-        : Array.isArray(cc["docs"])
-          ? cc["docs"]
-          : []) as ChapterPage[],
-      extern: (cc["extern"] ?? {}) as StringMap,
-    };
-
-    return {
-      source: PLUGIN_ID,
-      comicId,
-      chapterId,
-      extern: payload.extern ?? null,
-      scheme: {
-        version: "1.0.0" as const,
-        type: "chapterContent" as const,
-        source: PLUGIN_ID,
-      },
-      data: {
-        comic: {
-          id: comicId,
-          source: PLUGIN_ID,
-          title: (cc["name"] ?? cc["epName"] ?? "").toString(),
-          extern: {},
-        },
-        chapter: cachedChapter,
-        chapters: [],
-      },
-    };
-  }
-
-  const recheckCached = await readGetChapterCache(comicId, chapterId);
-  if (recheckCached) {
-    const rcc = recheckCached.chapter as Record<string, unknown>;
-    const recheckChapter: ChapterWithPages = {
-      id: (rcc["id"] ?? rcc["epId"] ?? "").toString(),
-      requestId: (rcc["requestId"] ?? rcc["id"] ?? "").toString(),
-      logicalKey: (rcc["logicalKey"] ?? rcc["id"] ?? "").toString(),
-      storageChapterId: (rcc["storageChapterId"] ?? rcc["id"] ?? "").toString(),
-      name: (rcc["name"] ?? rcc["epName"] ?? "").toString(),
-      order: Number(rcc["order"] ?? 0),
-      groupTitle:
-        rcc["groupTitle"] == null || String(rcc["groupTitle"]).trim() === ""
-          ? null
-          : String(rcc["groupTitle"]),
-      pages: (Array.isArray(rcc["pages"])
-        ? rcc["pages"]
-        : Array.isArray(rcc["docs"])
-          ? rcc["docs"]
-          : []) as ChapterPage[],
-      extern: (rcc["extern"] ?? {}) as StringMap,
-    };
-
-    return {
-      source: PLUGIN_ID,
-      comicId,
-      chapterId,
-      extern: payload.extern ?? null,
-      scheme: {
-        version: "1.0.0" as const,
-        type: "chapterContent" as const,
-        source: PLUGIN_ID,
-      },
-      data: {
-        comic: {
-          id: comicId,
-          source: PLUGIN_ID,
-          title: (rcc["name"] ?? rcc["epName"] ?? "").toString(),
-          extern: {},
-        },
-        chapter: recheckChapter,
-        chapters: [],
-      },
-    };
-  }
 
   const chapterContent = await readChapterContent(comicId, chapterId, route);
   const imageUrls = sortChapterImageUrls(chapterContent.contents, chapterContent.words);
@@ -2607,8 +2683,6 @@ async function getChapter(payload: ChapterPayload = {}): Promise<ChapterContentC
     pages: docs,
     extern: targetChapter.extern,
   };
-
-  await writeGetChapterCache(comicId, chapterId, chapter);
 
   return {
     source: PLUGIN_ID,
@@ -3033,7 +3107,7 @@ async function continueFavoriteAction(
 }
 
 async function getCloudFavoriteData(
-  payload: CloudFavoritePayload = {},
+  payload: CloudFavoritePayload & { __breezeReadScope?: string } = {},
 ): Promise<ComicPagedListContract> {
   const { apiBase, headers } = await loadAccountRequest();
   const extern = toStringMap(payload.extern);
@@ -3055,6 +3129,8 @@ async function getCloudFavoriteData(
     json = await fetchCopyApiWithHeaders<CollectApiData>(
       `${apiBase}/member/collect/comics?${params.toString()}`,
       headers,
+      false,
+      payload.__breezeReadScope,
     );
   } catch (error) {
     const message = String((error as Error).message ?? "");
@@ -3180,28 +3256,22 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
   const date = speed ? new Date(speed.measuredAt) : null;
   const time = date ? `${date.getMonth() + 1}-${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}` : "";
   const speedOptions = Object.entries(COPY_API_ROUTES).map(([value, base]) => {
-    const result = speed?.results.find((row) => row.choice === value);
+    const result = speed?.stale ? undefined : speed?.results.find((row) => row.choice === value);
     const name = copyRouteName(value);
     const onlyReading = !isCopyAccountChoice(value);
-    let status = "未测";
-    if (result) {
-      if (result.ok) status = `${result.ms} ms`;
-      else if (result.failedAt === "detail") status = "详情未通过";
-      else if (result.failedAt === "chapters") status = "章节未通过";
-      else if (result.status === null) status = "本次未响应";
-      else if (result.status >= 200 && result.status < 300) status = "目录未通过";
-      else status = `HTTP ${result.status}`;
-    }
-    if (onlyReading) status = result ? `${status} / 仅阅读` : "仅阅读";
-    const title = `${name} · ${status}${result && speed?.stale ? "（旧）" : ""}`;
+    const status = result ? (result.ok ? `${result.ms} ms` : "暂不可用") : "未测速";
+    const title = `${name} · ${status}${onlyReading ? " · 仅阅读" : ""}`;
     const domain = new URL(base).hostname;
     return {
       value,
       label: `${title} · ${domain}`,
       routeOption: {
-        title,
+        title: `${name} · ${status}${onlyReading ? " / 仅阅读" : ""}`,
         domain,
-        inUse: selectedApiDomainChoice === COPY_AUTO_CHOICE && value === route.effective,
+        status: result == null ? "unknown" : result.ok ? "available" : "unavailable",
+        latencyMs: result?.ms ?? null,
+        readOnly: onlyReading,
+        inUse: isCopyAutoChoice(selectedApiDomainChoice) && value === route.effective && result?.ok !== false,
       },
     };
   });
@@ -3210,31 +3280,29 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
       key: API_DOMAIN_CONFIG_KEY,
       kind: "select" as const,
       label: "访问线路",
-      description: "验证目录、公开详情和章节列表。测速通过后，再选耗时最短的线路。耗时以详情和首批章节为准。封面和账号各自连接。「仅阅读」可手动选择。",
+      description: "可用优先在账号线路不可用时，会为公开阅读使用已测通的线路。",
       fnPath: "saveSettings",
       persist: false,
-      options: [{ value: COPY_AUTO_CHOICE, label: "自动（可用优先）" }, ...speedOptions],
+      options: [
+        { value: COPY_AUTO_CHOICE, label: "自动（可用优先）" },
+        { value: COPY_AUTO_SPEED_CHOICE, label: "自动（速度优先）" },
+        ...speedOptions,
+      ],
     },
     {
       key: PLATFORM_CONFIG_KEY,
       kind: "select" as const,
       label: "请求标识",
-      description: "默认用 1 标识阅读客户端，可能影响站点返回。测速沿用当前值，账号请求固定用 1。",
       fnPath: "saveSettings",
       persist: false,
       options: PLATFORM_OPTIONS,
     },
   ];
 
-  const networkStatus = [
-    ...(selectedApiDomainChoice === COPY_AUTO_CHOICE
-      ? [`当前首选线路：${copyRouteName(route.effective)}`] : []),
-    ...(time ? [`上次测速 ${time}${speed?.stale ? " · 旧结果" : ""}`] : []),
-  ];
   const networkSection = {
     id: "network", title: "网络", fields: networkFields,
     headerAction: { key: "line-speed", title: "测速", fnPath: "testLineSpeeds" },
-    ...(networkStatus.length ? { footer: networkStatus.join("\n") } : {}),
+    ...(time && !speed?.stale ? { footer: `上次测速 ${time}` } : {}),
   };
 
   return {
@@ -3273,10 +3341,10 @@ async function saveSettings(payload: {
   const { before, owner, enabledAuto } = await writeRoute(async () => {
     const before = await readRouteSelection();
     const changeChoice = choice !== before.choice &&
-      (choice === COPY_AUTO_CHOICE || isCopyRouteChoice(choice));
+      (isCopyAutoChoice(choice) || isCopyRouteChoice(choice));
     const changePlatform = typeof platform === "string" && platform !== before.platform &&
       PLATFORM_OPTIONS.some((item) => item.value === platform);
-    const enabledAuto = changeChoice && choice === COPY_AUTO_CHOICE;
+    const enabledAuto = changeChoice && isCopyAutoChoice(choice);
     if (changeChoice || changePlatform) {
       routeRevision++;
       lineSpeedTest.invalidate();

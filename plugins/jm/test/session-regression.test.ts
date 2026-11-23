@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { beforeEach, test } from "node:test";
 import { setImmediate } from "node:timers/promises";
 import axios, { type InternalAxiosRequestConfig } from "axios";
@@ -11,7 +12,11 @@ let requests: InternalAxiosRequestConfig[] = [];
 let checkinNotices: unknown[] = [];
 let storageGate: ((name: string, key: string, value: unknown) => Promise<void>) | null = null;
 let malformedSetting: string | null = null;
-let respond: (config: InternalAxiosRequestConfig) => Promise<{ status: number; data: unknown }>;
+let respond: (config: InternalAxiosRequestConfig) => Promise<{
+  status: number; data: unknown; headers?: Record<string, string>;
+}>;
+
+(globalThis as any).uuidv4 = randomUUID;
 
 (globalThis as any).bridge = {
   call: async (name: string, key: string, value: unknown) => {
@@ -35,16 +40,22 @@ let respond: (config: InternalAxiosRequestConfig) => Promise<{ status: number; d
 axios.defaults.adapter = async (config) => {
   requests.push(config);
   const result = await respond(config);
-  return { ...result, statusText: "fixture", headers: {}, config };
+  return { ...result, statusText: "fixture", headers: result.headers ?? {}, config };
 };
 
 const { default: plugin, runJmAuthAndCheckInLoop } = await import("../src/index");
 const state = await import("../src/state");
+const { Config } = await import("../src/constants");
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
+}
+
+function favoriteFolderForm(request: InternalAxiosRequestConfig): FormData {
+  assert.ok(request.data instanceof FormData, "folder writes match the official multipart form");
+  return request.data;
 }
 
 const loginPayload = { account: "fixture-account", password: "fixture-password" };
@@ -301,6 +312,743 @@ test("an unreadable or refused folder move never reports success or repeats its 
   assert.deepEqual(requests.map((request) => request.method), ["post"]);
 });
 
+test("account collections start with a persisted session, keep the token scoped, and never refresh it", async () => {
+  settings.set("auth.userInfo", { uid: "fixture-user" });
+  settings.set("auth.jwt", "fixture-token");
+  respond = async (config) => {
+    assert.equal(config.headers.get("Authorization"), "Bearer fixture-token");
+    assert.equal(config.withCredentials, false);
+    assert.equal(config.maxRedirects, 0);
+    assert.equal(new URL(config.url!).pathname, "/tags_favorite");
+    return { status: 200, data: { list: [{ tag: "指定标签" }], jwttoken: "unexpected-token" } };
+  };
+
+  const result = await plugin.getJmAccountCollection({ collection: "tags", accountId: "fixture-user" });
+  assert.deepEqual(result.data, { tags: ["指定标签"], accountId: "fixture-user" });
+  assert.equal(settings.get("auth.jwt"), "fixture-token");
+  assert.equal(await state.getJwtToken(), "");
+  await assert.rejects(plugin.getJmAccountCollection({ collection: "tags", accountId: "other-user" }), /unauthorized/);
+  assert.equal(requests.length, 1);
+});
+
+test("account collections stop before readback when the account is replaced during a write", async () => {
+  settings.set("auth.userInfo", { uid: "fixture-user" });
+  settings.set("auth.jwt", "fixture-token");
+  respond = async (config) => {
+    if (config.method === "post") {
+      settings.set("auth.userInfo", { uid: "other-user" });
+      settings.set("auth.jwt", "other-token");
+    }
+    return { status: 200, data: { code: 200, data: false } };
+  };
+
+  await assert.rejects(plugin.setJmAccountCollection({
+    collection: "follows", accountId: "fixture-user", comicId: "123", enabled: true,
+  }), state.SessionChangedError);
+  assert.deepEqual(requests.map(({ method }) => method), ["get", "post"]);
+  assert.ok(requests.every(({ headers }) => headers.get("Authorization") === "Bearer fixture-token"));
+});
+
+test("site watch history only reads authenticated pages and returns account-scoped comic rows", async () => {
+  settings.set("auth.userInfo", { ...loginData, s: "fixture-cookie" });
+  settings.set("auth.jwt", "fixture-token");
+  assert.equal(Reflect.get(await plugin.getInfo(), "breezeExperience").jmSiteWatchHistory, true);
+  respond = async (config) => {
+    assert.equal(config.method, "get");
+    assert.equal(config.maxRedirects, 0);
+    assert.equal(config.headers.get("Authorization"), "Bearer fixture-token");
+    assert.equal(config.headers.get("Cookie"), "AVS=fixture-cookie");
+    assert.equal(new URL(config.url!).origin, new URL(Config.baseUrl).origin);
+    assert.equal(new URL(config.url!).pathname, "/watch_list");
+    assert.deepEqual(config.params, { page: 2 });
+    return { status: 200, data: { code: 200, data: {
+      list: [{ id: "123", name: "站点记录", author: "作者" }], total: "21",
+      jwttoken: "unexpected-token",
+    } } };
+  };
+
+  const { data } = await plugin.getSiteWatchHistory({ page: 2, accountId: loginData.uid });
+  assert.equal(data.accountId, loginData.uid);
+  assert.equal(data.page, 2);
+  assert.equal(data.total, 21);
+  assert.equal(data.hasReachedMax, true);
+  assert.equal(data.items[0]?.title, "站点记录");
+  assert.deepEqual(data.items[0]?.metadata[0]?.value, ["作者"]);
+  assert.equal(settings.get("auth.jwt"), "fixture-token");
+  assert.equal(await state.getJwtToken(), "");
+
+  await assert.rejects(plugin.getSiteWatchHistory({ accountId: "other-account" }), /unauthorized/);
+  assert.equal(requests.length, 1);
+});
+
+test("site watch history distinguishes empty from malformed and discards a replaced account response", async () => {
+  settings.set("auth.userInfo", loginData);
+  settings.set("auth.jwt", "fixture-token");
+  const payload = { accountId: loginData.uid };
+  respond = async () => ({ status: 200, data: { list: [], total: 0 } });
+  assert.deepEqual((await plugin.getSiteWatchHistory(payload)).data.items, []);
+  respond = async () => ({ status: 200, data: { list: [], total: 4 } });
+  await assert.rejects(plugin.getSiteWatchHistory(payload), /记录读取不完整/);
+  respond = async () => {
+    settings.set("auth.userInfo", { ...loginData, uid: "other-account" });
+    return { status: 200, data: { list: [{ id: "5", name: "旧记录" }], total: 1 } };
+  };
+  await assert.rejects(plugin.getSiteWatchHistory(payload), state.SessionChangedError);
+});
+
+test("account collection reads retry transport once, preserving account and a short terminal history page", async () => {
+  settings.set("auth.userInfo", loginData);
+  settings.set("auth.jwt", "fixture-token");
+  let attempts = 0;
+  respond = async () => {
+    if (attempts++ === 0) throw new axios.AxiosError("connection reset", "ECONNRESET");
+    return { status: 200, data: { list: [{ id: "5", name: "短页记录" }], total: 41 } };
+  };
+  const { data } = await plugin.getSiteWatchHistory({ page: 3, accountId: loginData.uid });
+  assert.equal(data.hasReachedMax, true);
+  assert.equal(data.total, 41);
+  assert.equal(data.items[0]?.id, "5");
+  assert.deepEqual(requests.map(({ method }) => method), ["get", "get"]);
+  assert.ok(requests.every(({ headers }) => headers.get("Authorization") === "Bearer fixture-token"));
+
+  requests.length = 0;
+  respond = async () => ({ status: 429, data: {} });
+  await assert.rejects(plugin.getSiteWatchHistory({ page: 1, accountId: loginData.uid }), /429/);
+  assert.equal(requests.length, 1);
+
+  requests.length = 0;
+  respond = async () => { throw new axios.AxiosError("timeout of 10000ms exceeded", "ETIMEDOUT"); };
+  await assert.rejects(plugin.getSiteWatchHistory({ accountId: loginData.uid }), /timeout/);
+  assert.equal(requests.length, 1);
+});
+
+test("a switched account cannot continue waiting collection read retries", async () => {
+  settings.set("auth.userInfo", loginData);
+  settings.set("auth.jwt", "fixture-token");
+  const started = deferred<void>();
+  respond = async () => {
+    started.resolve();
+    throw new axios.AxiosError("connection reset", "ECONNRESET");
+  };
+  const pending = plugin.getJmAccountCollection({ accountId: loginData.uid, collection: "follows" });
+  const rejected = assert.rejects(pending, state.SessionChangedError);
+  await started.promise;
+  await plugin.clearPluginSession();
+  await rejected;
+  assert.equal(requests.length, 1);
+});
+
+test("cloud favorite advertises folder management and reads the authenticated folder list", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const bundle = await plugin.getCloudFavoriteSceneBundle();
+  assert.equal((bundle.data.scene as { cloudFavoriteFolderManagement?: boolean }).cloudFavoriteFolderManagement, true);
+  respond = async () => ({ status: 200, data: { code: 200, data: {
+    folder_list: [{ FID: 9, name: "收藏资料夹" }],
+  } } });
+  assert.deepEqual(await plugin.listFavoriteFolders(), { items: [{ id: "9", name: "收藏资料夹" }] });
+  const bundleFilter = await plugin.getCloudFavoriteFilterBundle();
+  const scheme = bundleFilter.scheme as { fields: Array<{ options: Array<{ value: string }> }> };
+  assert.deepEqual(scheme.fields[0]!.options.map((option) => option.value), ["", "9"]);
+  assert.ok(requests.every((request) => request.headers.Authorization === "Bearer fixture-token"));
+  respond = async () => ({ status: 200, data: {} });
+  await assert.rejects(plugin.listFavoriteFolders(), /收藏夹资料读取不完整/);
+});
+
+test("favorite feeds can omit custom folders or return a reserved default row", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const { data, omitted } of [
+    { data: { list: [{ id: "123" }], total: "267" }, omitted: true },
+    { data: { code: 200, data: { list: [{ id: "123" }], total: "267", folder_list: null } } },
+    { data: { code: 200, data: JSON.stringify({ list: [], total: 0, folder_list: null }) } },
+    { data: { list: [{ id: "123" }], folder_list: [{ FID: "0" }] } },
+  ]) {
+    respond = async () => ({ status: 200, data });
+    assert.deepEqual(await plugin.listFavoriteFolders(), {
+      items: [], ...(omitted ? { folderListVerified: false } : {}),
+    });
+    const filter = await plugin.getCloudFavoriteFilterBundle();
+    const scheme = filter.scheme as { fields: Array<{ options: Array<{ value: string }> }> };
+    assert.deepEqual(scheme.fields[0]!.options.map((option) => option.value), [""]);
+    assert.equal(filter.data.folderListVerified, omitted ? false : undefined);
+  }
+
+  const folder_list = [{ FID: 0 }, { FID: "9", name: "实际收藏夹" }];
+  for (const data of [
+    { list: [], total: 0, data: { folder_list } },
+    { folder_list, data: { list: [], total: 0 } },
+    { code: 200, data: { list: [], total: 0, folder_list } },
+  ]) {
+    respond = async () => ({ status: 200, data });
+    assert.deepEqual(await plugin.listFavoriteFolders(), { items: [{ id: "9", name: "实际收藏夹" }] });
+  }
+});
+
+test("an invalid folder snapshot never becomes the default-only filter", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const data of [
+    { folder_list: null }, { list: [{}], total: 1, folder_list: null },
+    { list: [], total: 267 }, { list: [], total: 0, folder_list: {} },
+    { folder_id: "9", folder_list: [] },
+    { folder_list: [{ FID: 9 }] },
+    { folder_list: [{ FID: 9, name: "甲" }, { FID: "9", name: "乙" }] },
+    { code: 403, data: JSON.stringify({ list: [], total: 0 }) },
+  ]) {
+    respond = async () => ({ status: 200, data });
+    await assert.rejects(plugin.getCloudFavoriteFilterBundle(), "code" in data ? /HTTP 403/ : /收藏/);
+  }
+});
+
+test("creating a folder sends selected IDs once and separately verifies the new folder and membership", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  settings.set("auth.userInfo", { ...loginData, s: "fixture-avs" });
+  for (const membership of [true, false]) {
+    let created = false;
+    requests.length = 0;
+    respond = async (request) => {
+      if (request.method === "post") {
+        created = true;
+        return { status: 200, data: { code: 200, data: { status: "ok" } } };
+      }
+      if (request.params.folder_id === "9") {
+        const list = membership ? [{ id: 123 }, { id: "456" }] : [{ id: 123 }];
+        return { status: 200, data: { total: list.length, list } };
+      }
+      return { status: 200, data: created
+        ? { folder_list: [{ FID: "9", name: "收藏夹甲" }] }
+        : { list: [{ id: "123" }], total: "267", folder_list: null } };
+    };
+    assert.deepEqual(await plugin.createFavoriteFolder({
+      folderName: " 收藏夹甲 ", comicIds: ["123", "456", "0123"],
+    }), {
+      ok: true, folder: { id: "9", name: "收藏夹甲" },
+      folders: [{ id: "9", name: "收藏夹甲" }], membershipVerified: membership,
+    });
+    assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get", "get"]);
+    const wire = new Request("https://fixture.invalid/favorite_folder", {
+      method: "POST", body: favoriteFolderForm(requests[1]!),
+    });
+    assert.match(wire.headers.get("content-type") ?? "", /^multipart\/form-data; boundary=/);
+    assert.deepEqual(Object.fromEntries(await wire.formData()), {
+      type: "add", folder_id: "", folder_name: "收藏夹甲", aid: "123,456",
+    });
+    assert.ok(requests.every((request) => request.headers.Authorization === "Bearer fixture-token"));
+    assert.ok(requests.every((request) => request.headers.Cookie === "AVS=fixture-avs"));
+  }
+});
+
+test("an equivalent existing or in-flight folder name never causes a duplicate creation", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const reading = deferred<void>();
+  const existing = deferred<{ status: number; data: unknown }>();
+  respond = async () => { reading.resolve(); return existing.promise; };
+  const create = plugin.createFavoriteFolder({ folderName: "Café" });
+  const refused = assert.rejects(create, /已存在同名收藏夹/);
+  await reading.promise;
+  await assert.rejects(plugin.createFavoriteFolder({ folderName: "Café" }), /正在更新收藏夹/);
+  existing.resolve({ status: 200, data: { folder_list: [{ FID: "7", name: "Cafe\u0301" }] } });
+  await refused;
+  assert.deepEqual(requests.map((request) => request.method), ["get"]);
+});
+
+test("batch move sends one official request and requires every selected comic in the destination", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const confirmed of [false, true]) {
+    requests.length = 0;
+    respond = async (request) => ({ status: 200, data: request.method === "post"
+      ? { code: 200, data: { status: "ok" } }
+      : { list: confirmed ? [{ id: "123" }, { id: 456 }] : [{ id: "123" }] },
+    });
+    const move = plugin.moveFavoriteToFolder({ folderId: "9", folderName: "收藏夹甲", comicIds: ["123", "456"] });
+    if (confirmed) assert.deepEqual(await move, { ok: true });
+    else await assert.rejects(move, /无法确认已移入/);
+    assert.deepEqual(requests.map((request) => request.method), ["post", "get"]);
+    assert.deepEqual(Object.fromEntries(favoriteFolderForm(requests[0]!)), {
+      type: "move", folder_id: "9", folder_name: "收藏夹甲", aid: "123,456",
+    });
+  }
+});
+
+test("batch move finds older favorites past page two and never accepts an explicit default-scope page", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const scope of ["9", "0"]) {
+    requests.length = 0;
+    respond = async (request) => {
+      if (request.method === "post") return { status: 200, data: { code: 200, data: { status: "ok" } } };
+      const page = request.params.page;
+      const list = page < 4 ? Array.from({ length: 20 }, (_, index) => ({ id: 1000 + page * 20 + index })) :
+        [{ id: 123 }, { id: 456 }];
+      return { status: 200, data: { folder_id: page < 4 ? "9" : scope, total: 62, list } };
+    };
+    const move = plugin.moveFavoriteToFolder({ folderId: "9", comicIds: ["123", "456"] });
+    if (scope === "9") assert.deepEqual(await move, { ok: true });
+    else await assert.rejects(move, /无法确认已移入/);
+    assert.deepEqual(requests.map((request) => request.method), ["post", "get", "get", "get", "get"]);
+    assert.deepEqual(requests.slice(1).map((request) => request.params.page), [1, 2, 3, 4]);
+  }
+});
+
+test("a batch crossing a page boundary still sends only one write", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const ids = Array.from({ length: 27 }, (_, index) => String(index + 101));
+  respond = async (request) => {
+    if (request.method === "post") {
+      assert.equal(favoriteFolderForm(request).get("aid"), ids.join(","));
+      return { status: 200, data: { status: "ok" } };
+    }
+    const offset = (request.params.page - 1) * 20;
+    return { status: 200, data: { total: 27, list: ids.slice(offset, offset + 20).map((id) => ({ id })) } };
+  };
+  assert.deepEqual(await plugin.moveFavoriteToFolder({ folderId: "9", comicIds: ids }), { ok: true });
+  assert.deepEqual(requests.map((request) => request.method), ["post", "get", "get"]);
+});
+
+test("an in-flight folder move excludes duplicate moves and simultaneous metadata writes", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const posted = deferred<void>();
+  const reply = deferred<{ status: number; data: unknown }>();
+  respond = async (request) => {
+    if (request.method === "post") { posted.resolve(); return reply.promise; }
+    return { status: 200, data: { total: 1, list: [{ id: 123 }] } };
+  };
+  const payload = { folderId: "9", comicIds: ["123"] };
+  const move = plugin.moveFavoriteToFolder(payload);
+  await posted.promise;
+  await assert.rejects(plugin.moveFavoriteToFolder(payload), /正在更新收藏夹/);
+  await assert.rejects(plugin.createFavoriteFolder({ folderName: "另一个收藏夹" }), /正在更新收藏夹/);
+  reply.resolve({ status: 200, data: { status: "ok" } });
+  assert.deepEqual(await move, { ok: true });
+  assert.deepEqual(requests.map((request) => request.method), ["post", "get"]);
+});
+
+test("a lost folder mutation receipt triggers exact readback without resending the write", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  let posted = false;
+  respond = async (request) => {
+    if (request.method === "post") {
+      posted = true;
+      throw new axios.AxiosError("fixture missing receipt", "ECONNABORTED");
+    }
+    return { status: 200, data: { folder_list: posted ? [{ FID: 9, name: "新增收藏夹" }] : [] } };
+  };
+  assert.deepEqual(await plugin.createFavoriteFolder({ folderName: "新增收藏夹" }), {
+    ok: true, folder: { id: "9", name: "新增收藏夹" }, folders: [{ id: "9", name: "新增收藏夹" }],
+  });
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get"]);
+});
+
+test("folder saves confirm a late directory update without posting again", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const type of ["edit", "add"]) {
+    requests.length = 0;
+    const oldFolder = { FID: 9, name: "原收藏夹" };
+    const newFolder = { FID: type === "edit" ? 9 : 10, name: "新收藏夹" };
+    let readAfterWrite = 0;
+    let writes = 0;
+    respond = async (request) => {
+      if (request.method === "post") {
+        writes++;
+        assert.equal(favoriteFolderForm(request).get("type"), type);
+        return { status: 200, data: type === "edit" ? { status: "ok" } : {} };
+      }
+      const committed = writes > 0 && ++readAfterWrite > 1;
+      const folders = committed ? type === "edit" ? [newFolder] : [oldFolder, newFolder] : [oldFolder];
+      return { status: 200, data: { folder_list: folders } };
+    };
+    const result = type === "edit"
+      ? await plugin.renameFavoriteFolder({ folderId: "9", folderName: newFolder.name })
+      : await plugin.createFavoriteFolder({ folderName: newFolder.name });
+    assert.deepEqual(result.folder, { id: String(newFolder.FID), name: newFolder.name });
+    assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get", "get"]);
+    assert.ok(requests.slice(2).every((request) => request.headers.get("cache-control") === "no-cache"));
+  }
+});
+
+test("folder readback can recover from a transient error but respects Retry-After and account changes", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const failure of [503, 429, "account"]) {
+    requests.length = 0;
+    let posted = false;
+    let readsAfterWrite = 0;
+    respond = async (request) => {
+      if (request.method === "post") {
+        posted = true;
+        return { status: 200, data: { status: "ok" } };
+      }
+      if (!posted) return { status: 200, data: { folder_list: [] } };
+      assert.ok(request.timeout !== undefined && request.timeout > 0 && request.timeout <= 3500);
+      if (++readsAfterWrite === 1 && failure === "account") {
+        settings.set("auth.jwt", "different-fixture-account");
+      } else if (readsAfterWrite === 1) {
+        const headers: Record<string, string> = failure === 429 ? { "retry-after": "120" } : {};
+        return { status: Number(failure), data: {}, headers };
+      }
+      return { status: 200, data: { folder_list: [{ FID: 9, name: "新收藏夹" }] } };
+    };
+    const mutation = plugin.createFavoriteFolder({ folderName: "新收藏夹" });
+    if (failure === 503) {
+      assert.equal((await mutation).folder?.id, "9");
+      assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get", "get"]);
+    } else {
+      await assert.rejects(mutation, failure === 429 ? /HTTP 429 Retry-After: 120/ : state.SessionChangedError);
+      assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get"]);
+    }
+  }
+});
+
+test("rename and delete use the official form and verify the original folder ID", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  let folders = [{ FID: "9", name: "原收藏夹" }, { FID: "10", name: "其他" }];
+  respond = async (request) => {
+    if (request.method === "get") return { status: 200, data: { folder_list: folders } };
+    const form = Object.fromEntries(favoriteFolderForm(request));
+    if (form.type === "edit") {
+      assert.deepEqual(form, { type: "edit", folder_id: "9", folder_name: "新收藏夹", aid: "" });
+      folders = [{ FID: "9", name: "新收藏夹" }, folders[1]!];
+    } else {
+      assert.deepEqual(form, { type: "del", folder_id: "9", folder_name: "新收藏夹", aid: "" });
+      folders = [folders[1]!];
+    }
+    return { status: 200, data: { code: 200, data: { status: "ok" } } };
+  };
+  assert.deepEqual(await plugin.renameFavoriteFolder({ folderId: "9", folderName: "新收藏夹" }),
+    { ok: true, folder: { id: "9", name: "新收藏夹" },
+      folders: [{ id: "9", name: "新收藏夹" }, { id: "10", name: "其他" }] });
+  assert.deepEqual(await plugin.deleteFavoriteFolder({ folderId: "9", folderName: "旧缓存名" }),
+    { ok: true, folders: [{ id: "10", name: "其他" }] });
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get", "get", "post", "get"]);
+});
+
+test("prepared rename and create each move the preflight out of the save path and still verify the write", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const folders = [{ FID: "9", name: "原收藏夹" }];
+  respond = async (request) => {
+    if (request.method === "get") return { status: 200, data: { folder_list: [...folders] } };
+    const form = favoriteFolderForm(request);
+    if (form.get("type") === "edit") folders[0] = { FID: "9", name: String(form.get("folder_name")) };
+    else folders.push({ FID: "10", name: String(form.get("folder_name")) });
+    return { status: 200, data: { status: "ok" } };
+  };
+
+  for (const folderId of ["9", undefined]) {
+    requests.length = 0;
+    const { preflightId } = await plugin.prepareJmFavoriteFolderChange({ folderId });
+    assert.deepEqual(requests.map((request) => request.method), ["get"]);
+    requests.length = 0;
+    const renamed = { folderId, folderName: "新名字", preflightId };
+    const result = folderId === undefined
+      ? await plugin.createFavoriteFolder({ ...renamed, folderName: "新增" })
+      : await plugin.renameFavoriteFolder(renamed);
+    assert.equal(result.folder?.id, folderId ?? "10");
+    assert.deepEqual(requests.map((request) => request.method), ["post", "get"]);
+
+    requests.length = 0;
+    if (folderId === undefined) {
+      await assert.rejects(plugin.createFavoriteFolder({ ...renamed, folderName: "新增" }), /已存在同名收藏夹/);
+    } else {
+      await plugin.renameFavoriteFolder(renamed);
+    }
+    assert.deepEqual(requests.map((request) => request.method), ["get"]);
+  }
+});
+
+test("an expired preparation rechecks the current directory, and changing accounts prevents its use", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  let folders = [{ FID: "9", name: "原收藏夹" }];
+  respond = async (request) => {
+    assert.equal(request.method, "get");
+    return { status: 200, data: { folder_list: folders } };
+  };
+  const stale = await plugin.prepareJmFavoriteFolderChange({ folderId: "9" });
+  const now = Date.now;
+  try {
+    Date.now = () => now() + 6000;
+    folders = [...folders, { FID: "10", name: "其他客户端新增" }];
+    await assert.rejects(plugin.renameFavoriteFolder({ ...stale, folderId: "9", folderName: "其他客户端新增" }),
+      /已存在同名收藏夹/);
+  } finally {
+    Date.now = now;
+  }
+  requests.length = 0;
+  const active = await plugin.prepareJmFavoriteFolderChange({ folderId: "9" });
+  settings.set("auth.jwt", "other-fixture-session");
+  await assert.rejects(plugin.renameFavoriteFolder({ ...active, folderId: "9", folderName: "新名字" }),
+    state.SessionChangedError);
+  assert.deepEqual(requests.map((request) => request.method), ["get"]);
+});
+
+test("a verified folder directory skips the extra pre-save read and never replaces the confirmation read", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  let rows = [{ FID: "9", name: "原收藏夹" }];
+  respond = async (request) => {
+    if (request.method === "post") {
+      rows = [{ FID: "9", name: "新名字" }];
+      return { status: 200, data: { status: "ok" } };
+    }
+    return { status: 200, data: { folder_list: rows } };
+  };
+
+  await plugin.listFavoriteFolders();
+  const preparation = await plugin.prepareJmFavoriteFolderChange({ folderId: "9" });
+  assert.deepEqual(requests.map((request) => request.method), ["get"]);
+  const result = await plugin.renameFavoriteFolder({
+    folderId: "9", folderName: "新名字", reportFolderFailure: true, ...preparation,
+  });
+  assert.equal(result.folder?.name, "新名字");
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get"]);
+});
+
+test("saving during an in-flight folder preparation joins its read without a second preflight", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const started = deferred<void>();
+  const release = deferred<void>();
+  let created = false;
+  respond = async (request) => {
+    if (requests.length === 1) {
+      started.resolve();
+      await release.promise;
+      return { status: 200, data: { folder_list: [] } };
+    }
+    if (request.method === "post") {
+      created = true;
+      return { status: 200, data: { status: "ok" } };
+    }
+    assert.equal(created, true);
+    return { status: 200, data: { folder_list: [{ FID: "9", name: "新增" }] } };
+  };
+  const preparation = plugin.prepareJmFavoriteFolderChange().catch(() => undefined);
+  await started.promise;
+  const save = plugin.createFavoriteFolder({ folderName: "新增", reportFolderFailure: true });
+  release.resolve();
+  await preparation;
+  assert.equal((await save).folder?.id, "9");
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get"]);
+});
+
+test("a preparation completing after another folder write cannot become the next write's preflight", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const preparing = deferred<void>();
+  const releasePreparation = deferred<void>();
+  let folders: { FID: string; name: string }[] = [];
+  respond = async (request) => {
+    if (requests.length === 1) {
+      const before = folders;
+      preparing.resolve();
+      await releasePreparation.promise;
+      return { status: 200, data: { folder_list: before } };
+    }
+    if (request.method === "post") {
+      folders = [{ FID: "9", name: "另一次新建" }];
+      return { status: 200, data: { status: "ok" } };
+    }
+    return { status: 200, data: { folder_list: folders } };
+  };
+  const preparation = plugin.prepareJmFavoriteFolderChange();
+  await preparing.promise;
+  const refused = assert.rejects(preparation, /收藏夹资料读取不完整/);
+  await plugin.createFavoriteFolder({ folderName: "另一次新建" });
+  releasePreparation.resolve();
+  await refused;
+  assert.deepEqual(requests.map((request) => request.method), ["get", "get", "post", "get"]);
+});
+
+test("folder failures identify before-write failure, explicit folder limit, and unconfirmed readback", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const payload = { folderName: "新增", reportFolderFailure: true };
+  const checkFailure = (phase: string, reason: string, folderCount?: number) => (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.deepEqual(JSON.parse(error.message), {
+      type: "jm_folder_change", phase, reason, ...(folderCount === undefined ? {} : { folderCount }),
+    });
+    return true;
+  };
+  respond = async () => ({ status: 503, data: {} });
+  await assert.rejects(plugin.createFavoriteFolder(payload), checkFailure("notSubmitted", "unavailable"));
+  assert.deepEqual(requests.map((request) => request.method), ["get"]);
+
+  requests.length = 0;
+  respond = async (request) => request.method === "post"
+    ? { status: 200, data: { code: 400, msg: "資料夾數量已達上限" } }
+    : { status: 200, data: { folder_list: [{ FID: 1, name: "现有" }, { FID: 2, name: "另一个" }] } };
+  await assert.rejects(plugin.createFavoriteFolder(payload), checkFailure("rejected", "limit", 2));
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post"]);
+
+  requests.length = 0;
+  respond = async (request) => request.method === "post"
+    ? { status: 200, data: { code: 400, msg: "請求次數已達上限" } }
+    : { status: 200, data: { folder_list: [] } };
+  await assert.rejects(plugin.createFavoriteFolder(payload), checkFailure("unconfirmed", "unavailable"));
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post"]);
+
+  requests.length = 0;
+  respond = async (request) => request.method === "post"
+    ? { status: 200, data: { status: "ok" } }
+    : { status: 200, data: { folder_list: [] } };
+  await assert.rejects(plugin.createFavoriteFolder(payload), checkFailure("unconfirmed", "unavailable"));
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get", "get", "get"]);
+});
+
+test("folder management rejects missing proof, target substitutions, and missing deletion proof", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const existing = [{ FID: "9", name: "旧收藏夹" }];
+  let after = false;
+  let receipt: unknown = {};
+  let readback = existing;
+  respond = async (request) => {
+    if (request.method === "get") return { status: 200, data: { folder_list: after ? readback : existing } };
+    after = true;
+    return { status: 200, data: receipt };
+  };
+  await assert.rejects(plugin.createFavoriteFolder({ folderName: "新收藏夹" }), /无法确认收藏夹更新/);
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get", "get", "get"]);
+
+  after = false;
+  requests.length = 0;
+  receipt = { code: 200, data: { status: "ok" } };
+  readback = [{ FID: "10", name: "新收藏夹" }];
+  await assert.rejects(plugin.renameFavoriteFolder({ folderId: "9", folderName: "新收藏夹" }), /无法确认收藏夹更新/);
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get"]);
+
+  after = false;
+  requests.length = 0;
+  readback = existing;
+  await assert.rejects(plugin.deleteFavoriteFolder({ folderId: "9" }), /无法确认收藏夹更新/);
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get"]);
+});
+
+test("delete accepts explicit null for the last folder only with an authentic acknowledgement", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const { after, succeeds, others, lost } of [
+    { after: {}, succeeds: false },
+    { after: { folder_list: null }, succeeds: false, others: true },
+    { after: { folder_list: null }, succeeds: false, lost: true },
+    { after: { folder_list: null }, succeeds: true },
+    { after: { folder_list: [] }, succeeds: true },
+    { after: { folder_list: [{ FID: 0 }] }, succeeds: true },
+  ]) {
+    let posted = false;
+    requests.length = 0;
+    respond = async (request) => {
+      if (request.method === "post") {
+        posted = true;
+        if (lost) throw new axios.AxiosError("fixture missing receipt", "ECONNABORTED");
+        return { status: 200, data: { code: 200, data: { status: "ok" } } };
+      }
+      return { status: 200, data: posted ? { list: [{ id: "123" }], total: "267", ...after } :
+        { folder_list: [{ FID: 9, name: "旧收藏夹" }, ...(others ? [{ FID: 10, name: "另一个" }] : [])] } };
+    };
+    const deletion = plugin.deleteFavoriteFolder({ folderId: "9" });
+    if (succeeds) assert.deepEqual(await deletion, { ok: true, folders: [] });
+    else await assert.rejects(deletion, /无法确认收藏夹更新/);
+    assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get"]);
+  }
+});
+
+test("folder writes detect replacement of a saved account before committing on the same revision", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  respond = async () => {
+    settings.set("auth.jwt", "other-fixture-session");
+    return { status: 200, data: { folder_list: [] } };
+  };
+  await assert.rejects(plugin.createFavoriteFolder({ folderName: "新收藏夹" }), state.SessionChangedError);
+  assert.deepEqual(requests.map((request) => request.method), ["get"]);
+});
+
+test("refreshing folders after a line change uses the new line and rejects the old response", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  settings.set("auth.userInfo", { ...loginData, s: "fixture-avs" });
+  const saved = { bases: Config.baseUrls, index: Config.baseUrlIndex };
+  const former = Config.baseUrl;
+  const selected = "https://new-line.fixture.invalid";
+  const started = deferred<void>();
+  const finishFormer = deferred<void>();
+  try {
+    Config.baseUrls = [former, selected];
+    Config.baseUrlIndex = 0;
+    respond = async (request) => {
+      assert.equal(request.method, "get");
+      assert.equal(request.headers.Authorization, "Bearer fixture-token");
+      assert.equal(request.headers.Cookie, "AVS=fixture-avs");
+      if (request.url === `${former}/favorite`) {
+        started.resolve();
+        await finishFormer.promise;
+        return { status: 200, data: { folder_list: [{ FID: 9, name: "原名称" }] } };
+      }
+      assert.equal(request.url, `${selected}/favorite`);
+      assert.equal(request.headers.get("cache-control"), "no-cache");
+      assert.deepEqual((request as InternalAxiosRequestConfig & { fetchOptions?: unknown }).fetchOptions, {
+        redirect: "error", breezeReadScope: "folder-refresh-fixture",
+      });
+      return { status: 200, data: { folder_list: [{ FID: 9, name: "新名称" }] } };
+    };
+    const formerRead = assert.rejects(plugin.listFavoriteFolders(), /接口线路已变更/);
+    await started.promise;
+    Config.baseUrlIndex = 1;
+    try {
+      assert.deepEqual(await plugin.listFavoriteFolders({
+        refresh: true, __breezeReadScope: "folder-refresh-fixture",
+      }), { items: [{ id: "9", name: "新名称" }] });
+    } finally {
+      finishFormer.resolve();
+      await formerRead;
+    }
+    assert.deepEqual(requests.map((request) => request.url), [`${former}/favorite`, `${selected}/favorite`]);
+  } finally {
+    Config.baseUrls = saved.bases;
+    Config.baseUrlIndex = saved.index;
+  }
+});
+
+test("folder writes stop before dispatch when the effective line changes during header preparation", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const before = { bases: Config.baseUrls, index: Config.baseUrlIndex };
+  const hashing = deferred<void>();
+  const resume = deferred<void>();
+  storageGate = async (name) => {
+    if (!name.includes("md5")) return;
+    hashing.resolve();
+    await resume.promise;
+  };
+  try {
+    Config.baseUrls = [Config.baseUrl, "https://new-line.fixture.invalid"];
+    Config.baseUrlIndex = 0;
+    const move = plugin.moveFavoriteToFolder({ folderId: "9", comicIds: ["123"] });
+    const refusal = assert.rejects(move, /接口线路已变更/);
+    await hashing.promise;
+    Config.baseUrlIndex = 1;
+    resume.resolve();
+    await refusal;
+    assert.equal(requests.length, 0);
+  } finally {
+    Config.baseUrls = before.bases;
+    Config.baseUrlIndex = before.index;
+  }
+});
+
+test("folder creation stops when the originating account changes before membership verification", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  const started = deferred<void>();
+  const membership = deferred<{ status: number; data: unknown }>();
+  let created = false;
+  respond = async (request) => {
+    if (request.method === "post") {
+      created = true;
+      return { status: 200, data: { code: 200, data: { status: "ok" } } };
+    }
+    if (request.params.folder_id === "9") {
+      started.resolve();
+      return membership.promise;
+    }
+    return { status: 200, data: { folder_list: created ? [{ FID: "9", name: "收藏夹甲" }] : [] } };
+  };
+  const creation = plugin.createFavoriteFolder({ folderName: "收藏夹甲", comicIds: ["123"] });
+  const refused = assert.rejects(creation, state.SessionChangedError);
+  await started.promise;
+  await plugin.clearPluginSession();
+  membership.resolve({ status: 200, data: { list: [{ id: "123" }] } });
+  await refused;
+  assert.deepEqual(requests.map((request) => request.method), ["get", "post", "get", "get"]);
+});
+
 test("cloud favorite reads accept real zero and preserve a known nonzero count", async () => {
   settings.set("auth.jwt", "fixture-token");
   respond = async () => ({ status: 200, data: { list: [], total: "0" } });
@@ -310,18 +1058,73 @@ test("cloud favorite reads accept real zero and preserve a known nonzero count",
   assert.deepEqual(empty.data.items, []);
 
   respond = async () => ({ status: 200, data: { code: 200, data: {
-    list: [{ id: "123", name: "fixture-work" }], total: "21",
+    list: Array.from({ length: 20 }, (_, index) => ({ id: String(123 + index), name: "fixture-work" })), total: "21",
   } } });
   const populated = await plugin.getCloudFavoriteData();
   assert.equal(populated.data.total, 21);
   assert.equal(populated.data.hasReachedMax, false);
-  assert.deepEqual(populated.data.items.map((item) => item.id), ["123"]);
+  assert.equal(populated.data.items.length, 20);
+  assert.equal(populated.data.items[0]?.id, "123");
+  respond = async () => ({ status: 200, data: {
+    list: [{ id: "123", name: "fixture-work" }], total: "21",
+  } });
+  await assert.rejects(plugin.getCloudFavoriteData(), /收藏资料读取不完整/);
 
   respond = async () => ({ status: 200, data: { list: [{ id: "123", name: "fixture-work" }] } });
   const unknown = await plugin.getCloudFavoriteData();
   assert.equal("total" in unknown.data, false);
   assert.equal(unknown.data.hasReachedMax, false);
   assert.deepEqual(unknown.data.items.map((item) => item.id), ["123"]);
+});
+
+test("legacy default filter scope reads the aggregate feed and custom scopes reject an explicit mismatch", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  respond = async () => ({ status: 200, data: { folder_id: 0, list: [], total: 0 } });
+  assert.deepEqual((await plugin.getCloudFavoriteData({ folderId: "0" })).data.items, []);
+  assert.deepEqual(requests[0]!.params, { page: 1, folder_id: "", o: "mr" });
+  await assert.rejects(plugin.getCloudFavoriteData({ folderId: "9", order: "mp" }), /收藏资料读取不完整/);
+  assert.deepEqual(requests[1]!.params, { page: 1, folder_id: "9", o: "mp" });
+  await assert.rejects(plugin.moveFavoriteToFolder({ folderId: "0", comicIds: ["123"] }), /收藏夹编号无效/);
+  assert.equal(requests.length, 2);
+});
+
+test("favorite read failures carry status evidence without weakening write confirmation", async () => {
+  settings.set("auth.jwt", "fixture-token");
+  for (const [http, code, expected, retryable] of [
+    [503, undefined, 503, true],
+    [200, 429, 429, true],
+    [403, undefined, 403, false],
+  ] as const) {
+    respond = async () => ({ status: http, data: { code, message: "internal diagnostic" } });
+    await assert.rejects(plugin.getCloudFavoriteData(), {
+      message: `HTTP ${expected}`,
+      retryable,
+    });
+  }
+
+  respond = async () => ({ status: 503, data: {} });
+  await assert.rejects(plugin.toggleFavorite({ comicId: "123" }), /未确认收藏操作/);
+  assert.deepEqual(requests.map((request) => request.method), ["get", "get", "get", "get", "post"]);
+});
+
+test("a transient favorite page error retries only that page on the same account and line", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  settings.set("auth.jwt", "fixture-token");
+  respond = async () => requests.length === 1
+    ? { status: 500, data: {} }
+    : { status: 200, data: { total: 21, list: [{ id: "123", name: "fixture-work" }] } };
+  const pending = plugin.getCloudFavoriteData({ page: 2, order: "mr" });
+  await setImmediate();
+  assert.equal(requests.length, 1);
+  context.mock.timers.tick(600);
+  const result = await pending;
+  assert.deepEqual(result.data.items.map((work) => work.id), ["123"]);
+  assert.equal(result.data.total, 21);
+  assert.deepEqual(requests.map((request) => request.params), [
+    { page: 2, folder_id: "", o: "mr" },
+    { page: 2, folder_id: "", o: "mr" },
+  ]);
+  assert.equal(requests[0]!.url, requests[1]!.url);
 });
 
 test("cloud favorite reads reject malformed or failed replies rather than replacing the collection", async () => {
@@ -332,7 +1135,7 @@ test("cloud favorite reads reject malformed or failed replies rather than replac
     { code: 403, data: JSON.stringify({ list: [], total: 0 }) },
   ]) {
     respond = async () => ({ status: 200, data });
-    await assert.rejects(plugin.getCloudFavoriteData(), /收藏/);
+    await assert.rejects(plugin.getCloudFavoriteData(), "code" in data ? /HTTP 403/ : /收藏/);
   }
 });
 
@@ -347,7 +1150,7 @@ for (const status of [200, 401, 403]) {
   });
 }
 
-for (const failure of [429, 503, "ECONNABORTED"]) {
+for (const failure of [503, "ECONNABORTED"]) {
   test(`temporary login failures have exactly three attempts (${failure})`, async (context) => {
     context.mock.timers.enable({ apis: ["setTimeout"] });
     storedCredentials();
@@ -369,6 +1172,14 @@ for (const failure of [429, 503, "ECONNABORTED"]) {
     assert.equal(requests.length, 3);
   });
 }
+
+test("a rate limit keeps its own Retry-After value and automatic login does not immediately retry", async () => {
+  storedCredentials();
+  respond = async () => ({ status: 429, data: { message: "fixture-body" }, headers: { "retry-after": "120" } });
+  await assert.rejects(plugin.loginWithPassword(loginPayload), { message: "HTTP 429 Retry-After: 120" });
+  await runJmAuthAndCheckInLoop();
+  assert.equal(requests.length, 2);
+});
 
 test("a temporary login error can recover without retrying completed login during check-in", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });

@@ -51,6 +51,7 @@ export async function getComicDetail(
     url: `${apiBase}comics/${comicId}/eps?page=1`,
     method: "GET",
     cache: true,
+    refresh: payload.refresh,
     cacheArray: ["eps", "docs"],
   });
   const firstEps = toStringMap(toStringMap(toStringMap(firstEpsResponse).data).eps);
@@ -71,6 +72,7 @@ export async function getComicDetail(
         url: `${apiBase}comics/${comicId}/eps?page=${index + 2}`,
         method: "GET",
         cache: true,
+        refresh: payload.refresh,
         cacheArray: ["eps", "docs"],
       }),
     ),
@@ -88,6 +90,7 @@ export async function getComicDetail(
       url: `${apiBase}comics/${comicId}/recommendation`,
       method: "GET",
       cache: true,
+      refresh: payload.refresh,
       cacheArray: ["comics"],
     })) as StringMap;
   } catch {

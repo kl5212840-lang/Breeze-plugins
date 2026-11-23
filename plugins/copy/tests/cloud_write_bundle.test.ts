@@ -31,11 +31,12 @@ async function withRuntime(
     rejectWrite: boolean;
     queryResults: Array<Record<string, unknown>>;
   }) => Promise<void>,
+  config: Record<string, unknown> = {},
 ) {
   const oldFetch = globalThis.fetch;
   const oldBridge = globalThis.bridge;
   const calls: Request[] = [];
-  const values = new Map<string, unknown>();
+  const values = new Map(Object.entries(config));
   const state = { token: "fixture-token", rejectWrite: false, queryResults: [] as Array<Record<string, unknown>> };
   let saved = false;
   globalThis.bridge = {
@@ -118,6 +119,30 @@ test("built CJS cloud add sends form media type and fields instead of text/plain
       comic_id: "fixture-comic-uuid",
       is_collect: "1",
     });
+  });
+});
+
+test("a speed-first reading-only winner leaves profile and favorite requests on the trusted Copy account route", async () => {
+  const host = "mapi.copy20.com";
+  await withRuntime(async (calls) => {
+    assert.equal((await plugin.getUserInfoBundle()).data.extern?.userId, "fixture-id");
+    const added = await plugin.startFavoriteAction({ comicId: "fixture-comic", action: "add" });
+    assert.equal(added.status, "completed", added.message);
+    assert.equal(added.committed, true);
+    const removed = await plugin.startFavoriteAction({ comicId: "fixture-comic", action: "removeAll" });
+    assert.equal(removed.status, "completed", removed.message);
+    assert.equal(removed.committed, true);
+    const apiRequests = calls.map((request) => new URL(request.url))
+      .filter((url) => url.pathname.startsWith("/api/v3/"));
+    assert.deepEqual(new Set(apiRequests.map((url) => url.hostname)), new Set([host]));
+    assert.ok(calls.every((request) => [host, "2026copy.com"].includes(new URL(request.url).hostname)));
+    assert.equal(calls.filter((request) => request.method === "POST" || request.method === "DELETE").length, 2);
+  }, {
+    "api.domain": "auto-speed", "network.autoRoute.v1": "热辣漫画线路1",
+    "account.credentials": {
+      version: 1, account: "fixture-user", password: "fixture-password",
+      origin: `https://${host}`, updatedAt: 1, deleted: false,
+    },
   });
 });
 

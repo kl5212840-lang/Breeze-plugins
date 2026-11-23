@@ -238,7 +238,7 @@ test("clearing manual pins applies recent winners without another measurement", 
     const field = fields.find((row: any) => row.key === key);
     assert.equal(settings.data.values[key], "");
     assert.equal(field.options.some((option: any) => option.label.includes("使用中")), false);
-    assert.equal(field.options.slice(1).every((option: any) =>
+    assert.equal(field.options.slice(2).every((option: any) =>
       option.routeOption.domain === new URL(option.value).hostname &&
       !option.routeOption.title.includes("使用中")), true);
     assert.equal(field.options[0].value, "");
@@ -247,7 +247,7 @@ test("clearing manual pins applies recent winners without another measurement", 
   assert.equal(f.requests.length, 0);
 });
 
-test("JM chooses the lowest passing latency for both Auto fields and reuses it on initialization", async () => {
+test("JM availability keeps a working line and speed priority selects and restores the fastest verified line", async () => {
   const slowApi = "https://slow.fixture.invalid";
   const fastApi = "https://fast.fixture.invalid";
   const badApi = "https://bad.fixture.invalid";
@@ -280,17 +280,26 @@ test("JM chooses the lowest passing latency for both Auto fields and reuses it o
   f.cache.set("JmComic::runtime:endpoints", cache);
   await f.plugin.init();
   const result = await f.plugin.measureEndpointSpeeds();
-  assert.equal(result.data.effectiveRouteChanged, true);
+  assert.equal(result.data.effectiveRouteChanged, false);
   assert.equal(result.data.api.find((row: any) => row.url === badApi).ok, false);
   assert.equal(result.data.api.find((row: any) => row.url === badApi).failedAt, "album");
   assert.ok(result.data.api.find((row: any) => row.url === fastApi).ms <
     result.data.api.find((row: any) => row.url === slowApi).ms);
+  assert.equal((await f.plugin.init()).data.fastestApiBase, slowApi);
+  assert.equal((await f.plugin.init()).data.runtimeImageBaseUrl, slowImage);
+  const requestsAfterMeasurement = f.requests.length;
+  const apiChange = await f.plugin.onNetworkChanged({ key: "network.apiBase", value: "auto-speed" });
+  assert.equal(apiChange.data.effectiveRouteChanged, true);
+  assert.equal((await f.plugin.init()).data.runtimeImageBaseUrl, slowImage);
+  await f.plugin.onNetworkChanged({ key: "network.imageBase", value: "auto-speed" });
+  assert.equal(f.requests.length, requestsAfterMeasurement);
   const settings = await f.plugin.getSettingsBundle();
   const fields = settings.scheme.sections.find((row: any) => row.id === "network").fields;
   for (const [key, winner] of [["network.apiBase", fastApi], ["network.imageBase", fastImage]]) {
     const field = fields.find((row: any) => row.key === key);
     assert.equal(field.options[0].label, "自动（可用优先）");
-    assert.equal(settings.data.values[key], "");
+    assert.equal(field.options[1].label, "自动（速度优先）");
+    assert.equal(settings.data.values[key], "auto-speed");
     assert.equal(field.options.find((row: any) => row.routeOption?.inUse).value, winner);
   }
   await f.plugin.fetchImageBytes({ url: `${slowImage}/media/albums/51_3x4.jpg` });
@@ -299,6 +308,8 @@ test("JM chooses the lowest passing latency for both Auto fields and reuses it o
   const relaunched = fixture(() => { throw Error("recent results require no probe"); });
   relaunched.cache.set("JmComic::runtime:endpoints", cache);
   relaunched.cache.set(speedCacheKey, f.cache.get(speedCacheKey));
+  relaunched.settings.set("network.apiBase", "auto-speed");
+  relaunched.settings.set("network.imageBase", "auto-speed");
   const init = await relaunched.plugin.init();
   assert.equal(init.data.fastestApiBase, fastApi);
   assert.equal(init.data.runtimeImageBaseUrl, fastImage);
@@ -365,6 +376,62 @@ test("returning images to Auto can report a different effective API after fresh 
   assert.equal(changed.data.effectiveRouteChanged, true);
   assert.equal((await f.plugin.init()).data.fastestApiBase, winner);
   assert.equal(f.settings.get("network.apiBase"), undefined);
+});
+
+test("JM speed priority measures anonymously and sends a folder refresh only to the selected line", async () => {
+  const previous = "https://previous.fixture.invalid";
+  const winner = "https://winner.fixture.invalid";
+  const fixedImage = "https://cdn-msp.jmapiproxy1.cc";
+  const f = fixture((request) => {
+    const url = new URL(request.url);
+    assert.equal(request.method, "GET");
+    assert.equal(request.redirect, "error");
+    if (url.pathname === "/favorite") {
+      assert.equal(url.origin, winner);
+      assert.equal(request.headers.get("authorization"), "Bearer fixture-token");
+      assert.equal(request.headers.get("cookie"), "AVS=fixture-avs");
+      assert.equal(request.headers.get("cache-control"), "no-cache");
+      return json({ folder_list: [{ FID: 9, name: "Current folder" }] });
+    }
+    assert.equal(request.headers.get("authorization"), null);
+    assert.equal(request.headers.get("cookie"), null);
+    if (url.origin === winner && url.pathname === "/latest") {
+      return json({ list: [{ id: 51, name: "fixture" }] });
+    }
+    if (url.origin === winner && url.pathname === "/album") return album();
+    return json({ code: 503 }, 503);
+  });
+  f.cache.set("JmComic::runtime:endpoints", {
+    apiBaseUrl: previous, hostPool: [previous, winner],
+    imageBaseUrl: fixedImage, imageBaseUrls: [fixedImage], updatedAt: Date.now(),
+  });
+  f.settings.set("network.imageBase", fixedImage);
+  await f.plugin.init();
+  f.settings.set("auth.jwt", "fixture-token");
+  f.settings.set("auth.userInfo", { jwttoken: "fixture-token", s: "fixture-avs" });
+  const change = await f.plugin.onNetworkChanged({ key: "network.apiBase", value: "auto-speed" });
+  assert.equal(change.data.effectiveRouteChanged, true);
+  assert.equal(f.settings.get("network.apiBase"), "auto-speed");
+  assert.equal((await f.plugin.init()).data.runtimeImageBaseUrl, fixedImage);
+  const { items } = await f.plugin.listFavoriteFolders({ refresh: true });
+  assert.equal(items[0].name, "Current folder");
+  assert.deepEqual(f.requests.filter((request) => request.headers.has("authorization"))
+    .map((request) => new URL(request.url).pathname), ["/favorite"]);
+});
+
+test("JM speed priority keeps the current fallback when fresh probes verify no line", async () => {
+  const f = fixture(() => json({ code: 503 }, 503));
+  const selected = "https://selected.fixture.invalid";
+  f.cache.set("JmComic::runtime:endpoints", {
+    apiBaseUrl: selected, hostPool: [selected, "https://second.fixture.invalid"],
+    imageBaseUrl: "https://cdn-msp.jmapiproxy1.cc", updatedAt: Date.now(),
+  });
+  await f.plugin.init();
+  const change = await f.plugin.onNetworkChanged({ key: "network.apiBase", value: "auto-speed" });
+  assert.equal(f.settings.get("network.apiBase"), "auto-speed");
+  assert.equal(change.data.effectiveRouteChanged, false);
+  assert.equal((await f.plugin.init()).data.fastestApiBase, selected);
+  assert.deepEqual(f.requests.map((request) => new URL(request.url).pathname), ["/latest", "/latest"]);
 });
 
 const chapterApi = "https://chapter.fixture.invalid";
@@ -441,7 +508,7 @@ test("a JM download locks the selected image host and rotates only its automatic
   assert.equal((await f.plugin.init()).data.runtimeImageBaseUrl, primaryImage);
 });
 
-test("a fixed image route survives invalid chapter replies and excludes the previous API pair", async () => {
+test("an automatic speed API with a fixed image route survives invalid chapters and excludes the previous pair", async () => {
   const validApi = "https://valid.fixture.invalid";
   const f = fixture((request) => {
     const url = new URL(request.url);
@@ -452,6 +519,7 @@ test("a fixed image route survives invalid chapter replies and excludes the prev
     if (url.origin === backupApi) return json({ code: 200, data: chapterReply(151, ["../00001.webp"]) });
     return json({ code: 200, data: chapterReply() });
   });
+  f.settings.set("network.apiBase", "auto-speed");
   f.settings.set("network.imageBase", backupImage);
   await initDownloadRoutes(f, [chapterApi, backupApi, validApi]);
   const candidate = (await f.plugin.getChapter(downloadInput)).data.chapter;
@@ -612,5 +680,25 @@ test("compiled route menus shorten long hostnames while retaining exact copy dom
   assert.match(options[1].title, /catalog-delta…/);
   assert.equal(options[0].inUse, true);
   assert.equal(options[1].inUse, false);
+  assert.equal(f.requests.length, 0);
+});
+
+test("a retired API line is not shown as current and its setting is preserved", async () => {
+  const retired = "https://previous.fixture.invalid";
+  const current = "https://available.fixture.invalid";
+  const f = fixture(() => { throw Error("cached routes require no network"); });
+  f.settings.set("network.apiBase", retired);
+  f.cache.set("JmComic::runtime:endpoints", {
+    apiBaseUrl: current, hostPool: [current],
+    imageBaseUrl: "https://cdn-msp.jmapiproxy1.cc", updatedAt: Date.now(),
+  });
+  await f.plugin.init();
+
+  const settings = await f.plugin.getSettingsBundle();
+  const network = settings.scheme.sections.find((row: any) => row.id === "network");
+  const field = network.fields.find((row: any) => row.key === "network.apiBase");
+  assert.equal(settings.data.values["network.apiBase"], "");
+  assert.equal(field.options.find((option: any) => option.value === current).routeOption.inUse, true);
+  assert.equal(f.settings.get("network.apiBase"), retired);
   assert.equal(f.requests.length, 0);
 });

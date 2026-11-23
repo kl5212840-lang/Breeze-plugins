@@ -78,13 +78,17 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
     url.searchParams.set(field ?? "ca", field ? keyword : creatorId);
     url.searchParams.set("s", sort);
     url.searchParams.set("page", String(page));
-    response = (await bikaRequest({ url: url.href, method: "GET" })) as Record<string, unknown>;
+    response = (await bikaRequest({
+      url: url.href, method: "GET", readScope: payload.__breezeReadScope,
+    })) as Record<string, unknown>;
   } else if (scoped) {
     if (scoped.pathname === "/comics") {
       scoped.searchParams.set("page", String(page));
       scoped.searchParams.set("s", sort);
     }
-    response = (await bikaRequest({ url: scoped.href, method: "GET" })) as Record<string, unknown>;
+    response = (await bikaRequest({
+      url: scoped.href, method: "GET", readScope: payload.__breezeReadScope,
+    })) as Record<string, unknown>;
   } else {
     response = (await bikaRequest({
       url: `${apiBase}comics/advanced-search?page=${page}`,
@@ -103,12 +107,18 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
   const comics: StringMap = Array.isArray(comicsPayload)
     ? {
         docs: comicsPayload,
-        page,
-        pages: page,
+        page: responseData.page ?? page,
+        pages: responseData.pages ?? page,
+        total: responseData.total,
       }
     : toStringMap(comicsPayload);
   if (!Array.isArray(comics.docs)) {
     throw new Error("搜索结果格式错误");
+  }
+  const paginated = Boolean(field || (mode === "creator" && creatorId) ||
+    !scoped || scoped.pathname === "/comics");
+  if (paginated && comics.page != null && toNum(comics.page, -1) !== page) {
+    throw new Error("搜索分页返回不一致，请重试");
   }
   const rawDocs = comics.docs;
   const docs: StringMap[] = rawDocs.filter(
@@ -154,10 +164,10 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
 
   const data = {
     paging: {
-      page: toNum(comics.page, page),
-      pages: toNum(comics.pages, page),
+      page,
+      pages: paginated ? toNum(comics.pages, page) : page,
       total: toNum(comics.total, filteredDocs.length),
-      hasReachedMax: toNum(comics.page, page) >= toNum(comics.pages, page),
+      hasReachedMax: !paginated || page >= toNum(comics.pages, page),
     },
     items,
   };
@@ -180,7 +190,7 @@ export async function searchComic(payload: BikaSearchPayload = {}): Promise<Sear
   };
 }
 
-async function getNavigationItems(refresh: boolean) {
+async function getNavigationItems(refresh: boolean, readScope?: string) {
   const apiBase = await getApiBase();
   const categoriesResponse = await bikaRequest({
     url: `${apiBase}categories`,
@@ -188,6 +198,7 @@ async function getNavigationItems(refresh: boolean) {
     cache: true,
     cacheArray: ["categories"],
     refresh,
+    readScope,
   });
   const categoriesData = toStringMap(toStringMap(categoriesResponse).data);
   const categoriesRaw = Array.isArray(categoriesData.categories) ? categoriesData.categories : [];
@@ -241,13 +252,14 @@ export async function getHomeData(payload: BikaHomePayload = {}): Promise<Functi
   const apiBase = await getApiBase();
   const refresh = payload.refresh === true;
   const [navItems, keywordsResponse] = await Promise.all([
-    getNavigationItems(refresh),
+    getNavigationItems(refresh, payload.__breezeReadScope),
     bikaRequest({
       url: `${apiBase}keywords`,
       method: "GET",
       cache: true,
       cacheArray: ["keywords"],
       refresh,
+      readScope: payload.__breezeReadScope,
     }),
   ]);
   const keywordsData = toStringMap(toStringMap(keywordsResponse).data);
@@ -288,6 +300,7 @@ export async function getFavoriteData(
   const raw = await bikaRequest({
     url: `${apiBase}users/favourite?s=${sort}&page=${page}`,
     method: "GET",
+    readScope: payload.__breezeReadScope,
   });
 
   const favData = toStringMap(toStringMap(raw).data);
@@ -479,6 +492,9 @@ export async function getFunctionPage(
     payload.id ?? toStringMap(payload.core).id ?? toStringMap(payload.extern).id,
   ).trim();
   const refresh = payload.refresh === true;
+  const readScope = typeof payload.__breezeReadScope === "string"
+    ? payload.__breezeReadScope
+    : undefined;
 
   if (id === "hotSearch") {
     const apiBase = await getApiBase();
@@ -488,6 +504,7 @@ export async function getFunctionPage(
       cache: true,
       cacheArray: ["keywords"],
       refresh,
+      readScope,
     });
     const keywordsData = toStringMap(toStringMap(keywordsResponse).data);
     const items = Array.isArray(keywordsData.keywords)
@@ -513,7 +530,7 @@ export async function getFunctionPage(
 
   if (id === "navigation") {
     const blocked = new Set(toStrList(await loadPluginSetting("home.blockedCategories", [])));
-    const items = (await getNavigationItems(refresh)).filter((item) => {
+    const items = (await getNavigationItems(refresh, readScope)).filter((item) => {
       const title = String(item?.title ?? "").trim();
       if (blocked.has(title)) {
         return false;

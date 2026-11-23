@@ -6,7 +6,14 @@ import { COPY_SPEED_KEY } from "../src/line-speed.ts";
 const plugin = createRequire(import.meta.url)(process.env.BREEZE_COPY_SPEED_BUNDLE ?? "../dist/breeze-plugin-copy-comic.bundle.cjs")
   .default as typeof sourcePlugin;
 const routeOption = (option: object) =>
-  (option as { routeOption?: { title: string; domain: string; inUse: boolean } }).routeOption;
+  (option as { routeOption?: {
+    title: string;
+    domain: string;
+    inUse: boolean;
+    status: "unknown" | "available" | "unavailable";
+    latencyMs: number | null;
+    readOnly: boolean;
+  } }).routeOption;
 const success = (url?: URL) =>
   new Response(
     JSON.stringify({
@@ -144,16 +151,17 @@ test("distributable exposes pure speed action, validates every configured public
     const field = settings.scheme.sections[0]!.fields.find((field) => field.key === "api.domain")!;
     assert.equal(field.kind, "select");
     if (field.kind !== "select") throw Error("Expected select");
-    assert.equal(field.options.length, allDeclared.size + 1);
+    assert.equal(field.options.length, allDeclared.size + 2);
     const network = settings.scheme.sections[0] as unknown as { headerAction: { key: string; title: string; fnPath: string } };
     assert.deepEqual(network.headerAction, { key: "line-speed", title: "测速", fnPath: "testLineSpeeds" });
-    assert.equal(field.options.slice(1).every((option) => [...allDeclared].some((host) => option.label.includes(host))), true);
+    const routes = field.options.slice(2);
+    assert.equal(routes.every((option) => [...allDeclared].some((host) => option.label.includes(host))), true);
     assert.equal(field.options.find((option) => option.value === "热辣漫画线路7")!.label.includes("ms"), true);
     assert.equal(field.options.some((option) => option.label.includes("验证")), false);
     assert.deepEqual(field.options[0], { label: "自动（可用优先）", value: "auto" });
     assert.equal(field.options.some((option) => option.label.includes("使用中")), false);
-    assert.deepEqual(new Set(field.options.slice(1).map((option) => routeOption(option)?.domain)), allDeclared);
-    assert.equal(field.options.slice(1).every((option) => {
+    assert.deepEqual(new Set(routes.map((option) => routeOption(option)?.domain)), allDeclared);
+    assert.equal(routes.every((option) => {
       const metadata = routeOption(option);
       return metadata && !metadata.inUse && !metadata.title.includes(metadata.domain);
     }), true);
@@ -161,10 +169,15 @@ test("distributable exposes pure speed action, validates every configured public
       field.options.find((option) => option.value === "大陆专线3")!.label.includes("ms"),
       true,
     );
-    assert.equal(
-      field.options.find((option) => option.value === "国际服1")!.label.includes("目录未通过"),
-      true,
-    );
+    const unavailable = field.options.find((option) => option.value === "国际服1")!;
+    assert.match(unavailable.label, /暂不可用/);
+    assert.equal(routeOption(unavailable)?.status, "unavailable");
+    assert.equal(routeOption(unavailable)?.latencyMs, null);
+    assert.equal(routeOption(unavailable)?.readOnly, true);
+    const available = field.options.find((option) => option.value === "大陆专线3")!;
+    assert.equal(routeOption(available)?.status, "available");
+    assert.equal(typeof routeOption(available)?.latencyMs, "number");
+    assert.equal(routeOption(available)?.readOnly, false);
     assert.equal(
       JSON.stringify((settings.scheme.sections[0] as unknown as { footer: string }).footer).includes("上次测速"),
       true,
@@ -245,7 +258,7 @@ test("all failed routes retain a hand selection; Hot is measured for reading onl
     };
     const result = await plugin.testLineSpeeds();
     assert.equal(result.data.anyAvailable, false);
-    assert.equal(result.message.includes("0 条通过目录、详情及章节验证"), true);
+    assert.equal(result.message, "暂未找到可用线路");
     assert.equal(requests.filter((request) => new URL(request.url).pathname.endsWith("/comics")).length, allDeclared.size);
     const hot = requests.find((request) => new URL(request.url).hostname === "api.manga2025.com")!;
     assert.equal(hot.headers.get("Origin"), "https://m.relamanhua.org");
@@ -283,7 +296,7 @@ test("automatic selection keeps its preference, routes real catalog calls, and p
     const automaticSettings = await plugin.getSettingsBundle();
     assert.equal(automaticSettings.data.values["api.domain"], "auto");
     const automaticNetwork = automaticSettings.scheme.sections[0] as unknown as { footer: string };
-    assert.match(automaticNetwork.footer, /^当前首选线路：大陆 1\n上次测速 /);
+    assert.match(automaticNetwork.footer, /^上次测速 /);
     const automaticField = automaticSettings.scheme.sections[0]!.fields[0]!;
     if (automaticField.kind !== "select") throw Error("Expected select");
     assert.deepEqual(automaticField.options.filter((option) => routeOption(option)?.inUse).map((option) => option.value), ["大陆专线1"]);
@@ -291,8 +304,8 @@ test("automatic selection keeps its preference, routes real catalog calls, and p
     assert.equal(values.get("auth.token"), "PRIVATE_FIXTURE_NOT_FOR_PROBES");
     const currentRoute = automaticField.options.find((option) => routeOption(option)?.inUse);
     assert.equal(currentRoute && routeOption(currentRoute)?.domain, firstWinner);
-    assert.match(automaticField.description ?? "", /封面和账号各自连接/);
-    assert.match(automaticField.options.find((option) => option.value === "大陆Copy4000")!.label, /详情未通过/);
+    assert.equal(automaticField.description, "可用优先在账号线路不可用时，会为公开阅读使用已测通的线路。");
+    assert.match(automaticField.options.find((option) => option.value === "大陆Copy4000")!.label, /暂不可用/);
 
     passed.clear();
     const failed = await plugin.testLineSpeeds();
@@ -300,6 +313,9 @@ test("automatic selection keeps its preference, routes real catalog calls, and p
     assert.equal(failed.data.effectiveRouteChanged, false);
     assert.equal(failed.data.effectiveHost, firstWinner);
     assert.equal(values.get("api.domain"), "auto");
+    const unavailableField = (await plugin.getSettingsBundle()).scheme.sections[0]!.fields[0]!;
+    if (unavailableField.kind !== "select") throw Error("Expected select");
+    assert.equal(unavailableField.options.some((option) => routeOption(option)?.inUse), false);
 
     passed.add(secondWinner);
     const rematched = await plugin.testLineSpeeds();
@@ -315,7 +331,8 @@ test("automatic selection keeps its preference, routes real catalog calls, and p
     assert.equal(writes.filter((key) => key === "api.domain").length, 1);
   }));
 
-test("a delayed automatic selection cannot overwrite a newer manual route or request platform", () =>
+for (const automatic of ["auto", "auto-speed"]) {
+  test(`a delayed ${automatic} selection cannot overwrite a newer manual route or request platform`, () =>
   fixture(async ({ values, writes }) => {
     const anonymous = globalThis.fetch;
     let release!: () => void, entered!: () => void;
@@ -326,7 +343,7 @@ test("a delayed automatic selection cannot overwrite a newer manual route or req
       await gate;
       return anonymous(input, init);
     };
-    const pending = plugin.saveSettings({ key: "api.domain", value: "auto" });
+    const pending = plugin.saveSettings({ key: "api.domain", value: automatic });
     await ready;
     const manual = await plugin.saveSettings({ key: "api.domain", value: "大陆专线1" });
     await plugin.saveSettings({ key: "api.platform", value: " " });
@@ -339,6 +356,7 @@ test("a delayed automatic selection cannot overwrite a newer manual route or req
     assert.equal(values.get("api.domain"), "大陆专线1");
     assert.equal(writes.includes(COPY_SPEED_KEY), false);
   }));
+}
 
 test("legacy Auto Hot winners are discarded without altering the Auto preference", () =>
   fixture(async ({ values, writes, requests }) => {
@@ -351,6 +369,91 @@ test("legacy Auto Hot winners are discarded without altering the Auto preference
     if (field.kind !== "select") throw Error("Expected select");
     const active = field.options.find((option) => routeOption(option)?.inUse)!;
     assert.equal(routeOption(active)?.domain, "mapi.copy2000.site");
+    assert.equal(routeOption(active)?.status, "unknown");
     assert.equal(requests.length, 0);
     assert.deepEqual(writes, []);
+  }));
+
+test("availability-first applies a verified reading mirror from an existing partial result", () =>
+  fixture(async ({ values, writes, requests }) => {
+    values.set("api.domain", "auto");
+    values.set("network.autoRoute.v1", "大陆专线1");
+    values.set(COPY_SPEED_KEY, {
+      version: 1,
+      probeVersion: 4,
+      revision: "reading-only",
+      measuredAt: Date.now(),
+      context: { choice: "auto", platform: "1" },
+      results: [
+        { choice: "大陆专线1", host: "mapi.copy20.com", ok: false, ms: null, status: 503 },
+        { choice: "热辣漫画线路1", host: "mapi.hotmangasd.com", ok: true, ms: 90, status: 200 },
+        { choice: "热辣漫画线路2", host: "api.manga2025.com", ok: true, ms: 75, status: 200 },
+      ],
+    });
+    const setting = (await plugin.getSettingsBundle()).scheme.sections[0]!.fields[0]!;
+    if (setting.kind !== "select") throw Error("Expected select");
+    assert.deepEqual(setting.options.filter((option) => routeOption(option)?.inUse).map((option) => option.value),
+      ["热辣漫画线路2"]);
+    assert.deepEqual(requests, []);
+    globalThis.fetch = async (input) => {
+      const request = input as Request;
+      assert.equal(new URL(request.url).hostname, "api.manga2025.com");
+      assert.equal(request.headers.get("authorization"), null);
+      return success();
+    };
+    assert.equal((await plugin.getTagAuthorList()).data.items.length, 1);
+    assert.equal(values.get("api.domain"), "auto");
+    assert.equal(values.get("network.autoRoute.v1"), "大陆专线1");
+    assert.deepEqual(writes, []);
+  }));
+
+test("speed-first mode uses the fastest verified reading line and reuses measurements between automatic modes", () =>
+  fixture(async ({ values, requests }) => {
+    values.set("api.domain", "auto");
+    values.set("network.autoRoute.v1", "大陆专线1");
+    values.set(COPY_SPEED_KEY, {
+      version: 1,
+      probeVersion: 4,
+      revision: "verified-routes",
+      measuredAt: Date.now(),
+      context: { choice: "auto", platform: "1" },
+      results: [
+        { choice: "国际服1", host: "api.copy2000.online", ok: false, ms: null, status: 200 },
+        { choice: "热辣漫画线路1", host: "mapi.hotmangasd.com", ok: true, ms: 30, status: 200 },
+        { choice: "大陆专线1", host: "mapi.copy20.com", ok: true, ms: 300, status: 200 },
+      ],
+    });
+    const speed = await plugin.saveSettings({ key: "api.domain", value: "auto-speed" });
+    assert.equal(speed.data.effectiveHost, "mapi.hotmangasd.com");
+    assert.equal(speed.data.effectiveRouteChanged, true);
+    assert.equal(values.get("api.domain"), "auto-speed");
+    assert.equal(values.get("network.autoRoute.v1"), "热辣漫画线路1");
+    const field = (await plugin.getSettingsBundle()).scheme.sections[0]!.fields[0]!;
+    if (field.kind !== "select") throw Error("Expected select");
+    assert.deepEqual(field.options.slice(0, 2), [
+      { value: "auto", label: "自动（可用优先）" },
+      { value: "auto-speed", label: "自动（速度优先）" },
+    ]);
+    assert.equal(field.options.find((option) => routeOption(option)?.inUse)?.value, "热辣漫画线路1");
+    assert.deepEqual(requests, []);
+
+    globalThis.fetch = async (input) => {
+      assert.equal(new URL((input as Request).url).hostname, "mapi.hotmangasd.com");
+      assert.equal((input as Request).headers.get("authorization"), null);
+      return success();
+    };
+    assert.equal((await plugin.getTagAuthorList()).data.items.length, 1);
+
+    const available = await plugin.saveSettings({ key: "api.domain", value: "auto" });
+    assert.equal(available.data.effectiveHost, "mapi.copy20.com");
+    assert.equal(values.get("api.domain"), "auto");
+    assert.equal(values.get("network.autoRoute.v1"), "大陆专线1");
+
+    await plugin.saveSettings({ key: "api.domain", value: "auto-speed" });
+    globalThis.fetch = async () => new Response("unavailable");
+    const failed = await plugin.testLineSpeeds();
+    assert.equal(failed.data.anyAvailable, false);
+    assert.equal(failed.data.effectiveHost, "mapi.hotmangasd.com");
+    assert.equal(failed.data.effectiveRouteChanged, false);
+    assert.equal(values.get("api.domain"), "auto-speed");
   }));

@@ -38,7 +38,7 @@ client.defaults.adapter = async request => {
       { _id: "setting", title: "setting", categories: ["短篇"], thumb: {} },
       { _id: "local", title: "local", categories: ["全彩"], thumb: {} },
       { _id: "visible", title: "visible", categories: ["长篇"], thumb: {} },
-    ], page: 1, pages: 3, total: 60,
+    ], page: Number(new URL(requestedUrl).searchParams.get("page") ?? 1), pages: 3, total: 60,
   } } }, status: 200, statusText: "OK", headers: {}, config: request,
 }); };
 beforeEach(() => {
@@ -83,6 +83,11 @@ test("search distinguishes a malformed list from a genuine empty page", async ()
   }
 });
 
+
+test("a repeated earlier source page is rejected for a paged search", async () => {
+  comicsOverride = { docs: [{ _id: "old", title: "Old page", thumb: {} }], page: 1, pages: 3, total: 60 };
+  await assert.rejects(searchComic({ keyword: "query", page: 2 }), /分页返回不一致/);
+});
 
 test("scoped Bika discovery keeps category and applies page and sort", async () => {
   for (const category of ["大家都在看", "大濕推薦", "那年今天", "官方都在看"]) {

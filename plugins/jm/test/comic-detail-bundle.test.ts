@@ -120,32 +120,14 @@ test("compiled follow sends a saved token only after a membership gate and preve
   assert.equal(normal.eps[0].id, "51");
 });
 
-test("compiled JM like reconciles a lost fetch receipt on the same album and session", async () => {
-  const f = fixture(null, {
-    savedJwt: "fixture-token",
-    respond: (request) => {
-      if (request.method === "POST") throw new TypeError("Failed to fetch");
-      assert.equal(new URL(request.url).searchParams.get("id"), "51");
-      return { status: 200, data: { id: 51, liked: true, likes: "14" } };
-    },
-  });
-  const result = await f.plugin.toggleLike({ comicId: "51", currentLiked: false });
-  assert.deepEqual(JSON.parse(JSON.stringify(result)), { liked: true, verified: true, totalLikes: 14 });
-  assert.deepEqual(f.requests, ["/like", "/album"]);
-  assert.deepEqual(f.transport.map(({ authorization, redirect }) => [authorization, redirect]), [
-    ["Bearer fixture-token", "manual"],
-    ["Bearer fixture-token", "manual"],
-  ]);
-});
-
-test("compiled JM like keeps a redirect status and makes no second request", async () => {
-  const f = fixture(null, {
-    savedJwt: "fixture-token",
-    respond: () => ({ status: 307, data: null }),
-  });
-  await assert.rejects(f.plugin.toggleLike({ comicId: "51", currentLiked: false }), /307/);
-  assert.deepEqual(f.requests, ["/like"]);
-  assert.equal(f.transport[0]?.redirect, "manual");
+test("compiled JM work likes expose the count and no write action", async () => {
+  const f = fixture({ id: 51, name: "fixture", liked: true, likes: "14" });
+  const { data: { normal } } = await f.plugin.getComicDetail({ comicId: "51" });
+  assert.equal(normal.allowLike, false);
+  assert.equal(normal.totalLikes, 14);
+  assert.equal(normal.isLiked, true);
+  assert.equal("toggleLike" in f.plugin, false);
+  assert.deepEqual(f.requests, ["/album"]);
 });
 
 const mainApi = "https://main.fixture.invalid";

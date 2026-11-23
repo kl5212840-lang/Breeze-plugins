@@ -47,6 +47,23 @@ test('public detail snapshot is parsed without an anonymous request and invalid 
   }
   assert.equal((await p.getItem({...args,id})).data.title,'作品');
 });
+test('a late anonymous detail does not replace the refreshed browser detail', async () => {
+  const source = fresh();
+  const url = home + '/anime/' + id + '.html';
+  const request = {...args, id};
+  let finishOld;
+  let startOld;
+  const dispatched = new Promise(resolve => { startOld = resolve; });
+  global.fetch = () => new Promise(resolve => { finishOld = resolve; startOld(); });
+  const old = source.getItem(request);
+  await dispatched;
+  await source.getItem({...request, refresh: true, browserSnapshot: {
+    kind: 'public-detail', url, html: detail.replace('作品', 'Refreshed'),
+  }});
+  finishOld({ok: true, text: async () => detail});
+  await old;
+  assert.equal((await source.getItem(request)).data.title, 'Refreshed');
+});
 test('playback requests a browser detail once when cold and media refresh retains the cached detail',async()=>{
   const p=fresh();let detailReads=0;
   global.fetch=async raw=>{
@@ -95,6 +112,21 @@ test('source recommendations, cast links and discussion retain their real identi
   assert.equal(value.related.length,1);assert.equal(value.related[0].id,other);
   assert.equal(value.related[0].coverUrl,'https://images.example/recommend.webp');
 });
+test('browser catalog trusts usable next-page links over captions or a last-page link alone',async()=>{
+  global.fetch=async()=>({ok:true,text:async()=>''});
+  const p=fresh(),input={...args,typeId:'type:1'};
+  const url=(await p.getLibrary(input)).data.browserRequest.url;
+  const result=async (links,pageText)=>(await p.getLibrary({
+    ...input,browserSnapshot:{...snapshot(url,[card]),links,pageText},
+  })).data;
+  const next=await result([{label:'下一页',href:home+'/type/1-2.html'}],['1/1']);
+  assert.equal(next.pageCount,2);
+  assert.equal(next.nextCursor.nextUrl,home+'/type/1-2.html');
+  const noNext=await result([{label:'尾页',href:home+'/type/1-3.html'}],['1/3']);
+  assert.equal(noNext.pageCount,1);
+  assert.equal(noNext.nextCursor,null);
+});
+
 test('browser catalog retains a real paging URL and rejects stale conditions',async()=>{
   global.fetch=async()=>({ok:true,text:async()=>'<a href="/topicdetail-68.html">秋季新番</a>'});
   const p=fresh(),request=(await p.getLibrary({...args,typeId:'type:1',year:'2026'})).data.browserRequest;

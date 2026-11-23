@@ -141,17 +141,17 @@ test("a logical credential refusal stops automatic work after one request", asyn
   }
 });
 
-function httpFailure(request: InternalAxiosRequestConfig, status: number) {
+function httpFailure(request: InternalAxiosRequestConfig, status: number, retryAfter?: string) {
   return new AxiosError("fixture HTTP failure", "ERR_BAD_RESPONSE", request, undefined, {
     data: { message: "fixture-password fixture@example.invalid fixture-private-token" },
     status,
     statusText: "fixture",
-    headers: {},
+    headers: retryAfter ? { "retry-after": retryAfter } : {},
     config: request,
   });
 }
 
-for (const failure of [429, 503, "ECONNABORTED"]) {
+for (const failure of [503, "ECONNABORTED"]) {
   test(`automatic transient login has three total attempts and stops (${failure})`, async (context) => {
     context.mock.timers.enable({ apis: ["setTimeout"] });
     credentials();
@@ -175,6 +175,16 @@ for (const failure of [429, 503, "ECONNABORTED"]) {
     assert.deepEqual(writes, []);
   });
 }
+
+test("automatic authentication leaves a 429 to the supplied backoff instead of retrying login", async () => {
+  credentials();
+  respond = async (request) => { throw httpFailure(request, 429, "120"); };
+  await assert.rejects(loginWithPassword({ account: "fixture", password: "fixture" }),
+    { message: "HTTP 429 Retry-After: 120" });
+  await runBikaAuthAndCheckInLoop();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(writes, []);
+});
 
 for (const failure of [400, 401, 403, "ERR_CANCELED", "UNKNOWN"]) {
   test(`automatic permanent or unknown login failure never retries (${failure})`, async (context) => {

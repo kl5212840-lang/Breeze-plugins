@@ -12,7 +12,7 @@ import { normalizeAppChannel } from "../src/bika-network";
 const config = new Map<string, unknown>();
 const cache = new Map<string, unknown>();
 const writes: string[] = [];
-const requests: { url: string; channel: string }[] = [];
+const requests: { url: string; channel: string; readScope?: unknown }[] = [];
 let responseBody: unknown;
 let brokenResponseCache = false;
 Object.assign(globalThis, {
@@ -52,7 +52,11 @@ Object.assign(globalThis, {
 });
 const originalAdapter = client.defaults.adapter;
 const adapter: AxiosAdapter = async (request) => {
-  requests.push({ url: String(request.url), channel: String(request.headers.get("app-channel")) });
+  requests.push({
+    url: String(request.url),
+    channel: String(request.headers.get("app-channel")),
+    readScope: (request.fetchOptions as { breezeReadScope?: unknown } | undefined)?.breezeReadScope,
+  });
   return {
     data: responseBody ?? { code: 200, request: requests.length },
     status: 200,
@@ -72,6 +76,14 @@ beforeEach(() => {
 });
 after(() => {
   client.defaults.adapter = originalAdapter;
+});
+
+test("the host read scope reaches the GET fetch adapter and cannot cancel mutations", async () => {
+  responseBody = { code: 200, data: { keywords: [] } };
+  await getFunctionPage({ id: "hotSearch", refresh: true, __breezeReadScope: "fixture-owner" });
+  assert.equal(requests[requests.length - 1]?.readScope, "fixture-owner");
+  await bikaRequest({ url: `${DEFAULT_API_BASE}fixture`, method: "POST", readScope: "fixture-owner" });
+  assert.equal(requests[requests.length - 1]?.readScope, undefined);
 });
 
 test("network settings expose neutral origins and three channels with default 3", async () => {

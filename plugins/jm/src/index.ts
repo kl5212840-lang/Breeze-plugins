@@ -15,7 +15,6 @@ import type {
   RecommendItem,
   SettingsBundleContract,
   ToggleFavoriteResult,
-  ToggleLikeResult,
   UserInfoBundleContract,
 } from "breeze-plugin-kit";
 import {
@@ -24,7 +23,8 @@ import {
   pluginConfig,
   runtime,
 } from "breeze-plugin-kit";
-import { buildUnauthorizedError, createJmClient, JmLikeUnconfirmedError, recordJmLikeStage } from "./client";
+import { buildUnauthorizedError, createJmClient, hasJmMembershipGate } from "./client";
+import { jmFavoriteTag, jmPageLengthMatchesTotal, jmTrackedComicId, readJmFavoriteTags, readJmSiteFollow, readJmSiteFollows, setJmFavoriteTags, setJmSiteFollow } from "./account-collections";
 import { optionalJmCount, unwrapJmAlbumPayload } from "./codec";
 import {
   downloadRouteExclusions,
@@ -40,7 +40,7 @@ import {
 import { parseJmNotifications } from "./notifications";
 import { decodePublicJmData, probeJmAlbum, probeJmCatalog, probeJmCover, probeJmRankingCatalog } from "./line-speed";
 import { Config } from "./constants";
-import { isTransientError, JmFollowError, JmRequestError, retryTransient, toFriendlyError } from "./errors";
+import { isTransientError, JmFollowError, JmRequestError, resolveServerMessage, retryTransient, toFriendlyError } from "./errors";
 import { buildPluginInfo } from "./get-info";
 import { buildRequestConfig } from "./request-config";
 import {
@@ -55,9 +55,10 @@ import {
   currentSessionRevision,
   saveSessionValues,
   waitForSessionWrites,
+  SessionChangedError,
 } from "./state";
 import type { EndpointSpeedCache, EndpointSpeedRecord } from "./state";
-import type { JmLikeDiagnostic, RequestPayload } from "./types";
+import type { RequestPayload } from "./types";
 import { getHost, md5Hex } from "./utils";
 import { notifyAutoCheckinCompleted } from "../../shared/auto-checkin-notice";
 
@@ -65,9 +66,13 @@ const JM_PLUGIN_ID = "6886291b-f524-441c-844b-c2efae9899a9";
 
 const jmClient = createJmClient();
 
+function jmCalendarDay(timestamp: number) {
+  return new Date(timestamp + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 // Only explicit server check-in evidence creates this account-scoped receipt.
 function checkinDate() {
-  return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return jmCalendarDay(Date.now());
 }
 
 async function readCheckin(uid: unknown, revision: number) {
@@ -171,14 +176,15 @@ type FetchImageBytesParams = {
 };
 
 const IMAGE_BASE_FAILURE_LIMIT = 3;
+const JM_SPEED_FIRST = "auto-speed";
 const imageBaseFailures = new Map<string, number>();
 
-let pinnedImageBaseCache = { value: "", at: 0 };
-let pinnedApiBaseCache = { value: "", at: 0 };
+let imageBasePreferenceCache = { value: "", at: 0 };
+let apiBasePreferenceCache = { value: "", at: 0 };
 
-async function getPinnedImageBase(): Promise<string> {
-  if (Date.now() - pinnedImageBaseCache.at < 10_000) {
-    return pinnedImageBaseCache.value;
+async function getImageBasePreference(): Promise<string> {
+  if (Date.now() - imageBasePreferenceCache.at < 10_000) {
+    return imageBasePreferenceCache.value;
   }
   let value = "";
   try {
@@ -186,13 +192,13 @@ async function getPinnedImageBase(): Promise<string> {
   } catch {
     value = "";
   }
-  pinnedImageBaseCache = { value, at: Date.now() };
+  imageBasePreferenceCache = { value, at: Date.now() };
   return value;
 }
 
-async function getPinnedApiBase(): Promise<string> {
-  if (Date.now() - pinnedApiBaseCache.at < 10_000) {
-    return pinnedApiBaseCache.value;
+async function getApiBasePreference(): Promise<string> {
+  if (Date.now() - apiBasePreferenceCache.at < 10_000) {
+    return apiBasePreferenceCache.value;
   }
   let value = "";
   try {
@@ -200,8 +206,12 @@ async function getPinnedApiBase(): Promise<string> {
   } catch {
     value = "";
   }
-  pinnedApiBaseCache = { value, at: Date.now() };
+  apiBasePreferenceCache = { value, at: Date.now() };
   return value;
+}
+
+function fixedJmEndpoint(preference: string): string {
+  return preference === JM_SPEED_FIRST ? "" : preference;
 }
 
 function imageBaseOf(url: string): string {
@@ -250,7 +260,7 @@ function noteImageBaseFailure(url: string) {
 
 /** 新请求优先使用当前线路，旧封面地址仍可作为候选。 */
 async function buildImageAttempts(targetUrl: string): Promise<string[]> {
-  const pinned = await getPinnedImageBase();
+  const pinned = fixedJmEndpoint(await getImageBasePreference());
   const candidates = (
     Config.imagesUrls.length
       ? Config.imagesUrls
@@ -344,6 +354,8 @@ async function jmRequest(
   input: RequestPayload,
   revision = currentSessionRevision(),
   requestJwt?: string,
+  assertScopedRequest?: () => Promise<void>,
+  requestCookie?: string,
 ) {
   await waitForSessionWrites(revision);
   const resolvedJwtToken =
@@ -358,6 +370,8 @@ async function jmRequest(
     ...input,
     jwtToken: resolvedJwtToken,
   }, revision, requestJwt);
+  if (config.__jmMeta && assertScopedRequest) config.__jmMeta.assertScopedRequest = assertScopedRequest;
+  if (requestCookie) config.headers.Cookie = requestCookie;
 
   try {
     const response = await jmClient.request(config);
@@ -384,7 +398,9 @@ async function jmRequest(
   }
 }
 
-type ComicDetailPayload = {
+type JmScopedRead = { __breezeReadScope?: string };
+
+type ComicDetailPayload = JmScopedRead & {
   comicId?: string;
   extern?: Record<string, unknown>;
   path?: string;
@@ -392,7 +408,7 @@ type ComicDetailPayload = {
   jwtToken?: string;
 };
 
-type JmSearchPayload = {
+type JmSearchPayload = JmScopedRead & {
   keyword?: string;
   page?: number;
   extern?: Record<string, unknown>;
@@ -417,7 +433,7 @@ type JmReadSnapshotPayload = {
   extern?: Record<string, unknown>;
 };
 
-type JmHomePayload = {
+type JmHomePayload = JmScopedRead & {
   refresh?: boolean;
   page?: number;
   extern?: Record<string, unknown>;
@@ -426,7 +442,7 @@ type JmHomePayload = {
   jwtToken?: string;
 };
 
-type JmRankingPayload = {
+type JmRankingPayload = JmScopedRead & {
   refresh?: boolean;
   page?: number;
   extern?: Record<string, unknown>;
@@ -435,7 +451,7 @@ type JmRankingPayload = {
   jwtToken?: string;
 };
 
-type JmPromoteListPayload = {
+type JmPromoteListPayload = JmScopedRead & {
   refresh?: boolean;
   id?: number;
   page?: number;
@@ -445,7 +461,7 @@ type JmPromoteListPayload = {
   jwtToken?: string;
 };
 
-type JmWeekRankingPayload = {
+type JmWeekRankingPayload = JmScopedRead & {
   refresh?: boolean;
   date?: number;
   type?: string;
@@ -456,21 +472,11 @@ type JmWeekRankingPayload = {
   jwtToken?: string;
 };
 
-type JmCloudFavoritePayload = {
+type JmCloudFavoritePayload = JmScopedRead & {
   page?: number;
+  refresh?: boolean;
   folderId?: string;
   order?: string;
-  extern?: Record<string, unknown>;
-  path?: string;
-  useJwt?: boolean;
-  jwtToken?: string;
-};
-
-type JmLikePayload = {
-  comicId?: string;
-  currentLiked?: boolean;
-  previousTotalLikes?: number;
-  includeLikeDiagnostic?: boolean;
   extern?: Record<string, unknown>;
   path?: string;
   useJwt?: boolean;
@@ -486,10 +492,14 @@ type JmToggleFavoritePayload = {
   jwtToken?: string;
 };
 
-type JmFavoriteFolderPayload = {
+type JmFavoriteFolderPayload = JmScopedRead & {
   comicId?: string;
+  comicIds?: string[];
   folderId?: string;
   folderName?: string;
+  preflightId?: string;
+  reportFolderFailure?: boolean;
+  refresh?: boolean;
   extern?: Record<string, unknown>;
   path?: string;
   useJwt?: boolean;
@@ -739,7 +749,7 @@ function toComicItem(item: any) {
     finished: false,
     likesCount: totalLikes ?? 0,
     viewsCount: totalViews ?? 0,
-    updatedAt: comicUpdateTime(item?.update_at),
+    updatedAt: comicDateTime(item?.update_at),
     cover: {
       id,
       url: buildJmCoverUrl(item),
@@ -1102,6 +1112,7 @@ function sortByToOrder(value: unknown): string {
   if (sortBy === 2) return "mv";
   if (sortBy === 3) return "mp";
   if (sortBy === 4) return "tf";
+  if (sortBy === 5) return "old";
   return "";
 }
 
@@ -1224,6 +1235,7 @@ function buildEndpointOptions(
   for (const name of shortNames) counts.set(name, (counts.get(name) ?? 0) + 1);
   return [
     { label: "自动（可用优先）", value: "" },
+    { label: "自动（速度优先）", value: JM_SPEED_FIRST },
     ...bases.map((base, index) => {
       const domain = domains[index]!;
       const shortened = shortNames[index]!;
@@ -1319,27 +1331,33 @@ function rankedDownloadBases(pin: string, active: string, bases: string[], recor
   });
 }
 
-function endpointIndex(bases: string[], preference: string, fastest: string, previous: string) {
-  for (const value of [preference, fastest, previous]) {
-    const index = bases.indexOf(value);
-    if (index >= 0) return index;
+function endpointIndex(bases: string[], preference: string, records: EndpointSpeedRecord[], previous: string) {
+  const fixed = bases.indexOf(fixedJmEndpoint(preference));
+  if (fixed >= 0) return fixed;
+  if (preference === JM_SPEED_FIRST) {
+    const fastest = bases.indexOf(fastestEndpoint(bases, records));
+    if (fastest >= 0) return fastest;
   }
-  return 0;
+  const results = buildSpeedMap(records);
+  const current = bases.indexOf(previous);
+  if (current >= 0 && results.get(previous)?.ok !== false) return current;
+  const available = bases.findIndex((base) => results.get(base)?.ok === true);
+  return available >= 0 ? available : Math.max(0, current);
 }
 
 function applyEndpointSelection(
-  pinnedApi: string,
-  pinnedImage: string,
+  apiPreference: string,
+  imagePreference: string,
   speed: EndpointSpeedCache | null,
   previousApi: string,
   previousImage: string,
 ) {
   const recent = speed && isRecentEndpointSpeed(speed) ? speed : null;
-  const api = recent ? fastestEndpoint(Config.baseUrls, recent.api) : "";
-  const image = recent ? fastestEndpoint(Config.imagesUrls, recent.image) : "";
-  Config.baseUrlIndex = endpointIndex(Config.baseUrls, pinnedApi, api, previousApi);
-  Config.imagesUrlIndex = endpointIndex(Config.imagesUrls, pinnedImage, image, previousImage);
-  if (image && !pinnedImage) imageBaseFailures.delete(image);
+  Config.baseUrlIndex = endpointIndex(Config.baseUrls, apiPreference, recent?.api ?? [], previousApi);
+  Config.imagesUrlIndex = endpointIndex(Config.imagesUrls, imagePreference, recent?.image ?? [], previousImage);
+  if (!fixedJmEndpoint(imagePreference) && recent?.image.some((record) => record.ok && record.url === Config.imagesUrl)) {
+    imageBaseFailures.delete(Config.imagesUrl);
+  }
 }
 
 function measureEndpointSpeeds() {
@@ -1403,12 +1421,12 @@ async function measureAndApplyEndpointSpeeds() {
   const effectiveRouteChanged = await writeEndpoints(async () => {
     const speed = { measuredAt, image, api };
     await setEndpointSpeedCache(speed);
-    const [pinnedApi, pinnedImage] = await Promise.all([getPinnedApiBase(), getPinnedImageBase()]);
+    const [apiPreference, imagePreference] = await Promise.all([getApiBasePreference(), getImageBasePreference()]);
     const previousApi = Config.baseUrl;
     const previousImage = Config.imagesUrl;
     Config.baseUrls = currentApiBases();
     Config.imagesUrls = currentImageBases();
-    applyEndpointSelection(pinnedApi, pinnedImage, speed, previousApi, previousImage);
+    applyEndpointSelection(apiPreference, imagePreference, speed, previousApi, previousImage);
     return previousApi !== Config.baseUrl;
   });
 
@@ -1441,7 +1459,7 @@ async function onNetworkChanged(
   } = {},
 ) {
   const key = String(payload.key ?? "");
-  const value = Config.normalizeBaseUrl(payload.value);
+  const value = payload.value === JM_SPEED_FIRST ? JM_SPEED_FIRST : Config.normalizeBaseUrl(payload.value);
 
   const isImage = key === "network.imageBase";
   const isApi = key === "network.apiBase";
@@ -1449,24 +1467,26 @@ async function onNetworkChanged(
   if (isImage || isApi) {
     const shouldMeasure = await writeEndpoints(async () => {
       const bases = isImage ? currentImageBases() : currentApiBases();
-      if (value && !bases.includes(value)) throw new Error("线路不在当前候选中");
-      const previousPin = await (isImage ? getPinnedImageBase() : getPinnedApiBase());
+      const fixed = fixedJmEndpoint(value);
+      if (fixed && !bases.includes(fixed)) throw new Error("线路不在当前候选中");
+      const previous = await (isImage ? getImageBasePreference() : getApiBasePreference());
       await pluginConfig.save(key, JSON.stringify(value));
-      const speed = value ? null : await getEndpointSpeedCache().catch(() => null);
+      const speed = fixed ? null : await getEndpointSpeedCache().catch(() => null);
       const results = speed && isRecentEndpointSpeed(speed) ? (isImage ? speed.image : speed.api) : [];
-      const fastest = fastestEndpoint(bases, results);
-      const index = endpointIndex(bases, value, fastest, previousPin ? "" : (isImage ? Config.imagesUrl : Config.baseUrl));
+      const current = !value && previous ? "" : (isImage ? Config.imagesUrl : Config.baseUrl);
+      const index = endpointIndex(bases, value, results, current);
       if (isImage) {
-        pinnedImageBaseCache = { value, at: Date.now() };
+        imageBasePreferenceCache = { value, at: Date.now() };
         Config.imagesUrls = bases;
         Config.imagesUrlIndex = index;
         imageBaseFailures.delete(Config.imagesUrl);
       } else {
-        pinnedApiBaseCache = { value, at: Date.now() };
+        apiBasePreferenceCache = { value, at: Date.now() };
         Config.baseUrls = bases;
         Config.baseUrlIndex = index;
       }
-      return Boolean(previousPin && !value && !fastest);
+      return !fixed && previous !== value &&
+        (value === JM_SPEED_FIRST || Boolean(fixedJmEndpoint(previous))) && !fastestEndpoint(bases, results);
     });
     if (shouldMeasure) {
       // A failed probe leaves the saved Auto selection and its available fallback.
@@ -1481,7 +1501,7 @@ async function onNetworkChanged(
 }
 
 async function getSettingsBundle(): Promise<SettingsBundleContract> {
-  const [account, password, commentEnabled, pinnedImage, pinnedApi, speedCache] =
+  const [account, password, commentEnabled, imagePreference, apiPreference, speedCache] =
     await Promise.all([
       loadPluginSetting("auth.account", ""),
       loadPluginSetting("auth.password", ""),
@@ -1493,6 +1513,9 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
 
   const imageBases = currentImageBases();
   const apiBases = currentApiBases();
+  const selectedApi = Config.normalizeBaseUrl(fixedJmEndpoint(String(apiPreference ?? "")));
+  const availableApiPin = apiBases.includes(selectedApi) ? selectedApi : "";
+  const imageSelection = String(imagePreference ?? "");
 
   const imageSpeedMap = buildSpeedMap(speedCache?.image ?? []);
   const apiSpeedMap = buildSpeedMap(speedCache?.api ?? []);
@@ -1506,17 +1529,19 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
         key: "network.imageBase",
         kind: "choice" as const,
         label: "图片线路",
-        description: `当前使用 ${getHost(Config.imagesUrl)}。自动模式优先使用加载封面最快的可用线路。`,
+        description: `当前使用 ${getHost(Config.imagesUrl)}。`,
         fnPath: "onNetworkChanged",
-        options: buildEndpointOptions(imageBases, imageSpeedMap, pinnedImage ? "" : Config.imagesUrl),
+        options: buildEndpointOptions(imageBases, imageSpeedMap, fixedJmEndpoint(imageSelection) ? "" : Config.imagesUrl),
       },
       {
         key: "network.apiBase",
         kind: "choice" as const,
         label: "接口线路",
-        description: `当前使用 ${getHost(Config.baseUrl)}。自动模式优先使用打开作品最快的可用线路。`,
+        description: selectedApi && !availableApiPin
+          ? `原线路已不在列表中。当前使用 ${getHost(Config.baseUrl)}，可重新选择。`
+          : `当前使用 ${getHost(Config.baseUrl)}。`,
         fnPath: "onNetworkChanged",
-        options: buildEndpointOptions(apiBases, apiSpeedMap, pinnedApi ? "" : Config.baseUrl),
+        options: buildEndpointOptions(apiBases, apiSpeedMap, availableApiPin ? "" : Config.baseUrl),
       },
     ],
   };
@@ -1556,8 +1581,8 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
         "auth.account": String(account ?? ""),
         "auth.password": String(password ?? ""),
         "comment.enabled": toBool(commentEnabled, false),
-        "network.imageBase": String(pinnedImage ?? ""),
-        "network.apiBase": String(pinnedApi ?? ""),
+        "network.imageBase": imageSelection,
+        "network.apiBase": apiPreference === JM_SPEED_FIRST ? JM_SPEED_FIRST : availableApiPin,
       },
     },
   };
@@ -1890,14 +1915,14 @@ async function resolveDynamicHosts() {
 /** 初始化候选列表，并恢复固定线路或仍有效的测速结果。 */
 async function applyEndpointLists(apiList: string[], imageList: string[]) {
   await writeEndpoints(async () => {
-    const [pinnedApi, pinnedImage, speed] = await Promise.all([
-      getPinnedApiBase(), getPinnedImageBase(), getEndpointSpeedCache().catch(() => null),
+    const [apiPreference, imagePreference, speed] = await Promise.all([
+      getApiBasePreference(), getImageBasePreference(), getEndpointSpeedCache().catch(() => null),
     ]);
     const previousApi = runtimeEndpointsReady ? Config.baseUrl : "";
     const previousImage = runtimeEndpointsReady ? Config.imagesUrl : "";
     Config.baseUrls = apiList.length ? apiList : [Config.JM_FALLBACK_API_BASE];
     Config.imagesUrls = imageList.length ? imageList : Config.buildImageCandidates();
-    applyEndpointSelection(pinnedApi, pinnedImage, speed, previousApi, previousImage);
+    applyEndpointSelection(apiPreference, imagePreference, speed, previousApi, previousImage);
     runtimeEndpointsReady = true;
   });
 }
@@ -2064,6 +2089,146 @@ async function checkInToday() {
       message: ok ? "今日签到已完成" : "签到未完成，请检查线路后重试",
     },
   };
+}
+
+type JmAccountCollectionPayload = JmScopedRead & {
+  collection?: unknown;
+  accountId?: unknown;
+  comicId?: unknown;
+  page?: unknown;
+  enabled?: unknown;
+  tags?: unknown;
+  tagWasPresent?: unknown;
+};
+
+async function openJmAccountCollection(account: unknown) {
+  const revision = currentSessionRevision();
+  const baseUrl = Config.baseUrl;
+  await waitForSessionWrites(revision);
+  const readAccountId = async () =>
+    String((await loadPluginSetting("auth.userInfo", {}, { strict: true }))?.uid ?? "").trim();
+  const readSavedJwt = async () =>
+    String(await loadPluginSetting("auth.jwt", "", { strict: true }) ?? "").trim();
+  const [accountId, storedJwt] = await Promise.all([readAccountId(), readSavedJwt()]);
+  const jwt = storedJwt || await getJwtToken(revision);
+  assertCurrentSession(revision);
+  if (!accountId || !jwt || jwt === "null" || jwt === "undefined" ||
+    (account != null && account !== accountId)) {
+    throw buildUnauthorizedError("请先登录当前禁漫账号");
+  }
+  const cookie = await readJmAvsCookie(jwt);
+
+  const assertActive = async () => {
+    await waitForSessionWrites(revision);
+    const [currentAccount, currentStoredJwt, currentCookie] = await Promise.all([
+      readAccountId(),
+      readSavedJwt(),
+      cookie ? readJmAvsCookie(jwt) : "",
+    ]);
+    assertCurrentSession(revision);
+    if (currentAccount !== accountId || currentStoredJwt !== storedJwt ||
+      currentCookie !== cookie || (!storedJwt && await getJwtToken(revision) !== jwt)) {
+      throw new SessionChangedError();
+    }
+    if (Config.baseUrl !== baseUrl) {
+      throw new JmRequestError("线路已变更，请重新打开后再试");
+    }
+  };
+
+  return {
+    revision,
+    accountId,
+    request: async (path: string, options: RequestPayload) => {
+      try {
+        const raw = await jmRequest({
+          ...options, path: `${baseUrl}${path}`, readOnlyProfile: true, cache: false,
+        }, revision, jwt, assertActive, cookie);
+        if (hasJmMembershipGate(raw) || Number(toStringMap(raw).code) === 401) {
+          throw buildUnauthorizedError();
+        }
+        return raw;
+      } finally {
+        await assertActive();
+      }
+    },
+  };
+}
+
+function retryJmAccountRead(request: Awaited<ReturnType<typeof openJmAccountCollection>>["request"]) {
+  return async (path: string, options: RequestPayload) => {
+    try {
+      return await request(path, options);
+    } catch (error) {
+      const transient = isTransientError(error) ||
+        (error instanceof TypeError && /connection (?:closed|reset|refused)|failed to (?:send HTTP request|read HTTP response body)/i.test(error.message));
+      // Let the host schedule recovery after a full request deadline.
+      if (!transient || (error instanceof Error && /\b429\b|timeout|timed out/i.test(error.message)) ||
+          (error instanceof JmRequestError && error.retryAfter !== undefined)) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 300));
+      // The request rechecks the original account and origin before dispatch.
+      // This wrapper is used only by reads, even when the site's method is POST.
+      return request(path, options);
+    }
+  };
+}
+
+async function getJmAccountCollection(payload: JmAccountCollectionPayload = {}) {
+  const session = await openJmAccountCollection(payload.accountId);
+  const { accountId } = session;
+  const request = retryJmAccountRead((path, options) =>
+    session.request(path, { ...options, readScope: payload.__breezeReadScope }));
+  let data: Record<string, unknown>;
+  switch (payload.collection) {
+    case "follows":
+      data = await readJmSiteFollows(request, Math.max(1, optionalJmCount(payload.page) ?? 1));
+      break;
+    case "tags":
+      data = { tags: await readJmFavoriteTags(request) };
+      break;
+    case "comic": {
+      const id = jmTrackedComicId(payload.comicId);
+      const [enabled, tags] = await Promise.all([
+        readJmSiteFollow(request, id),
+        readJmFavoriteTags(request),
+      ]);
+      data = { enabled, tags };
+      break;
+    }
+    default:
+      throw new JmRequestError("账号收藏类型无效");
+  }
+  return { source: JM_PLUGIN_ID, data: { ...data, accountId } };
+}
+
+const pendingJmAccountCollectionChanges = new Set<number>();
+
+async function setJmAccountCollection(payload: JmAccountCollectionPayload = {}) {
+  if (typeof payload.accountId !== "string" || !payload.accountId ||
+      typeof payload.enabled !== "boolean") {
+    throw new JmRequestError("账号收藏操作无效");
+  }
+  const { revision, accountId, request } = await openJmAccountCollection(payload.accountId);
+  if (pendingJmAccountCollectionChanges.has(revision)) {
+    throw new JmRequestError("账号收藏正在更新，请稍后重试");
+  }
+  pendingJmAccountCollectionChanges.add(revision);
+  try {
+    if (payload.collection === "follows") {
+      const enabled = await setJmSiteFollow(request, jmTrackedComicId(payload.comicId), payload.enabled);
+      return { source: JM_PLUGIN_ID, data: { accountId, enabled } };
+    }
+    if (payload.collection === "tags" && Array.isArray(payload.tags) &&
+        payload.tags.length > 0 && payload.tags.length <= 50) {
+      const tags = [...new Set(payload.tags.map(jmFavoriteTag))];
+      const updated = await setJmFavoriteTags(
+        request, tags, payload.enabled, payload.tagWasPresent === true,
+      );
+      return { source: JM_PLUGIN_ID, data: { accountId, tags: updated } };
+    }
+    throw new JmRequestError("账号收藏操作无效");
+  } finally {
+    pendingJmAccountCollectionChanges.delete(revision);
+  }
 }
 
 async function getNotifications() {
@@ -2307,44 +2472,37 @@ function buildJmLatestScene() {
 }
 
 function buildJmCloudFavoriteScene() {
-  return buildComicListScene({
-    title: "云端收藏",
-    list: {
-      fnPath: "getCloudFavoriteData",
-      extern: { source: "cloudFavorite", order: "mr", folderId: "" },
-    },
-    filter: {
-      fnPath: "getCloudFavoriteFilterBundle",
-      extern: { source: "cloudFavorite" },
-    },
-  });
+  return {
+    ...buildComicListScene({
+      title: "云端收藏",
+      list: {
+        fnPath: "getCloudFavoriteData",
+        extern: { source: "cloudFavorite", order: "mr", folderId: "" },
+      },
+      filter: {
+        fnPath: "getCloudFavoriteFilterBundle",
+        extern: { source: "cloudFavorite" },
+      },
+    }),
+    cloudFavoriteFolderManagement: true,
+  };
 }
 
 async function getCloudFavoriteFilterBundle(
   payload: JmCloudFavoritePayload = {},
-): Promise<FilterBundleContract> {
+): Promise<FilterBundleContract & { data: { folderListVerified?: false } }> {
   const extern = toStringMap(payload.extern);
-  const path = `${Config.baseUrl}/favorite`;
-  const raw = (await jmRequest({
-    path,
-    method: "GET",
-    params: { page: 1, folder_id: "", o: "mr" },
-    cache: false,
-    useJwt: payload.useJwt ?? true,
-    jwtToken: payload.jwtToken,
-  })) as Record<string, any>;
-
-  const folderList = Array.isArray(raw.folder_list) ? raw.folder_list : [];
+  const { items: folderList, folderListVerified } = await listFavoriteFolders(payload);
   const folderOptions = [
     {
-      label: "默认",
+      label: "全部",
       value: "",
       result: { extern: { folderId: "" } },
     },
-    ...folderList.map((item: any) => ({
-      label: String(item?.name ?? ""),
-      value: String(item?.FID ?? ""),
-      result: { extern: { folderId: String(item?.FID ?? "") } },
+    ...folderList.map((item) => ({
+      label: item.name,
+      value: item.id,
+      result: { extern: { folderId: item.id } },
     })),
   ];
 
@@ -2381,6 +2539,7 @@ async function getCloudFavoriteFilterBundle(
       ],
     },
     data: {
+      ...(folderListVerified === false ? { folderListVerified } : {}),
       values: {
         folderId: String(extern.folderId ?? ""),
         order: String(extern.order ?? "mr"),
@@ -2457,7 +2616,10 @@ async function getFunctionPage(
     throw new Error(`未知功能: ${id}`);
   }
 
-  const recommend = await getHomeRecommendData({ refresh: payload.refresh === true });
+  const recommend = await getHomeRecommendData({
+    refresh: payload.refresh === true,
+    __breezeReadScope: typeof payload.__breezeReadScope === "string" ? payload.__breezeReadScope : undefined,
+  });
   const sections = Array.isArray((recommend as any)?.data?.sections)
     ? (recommend as any).data.sections
     : [];
@@ -2574,10 +2736,60 @@ function jmSearchScope(value: unknown): 0 | 2 | 3 {
   return 0;
 }
 
+const jmSearchModes = [
+  { label: "站内搜索", value: "site" },
+  { label: "原作", value: "work" },
+  { label: "作者", value: "author" },
+  { label: "标签", value: "tag" },
+  { label: "登场人物", value: "character" },
+] as const;
+const jmSearchFirstYear = 2017;
+
+function jmSearchType(value: unknown) {
+  return jmSearchModes.find((mode) => mode.value === value)?.value;
+}
+
+function jmSearchDates(
+  extern: Record<string, unknown>,
+  currentYear = new Date().getFullYear(),
+): { y?: number; m?: number } {
+  const year = optionalJmCount(extern.y);
+  if (year === null || year < jmSearchFirstYear || year > currentYear) return {};
+  const month = optionalJmCount(extern.m);
+  return { y: year, ...(month !== null && month >= 1 && month <= 12 ? { m: month } : {}) };
+}
+
 async function getAdvancedSearchScheme(
   payload: { extern?: Record<string, unknown> } = {},
 ): Promise<AdvancedSearchContract> {
   const extern = toStringMap(payload.extern);
+  const currentYear = new Date().getFullYear();
+  const dates = jmSearchDates(extern, currentYear);
+  const legacyScope = jmSearchScope(extern.main_tag);
+  const publicationDateFields: (AdvancedSearchContract["scheme"]["fields"][number] & {
+    optionLayout: "menu";
+    requiresOption?: "y";
+  })[] = [
+    {
+      key: "y",
+      kind: "choice",
+      label: "年份",
+      optionLayout: "menu",
+      options: [{ label: "全部年份", value: "" }, ...Array.from({
+        length: currentYear - jmSearchFirstYear + 1,
+      }, (_, index) => ({ label: String(currentYear - index), value: currentYear - index }))],
+    },
+    {
+      key: "m",
+      kind: "choice",
+      label: "月份",
+      optionLayout: "menu",
+      requiresOption: "y",
+      options: [{ label: "全部月份", value: "" }, ...Array.from({ length: 12 }, (_, index) => ({
+        label: `${index + 1} 月`, value: index + 1,
+      }))],
+    },
+  ];
   return {
     source: JM_PLUGIN_ID,
     scheme: {
@@ -2585,32 +2797,34 @@ async function getAdvancedSearchScheme(
       type: "advancedSearch",
       fields: [
         {
-          key: "main_tag",
+          key: "search_type",
           kind: "choice",
           label: "搜索范围",
-          options: [
-            { label: "综合", value: 0 },
-            { label: "作者", value: 2 },
-            { label: "标签", value: 3 },
-          ],
+          options: [...jmSearchModes],
         },
         {
           key: "sortBy",
           kind: "choice",
           label: "排序",
           options: [
-            { label: "从新到旧", value: 1 },
+            { label: "最新", value: 1 },
             { label: "最多观看", value: 2 },
             { label: "最多图片", value: 3 },
             { label: "最多点赞", value: 4 },
+            { label: "从旧到新", value: 5 },
           ],
         },
+        ...publicationDateFields,
       ],
     },
     data: {
       values: {
-        main_tag: jmSearchScope(extern.main_tag),
+        main_tag: legacyScope,
+        search_type: jmSearchType(extern.search_type) ??
+          (legacyScope === 2 ? "author" : legacyScope === 3 ? "tag" : "site"),
         sortBy: toNum(extern.sortBy, 1),
+        y: dates.y ?? "",
+        m: dates.m ?? "",
       },
     },
   };
@@ -2709,7 +2923,7 @@ function timestampToIso(value: unknown): string {
   return new Date(seconds * 1000).toISOString();
 }
 
-function comicUpdateTime(value: unknown): string {
+function comicDateTime(value: unknown): string {
   if (typeof value !== "string" && typeof value !== "number") return "";
   const text = String(value).trim();
   if (/^[1-9][0-9]{9}$/.test(text)) return timestampToIso(text);
@@ -2809,7 +3023,7 @@ async function readAutomaticJmDownloadAlbum(payload: ComicDetailPayload, albumId
     const pin = await loadPluginSetting("network.apiBase", "", { strict: true });
     assertCurrentSession(revision);
     if (typeof pin !== "string") throw new Error("下载线路设置暂不可用，请重试");
-    return pin.trim();
+    return fixedJmEndpoint(pin.trim());
   };
   if (await readPin()) return null;
 
@@ -2894,6 +3108,7 @@ async function getComicDetail(
     : await jmRequest({
         path,
         method: "GET",
+        readScope: payload.__breezeReadScope,
         params: { id: comicId },
         useJwt: payload.useJwt ?? true,
         jwtToken: payload.jwtToken,
@@ -2909,6 +3124,8 @@ async function getComicDetail(
   const totalLikes = optionalJmCount(response.likes);
   const totalComments = optionalJmCount(response.comment_total);
   const totalPages = optionalJmCount(response.total_photos);
+  const publishedAt = comicDateTime(response.addtime);
+  const updatedAt = comicDateTime(response.update_at);
   const metricAvailability = {
     totalViews: totalViews !== null,
     totalLikes: totalLikes !== null,
@@ -2956,9 +3173,8 @@ async function getComicDetail(
       title: normalizedInfo.name,
       titleMeta: [
         ...(totalViews === null ? [] : [createActionItem(`浏览：${totalViews}`, {}, { metric: "totalViews" })]),
-        ...(timestampToIso(normalizedInfo.addtime)
-          ? [createActionItem(`更新：${timestampToIso(normalizedInfo.addtime).slice(0, 10)}`)]
-          : []),
+        ...(publishedAt ? [createActionItem(`发布：${jmCalendarDay(Date.parse(publishedAt))}`)] : []),
+        ...(updatedAt ? [createActionItem(`更新：${jmCalendarDay(Date.parse(updatedAt))}`)] : []),
         ...(Array.isArray(response.series)
           ? [createActionItem(`章节数：${normalizedInfo.series.length || 1}`)]
           : []),
@@ -2995,7 +3211,7 @@ async function getComicDetail(
               openSearchAction({
                 source: JM_PLUGIN_ID,
                 keyword: item,
-                extern: { main_tag: 2 },
+                extern: { search_type: "author", main_tag: 2 },
               }),
             ),
         ),
@@ -3005,7 +3221,7 @@ async function getComicDetail(
             openSearchAction({
               source: JM_PLUGIN_ID,
               keyword: item,
-              extern: { main_tag: 3 },
+              extern: { search_type: "tag", main_tag: 3 },
             }),
           ),
         ),
@@ -3016,7 +3232,11 @@ async function getComicDetail(
           (item) =>
             createActionItem(
               item,
-              openSearchAction({ source: JM_PLUGIN_ID, keyword: item }),
+              openSearchAction({
+                source: JM_PLUGIN_ID,
+                keyword: item,
+                extern: { search_type: "work" },
+              }),
             ),
         ),
         createMetadataActionList(
@@ -3026,7 +3246,11 @@ async function getComicDetail(
           (item) =>
             createActionItem(
               item,
-              openSearchAction({ source: JM_PLUGIN_ID, keyword: item }),
+              openSearchAction({
+                source: JM_PLUGIN_ID,
+                keyword: item,
+                extern: { search_type: "character" },
+              }),
             ),
         ),
       ].filter((item): item is NonNullable<typeof item> => item != null),
@@ -3095,10 +3319,10 @@ async function getComicDetail(
     isFavourite: !comicFollow && toBool(normalizedInfo.is_favorite),
     isLiked: !comicFollow && toBool(normalizedInfo.liked),
     allowComments: true,
-    allowLike: true,
+    allowLike: false,
     allowCollected: true,
     allowDownload: true,
-    extern: { metricAvailability, fieldsMissing, canUnlike: false },
+    extern: { metricAvailability, fieldsMissing, jmAccountCollections: !comicFollow },
   };
 
   const scheme = {
@@ -3123,18 +3347,80 @@ async function getComicDetail(
   };
 }
 
+function jmSearchResponseData(response: unknown): unknown {
+  const envelope = toStringMap(response);
+  if (!("code" in envelope)) return response;
+  if (Number(envelope.code) !== 200) throw new JmRequestError("暂时无法获取搜索结果，请稍后再试");
+  return envelope.data;
+}
+
+async function getJmSearchDiscovery() {
+  const revision = currentSessionRevision();
+  const origin = Config.baseUrl;
+  const readList = async (endpoint: string) => {
+    const data = jmSearchResponseData(await jmRequest({
+      path: `${origin}/${endpoint}`,
+      method: "GET",
+      cache: false,
+      useJwt: false,
+      readOnlyProfile: true,
+    }, revision));
+    if (!Array.isArray(data)) throw new JmRequestError("搜索推荐暂时无法读取");
+    return data;
+  };
+  const [topics, recommendations] = await Promise.allSettled([
+    readList("hot_tags").then((values) => [...new Set(values.flatMap((value) =>
+      typeof value === "string" && value.trim() ? [value.trim()] : [],
+    ))]),
+    readList("random_recommend").then((values) => {
+      const ids = new Set<number>();
+      return values.flatMap((value) => {
+        const row = toStringMap(value);
+        const id = optionalJmCount(row.id);
+        if (!id || typeof row.name !== "string" || !row.name.trim() || ids.has(id)) return [];
+        ids.add(id);
+        return [toComicItem(row)];
+      });
+    }),
+  ]);
+  assertCurrentSession(revision);
+  return {
+    source: JM_PLUGIN_ID,
+    data: {
+      topics: topics.status === "fulfilled" ? topics.value : [],
+      items: recommendations.status === "fulfilled" ? recommendations.value : [],
+      topicStatus: topics.status === "fulfilled" ? "ready" : "unavailable",
+      recommendationStatus: recommendations.status === "fulfilled" ? "ready" : "unavailable",
+    },
+  };
+}
+
+function jmPublicPageReachedEnd(page: number, pageSize: number, length: number, total: number | null) {
+  return total !== null && total >= length
+    ? Math.max(0, page - 1) * pageSize + length >= total
+    : length < pageSize;
+}
+
+function jmPublicFeedData(value: unknown, rows: "content" | "list") {
+  const root = toStringMap(value);
+  if (root.code !== undefined && Number(root.code) !== 200) return {};
+  return Array.isArray(root[rows]) ? root : toStringMap(root.data);
+}
+
 async function searchComic(payload: JmSearchPayload = {}) {
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, toNum(payload.page, 1));
   const keyword = String(payload.keyword ?? extern.keyword ?? "").trim();
   const keywordLower = keyword.toLowerCase();
   const scope = jmSearchScope(extern.main_tag);
+  const searchType = jmSearchType(extern.search_type);
+  const dates = jmSearchDates(extern);
   const order = String(extern.sort ?? sortByToOrder(extern.sortBy)).trim();
   const path =
     String(payload.path ?? extern.path ?? "").trim() ||
     `${Config.baseUrl}/search`;
   const searchPageSize = 80;
-  const buildResult = (content: any[], total: number) => {
+  const buildResult = (content: any[], total: number | null) => {
     const scheme = {
       version: "1.0.0",
       type: "searchResult",
@@ -3145,12 +3431,9 @@ async function searchComic(payload: JmSearchPayload = {}) {
     const data = {
       paging: {
         page,
-        pages: total > 0 ? Math.max(1, Math.ceil(total / searchPageSize)) : page,
-        total,
-        hasReachedMax:
-          content.length === 0 ||
-          content.length < searchPageSize ||
-          (total > 0 && (page - 1) * searchPageSize + content.length >= total),
+        pages: total !== null && total > 0 ? Math.max(1, Math.ceil(total / searchPageSize)) : page,
+        total: total ?? 0,
+        hasReachedMax: jmPublicPageReachedEnd(page, searchPageSize, content.length, total),
       },
       items: content.map((item: any) => toComicItem(item)),
     };
@@ -3169,7 +3452,7 @@ async function searchComic(payload: JmSearchPayload = {}) {
   };
 
   if (
-    scope === 0 &&
+    (searchType === "site" || (!searchType && scope === 0)) && !dates.y &&
     (Number(keyword) >= 100 || keywordLower.startsWith("jm")) &&
     page === 1
   ) {
@@ -3179,6 +3462,7 @@ async function searchComic(payload: JmSearchPayload = {}) {
     if (comicId) {
       try {
         const detailResponse = await getComicDetail({
+          __breezeReadScope: payload.__breezeReadScope,
           comicId,
           useJwt: payload.useJwt,
           jwtToken: payload.jwtToken,
@@ -3194,7 +3478,6 @@ async function searchComic(payload: JmSearchPayload = {}) {
                   ? comicInfo.author.join("/")
                   : comicInfo.author,
                 total_views: comicInfo.total_views ?? comicInfo.totalViews,
-                update_at: comicInfo.update_at ?? comicInfo.addtime,
               },
             ],
             1,
@@ -3206,22 +3489,33 @@ async function searchComic(payload: JmSearchPayload = {}) {
     }
   }
 
-  const response = (await jmRequest({
+  const response = toStringMap(jmSearchResponseData(await jmRequest({
     path,
     method: "GET",
+    readScope: payload.__breezeReadScope,
     params: {
       search_query: keyword,
       page,
       o: order,
-      ...(scope === 0 ? {} : { main_tag: scope }),
+      ...(searchType ? { search_type: searchType } : scope === 0 ? {} : { main_tag: scope }),
+      ...dates,
     },
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
-  })) as Record<string, any>;
+  })));
 
   const content = Array.isArray(response.content) ? response.content : [];
+  if (order === "old") {
+    // The official client also orders returned pages by their published dates.
+    const published = (item: unknown) => {
+      const date = toStringMap(item).adddate;
+      return typeof date === "string" && /^\d{4}-\d{2}-\d{2}/.test(date) ? date : "\uffff";
+    };
+    return buildResult([...content].sort((a, b) => published(a).localeCompare(published(b))),
+      optionalJmCount(response.total));
+  }
 
-  return buildResult(content, toNum(response.total, content.length));
+  return buildResult(content, optionalJmCount(response.total));
 }
 
 function buildHomeSectionAction(section: any) {
@@ -3331,6 +3625,7 @@ async function getHomeRecommendData(payload: JmHomePayload = {}) {
   const promote = await jmRequest({
     path: promotePath,
     method: "GET",
+    readScope: payload.__breezeReadScope,
     cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
@@ -3387,6 +3682,7 @@ async function getHomeLatestData(payload: JmHomePayload = {}) {
   const suggestion = await jmRequest({
     path,
     method: "GET",
+    readScope: payload.__breezeReadScope,
     params: { page: Math.max(0, page) },
     cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
@@ -3427,21 +3723,18 @@ async function getRankingData(payload: JmRankingPayload = {}) {
   const raw = await jmRequest({
     path,
     method: "GET",
+    readScope: payload.__breezeReadScope,
     params: { page, c, o },
     cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   });
 
-  const total = toNum((raw as any)?.total, 0);
-  const content = Array.isArray((raw as any)?.content)
-    ? (raw as any).content
-    : [];
-  const loadedCount = Math.max(0, page - 1) * rankingPageSize + content.length;
-  const hasReachedMax =
-    content.length === 0 ||
-    content.length < rankingPageSize ||
-    (total > 0 && loadedCount >= total);
+  const data = jmPublicFeedData(raw, "content");
+  const total = optionalJmCount(data.total);
+  const content = data.content;
+  if (!Array.isArray(content)) throw new JmRequestError("榜单列表读取不完整，请重试");
+  const hasReachedMax = jmPublicPageReachedEnd(page, rankingPageSize, content.length, total);
 
   return {
     source: JM_PLUGIN_ID,
@@ -3453,7 +3746,7 @@ async function getRankingData(payload: JmRankingPayload = {}) {
     },
     data: {
       page,
-      total,
+      ...(total === null ? {} : { total }),
       hasReachedMax,
       items: content.map((item: any) => toComicItem(item)),
       raw,
@@ -3470,19 +3763,18 @@ async function getPromoteListData(payload: JmPromoteListPayload = {}) {
   const raw = (await jmRequest({
     path,
     method: "GET",
+    readScope: payload.__breezeReadScope,
     params: { id, page },
     cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
     jwtToken: payload.jwtToken,
   })) as Record<string, any>;
 
-  const total = toNum(raw.total, 0);
-  const list = Array.isArray(raw.list) ? raw.list : [];
-  const loadedCount = Math.max(0, page - 1) * pageSize + list.length;
-  const hasReachedMax =
-    list.length === 0 ||
-    list.length < pageSize ||
-    (total > 0 && loadedCount >= total);
+  const data = jmPublicFeedData(raw, "list");
+  const total = optionalJmCount(data.total);
+  const list = data.list;
+  if (!Array.isArray(list)) throw new JmRequestError("推荐列表读取不完整，请重试");
+  const hasReachedMax = jmPublicPageReachedEnd(page, pageSize, list.length, total);
 
   return {
     source: JM_PLUGIN_ID,
@@ -3495,7 +3787,7 @@ async function getPromoteListData(payload: JmPromoteListPayload = {}) {
     data: {
       id,
       page,
-      total,
+      ...(total === null ? {} : { total }),
       hasReachedMax,
       items: list.map((item: any) => toComicItem(item)),
       raw,
@@ -3507,6 +3799,7 @@ async function getLatestData(payload: JmRankingPayload = {}) {
   const page = Math.max(1, toNum(payload.page, 1));
   if (page == 1) {
     const latest = await getHomeLatestData({
+      __breezeReadScope: payload.__breezeReadScope,
       page: 0,
       path: undefined,
       useJwt: payload.useJwt,
@@ -3540,6 +3833,7 @@ async function getLatestData(payload: JmRankingPayload = {}) {
   const raw = await jmRequest({
     path,
     method: "GET",
+    readScope: payload.__breezeReadScope,
     params: { page: requestPage },
     cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
@@ -3565,25 +3859,62 @@ async function getLatestData(payload: JmRankingPayload = {}) {
   };
 }
 
+function matchJmFavoriteFeedFolder(raw: Record<string, unknown>, folderId: string) {
+  const scope = raw.folder_id;
+  if (scope == null) return true;
+  return folderId === "" ? scope === "" || optionalJmCount(scope) === 0 :
+    optionalJmCount(scope) === Number(folderId);
+}
+
+function readJmFavoriteFeed(root: Record<string, unknown>, page: number, folderId: string, strictPage = false) {
+  if (!matchJmFavoriteFeedFolder(root, folderId)) return null;
+  const offset = (page - 1) * 20;
+  for (const raw of [root, toStringMap(root.data)]) {
+    const list = raw.list;
+    const total = optionalJmCount(raw.total);
+    if (!Array.isArray(list) || !matchJmFavoriteFeedFolder(raw, folderId)) continue;
+    const declaredEnd = raw.hasMore === false || raw.hasReachedMax === true;
+    const validLength = total === null
+      ? list.length > 0 || strictPage && declaredEnd
+      : strictPage
+        ? jmPageLengthMatchesTotal(list.length, total, page)
+        : list.length === 0 ? total <= offset : total >= offset + list.length;
+    const ids = list.map((item) => optionalJmCount(toStringMap(item).id));
+    if (validLength && ids.every(Boolean) &&
+        (!strictPage || list.length <= 20 && new Set(ids).size === ids.length &&
+          (raw.page == null || optionalJmCount(raw.page) === page))) {
+      return { raw, list, total, declaredEnd };
+    }
+  }
+  return null;
+}
+
 async function getCloudFavoriteData(payload: JmCloudFavoritePayload = {}) {
   const page = Math.max(1, optionalJmCount(payload.page) ?? 1);
   const extern = toStringMap(payload.extern);
-  const folderId = String(payload.folderId ?? extern.folderId ?? "");
-  const order = String(payload.order ?? extern.order ?? "mr") || "mr";
+  const filterFolderId = String(payload.folderId ?? extern.folderId ?? "").trim();
+  const folderId = filterFolderId === "" || optionalJmCount(filterFolderId) === 0
+    ? "" : jmFavoriteFolderId(filterFolderId);
+  const order = (payload.order ?? extern.order) === "mp" ? "mp" : "mr";
   const request = await openJmFavoriteRequest(payload);
-  const result = toStringMap(await request("/favorite", {
+  const readPage = () => request("/favorite", {
     method: "GET",
     params: { page, folder_id: folderId, o: order },
-  }));
-  const raw = Array.isArray(result.list) ? result : toStringMap(result.data);
-  const list = raw.list;
-  const total = optionalJmCount(raw.total);
-  const offset = (page - 1) * 20;
-  if (!Array.isArray(list) ||
-      (list.length === 0 ? total === null || total > offset : total !== null && total < offset + list.length) ||
-      list.some((item) => !optionalJmCount(toStringMap(item).id))) {
-    throw new JmRequestError("收藏资料读取不完整，请重试");
-  }
+    readScope: payload.__breezeReadScope,
+  });
+  const response = await readPage().catch(async (error: unknown) => {
+    if (!(error instanceof JmRequestError) || !error.retryable ||
+        error.status === 429 || error.retryAfter !== undefined) {
+      throw error;
+    }
+    // Re-read only this page after a temporary site error. The request checks
+    // the same account and line again before it can reach the network.
+    await new Promise<void>((resolve) => setTimeout(resolve, 600));
+    return readPage();
+  });
+  const feed = readJmFavoriteFeed(toStringMap(response), page, folderId, true);
+  if (!feed) throw new JmRequestError("收藏资料读取不完整，请重试");
+  const { raw, list, total, declaredEnd } = feed;
 
   return {
     source: JM_PLUGIN_ID,
@@ -3596,105 +3927,23 @@ async function getCloudFavoriteData(payload: JmCloudFavoritePayload = {}) {
     data: {
       page,
       ...(total === null ? {} : { total }),
-      hasReachedMax: total !== null && page * 20 >= total,
+      hasReachedMax: total === null ? declaredEnd : page * 20 >= total,
       items: list.map(toComicItem),
       raw,
     },
   };
 }
 
-function isJmLikeTransportFailure(error: unknown) {
-  if (isTransientError(error)) return true;
-  // QuickJS Fetch puts the native transport failure in a TypeError. Axios
-  // does not always attach a transport code to that error.
-  return axios.isAxiosError(error) && !error.response && error.name === "TypeError" &&
-    /^(?:Failed to (?:send HTTP request|parse HTTP response headers|read HTTP response body bytes)|发送 HTTP 请求失败|解析 HTTP 响应头失败|读取 HTTP 响应体字节失败)/i.test(error.message);
-}
-
-async function toggleLike(
-  payload: JmLikePayload = {},
-): Promise<ToggleLikeResult & { verified: true; totalLikes?: number; likeDiagnostic?: JmLikeDiagnostic }> {
-  const comicId = String(payload.comicId ?? "").trim();
-  const requestedId = optionalJmCount(comicId);
-  if (requestedId === null || requestedId === 0) {
-    throw new JmRequestError("作品编号无效");
+async function readJmAvsCookie(jwt: string) {
+  const profile = toStringMap(await loadPluginSetting("auth.userInfo", {}, { strict: true }));
+  const session = typeof profile.s === "string" ? profile.s.trim() : "";
+  // Only reuse the website session issued with this exact bearer. Restrict
+  // it to printable cookie octets so it cannot introduce another header.
+  if (profile.jwttoken !== jwt || session === "null" || session === "undefined" ||
+      !/^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+$/.test(session)) {
+    return "";
   }
-
-  if (toBool(payload.currentLiked, false)) {
-    throw new JmRequestError("禁漫暂不支持取消点赞");
-  }
-
-  const revision = currentSessionRevision();
-  const baseUrl = Config.baseUrl;
-  await waitForSessionWrites(revision);
-  const useJwt = payload.useJwt !== false;
-  const configuredJwt = useJwt
-    ? String(payload.jwtToken ?? "").trim() ||
-      String(await loadPluginSetting("auth.jwt", "", { strict: true }) ?? "").trim()
-    : "";
-  const requestJwt = useJwt && !configuredJwt ? await getJwtToken(revision)
-    : configuredJwt === "null" || configuredJwt === "undefined" ? "" : configuredJwt;
-  assertCurrentSession(revision);
-  // Axios merges its request configuration. Use a callback to preserve one
-  // diagnostics object for both requests without exposing it in either request.
-  const diagnostic: JmLikeDiagnostic | undefined = payload.includeLikeDiagnostic === true ? {} : undefined;
-  const options = { cache: false, comicLike: true, useJwt, likeDiagnostic: diagnostic ? () => diagnostic : undefined };
-  try {
-    await jmRequest({
-      ...options,
-      path: `${baseUrl}/like`,
-      method: "POST",
-      formData: { id: comicId },
-    }, revision, requestJwt);
-  } catch (error) {
-    assertCurrentSession(revision);
-    const transport = isJmLikeTransportFailure(error);
-    if (!transport && !(error instanceof JmLikeUnconfirmedError)) throw error;
-    // The server may have applied a write whose receipt never reached us.
-    if (transport) recordJmLikeStage(diagnostic, "submit", "transport");
-  }
-
-  let album: Record<string, unknown>;
-  try {
-    album = unwrapJmAlbumPayload(await jmRequest({
-      ...options,
-      path: `${baseUrl}/album`,
-      method: "GET",
-      params: { id: comicId },
-    }, revision, requestJwt));
-  } catch (error) {
-    assertCurrentSession(revision);
-    if (!isJmLikeTransportFailure(error)) throw error;
-    recordJmLikeStage(diagnostic, "readback", "transport");
-    throw new JmLikeUnconfirmedError(diagnostic);
-  }
-  assertCurrentSession(revision);
-  const albumId = optionalJmCount(album.id);
-  const work = albumId === null ? "unknown" : albumId === requestedId ? "match" : "mismatch";
-  const hasLiked = Object.prototype.hasOwnProperty.call(album, "liked");
-  const likedField = album.liked;
-  const likedType = !hasLiked ? "missing" : likedField === null ? "null" :
-    Array.isArray(likedField) ? "array" : typeof likedField;
-  const liked = toBool(likedField) ? "true" : !toBool(likedField, true) ? "false" : "unknown";
-  const totalLikes = optionalJmCount(album.likes);
-  const previous = optionalJmCount(payload.previousTotalLikes);
-  const total = totalLikes !== null ? "present" :
-    Object.prototype.hasOwnProperty.call(album, "likes") ? "invalid" : "missing";
-  const totalChange = work !== "match" || totalLikes === null || previous === null ? "unknown" :
-    totalLikes === previous ? "unchanged" : "changed";
-  const result = work === "match" && liked === "true" ? "confirmed" : "unconfirmed";
-  if (diagnostic) diagnostic.verify = { result, work, likedType, liked, total, totalChange };
-  // Log only classifications. Never include raw fields, IDs, credentials, or URLs.
-  console.info(`[jm.like] verify result=${result} work=${work} likedType=${likedType} liked=${liked} total=${total} totalChange=${totalChange}`);
-  if (result !== "confirmed") {
-    throw new JmLikeUnconfirmedError(diagnostic);
-  }
-  return {
-    liked: true,
-    verified: true,
-    ...(diagnostic ? { likeDiagnostic: diagnostic } : {}),
-    ...(totalLikes === null ? {} : { totalLikes }),
-  };
+  return `AVS=${session}`;
 }
 
 async function openJmFavoriteRequest(payload: { useJwt?: boolean; jwtToken?: string }) {
@@ -3702,16 +3951,71 @@ async function openJmFavoriteRequest(payload: { useJwt?: boolean; jwtToken?: str
   const baseUrl = Config.baseUrl;
   await waitForSessionWrites(revision);
   const useJwt = payload.useJwt !== false;
-  const configured = useJwt ? String(payload.jwtToken ?? "").trim() ||
-    String(await loadPluginSetting("auth.jwt", "", { strict: true }) ?? "").trim() : "";
+  const savedJwt = async () => String(await loadPluginSetting("auth.jwt", "", { strict: true }) ?? "").trim();
+  const stored = useJwt ? await savedJwt() : "";
+  const configured = useJwt ? String(payload.jwtToken ?? "").trim() || stored : "";
   const jwt = useJwt && !configured ? await getJwtToken(revision) : configured;
   assertCurrentSession(revision);
   if (!jwt || jwt === "null" || jwt === "undefined") {
     throw buildUnauthorizedError("请先登录禁漫天堂");
   }
-  return (route: string, options: RequestPayload) => jmRequest({
-    ...options, path: `${baseUrl}${route}`, comicFavorite: true, cache: false, useJwt,
-  }, revision, jwt);
+  const cookie = await readJmAvsCookie(jwt);
+  const assertActive = async () => {
+    await waitForSessionWrites(revision);
+    const [currentJwt, currentCookie] = await Promise.all([
+      savedJwt(),
+      cookie ? readJmAvsCookie(jwt) : "",
+    ]);
+    if (currentJwt !== stored || currentCookie !== cookie ||
+        (!configured && await getJwtToken(revision) !== jwt)) {
+      throw new SessionChangedError();
+    }
+    assertCurrentSession(revision);
+    if (Config.baseUrl !== baseUrl) throw new JmRequestError("禁漫接口线路已变更，请重新打开收藏夹");
+  };
+  const request = async (route: string, options: RequestPayload) => {
+    try {
+      return await jmRequest({
+        ...options, path: `${baseUrl}${route}`, comicFavorite: true, cache: false, useJwt,
+      }, revision, jwt, assertActive, cookie);
+    } finally {
+      await assertActive();
+    }
+  };
+  return Object.assign(request, { assertActive });
+}
+
+async function getSiteWatchHistory(payload: JmScopedRead & { page?: number; accountId?: string } = {}) {
+  const accountId = typeof payload.accountId === "string" ? payload.accountId.trim() : "";
+  if (!accountId) throw buildUnauthorizedError("请先登录禁漫天堂");
+  const page = Math.max(1, optionalJmCount(payload.page) ?? 1);
+  const { request } = await openJmAccountCollection(accountId);
+  const response = toStringMap(await retryJmAccountRead(request)("/watch_list", {
+    method: "GET",
+    readScope: payload.__breezeReadScope,
+    params: { page },
+    comicFavorite: true,
+  }));
+  for (const data of [response, toStringMap(response.data)]) {
+    const { list } = data;
+    const total = optionalJmCount(data.total);
+    if (!Array.isArray(list) || total === null ||
+        !jmPageLengthMatchesTotal(list.length, total, page) ||
+        (data.page != null && optionalJmCount(data.page) !== page) ||
+        new Set(list.map((row) => optionalJmCount(toStringMap(row).id))).size !== list.length ||
+        list.some((row) => {
+          const item = toStringMap(row);
+          return !optionalJmCount(item.id) || typeof item.name !== "string" || !item.name.trim();
+        })) {
+      continue;
+    }
+    return {
+      source: JM_PLUGIN_ID,
+      scheme: { version: "1.0.0", type: "comicHistoryFeed", card: "comic" },
+      data: { accountId, page, total, hasReachedMax: page * 20 >= total, items: list.map(toComicItem) },
+    };
+  }
+  throw new JmRequestError("站点阅读记录读取不完整，请重试");
 }
 
 async function toggleFavorite(
@@ -3740,61 +4044,379 @@ async function toggleFavorite(
 
 async function listFavoriteFolders(
   payload: JmFavoriteFolderPayload = {},
-): Promise<ListFavoriteFoldersResult> {
-  const path = `${Config.baseUrl}/favorite`;
-  const raw = (await jmRequest({
-    path,
+): Promise<ListFavoriteFoldersResult & { folderListVerified?: false }> {
+  const options = { freshRead: payload.refresh === true, readScope: payload.__breezeReadScope };
+  const { items, kind } = payload.useJwt === false || payload.jwtToken
+    ? await readJmFavoriteFolders(await openJmFavoriteRequest(payload), options)
+    : (await readJmFolderDirectory(false, options)).before;
+  return { items, ...(kind === "omitted" ? { folderListVerified: false as const } : {}) };
+}
+
+type JmFavoriteRequest = Awaited<ReturnType<typeof openJmFavoriteRequest>>;
+type JmFolderReadOptions = Pick<RequestPayload, "freshRead" | "readScope" | "folderReadbackTimeoutMs">;
+
+async function readJmFavoriteFolders(request: JmFavoriteRequest, options: JmFolderReadOptions = {}) {
+  const root = toStringMap(await request("/favorite", {
     method: "GET",
     params: { page: 1, folder_id: "", o: "mr" },
-    cache: false,
-    useJwt: payload.useJwt ?? true,
-    jwtToken: payload.jwtToken,
-  })) as Record<string, any>;
-
-  const folders = Array.isArray(raw.folder_list) ? raw.folder_list : [];
-  return {
-    items: folders.map((item: any) => ({
-      id: String(item?.FID ?? ""),
-      name: String(item?.name ?? ""),
-    })),
+    ...options,
+  }));
+  const body = toStringMap(root.data);
+  const feed = readJmFavoriteFeed(root, 1, "");
+  const rows = feed?.raw === body ? body.folder_list ?? root.folder_list :
+    root.folder_list ?? body.folder_list;
+  if (!matchJmFavoriteFeedFolder(root, "") || !matchJmFavoriteFeedFolder(body, "")) {
+    throw new JmRequestError("收藏夹资料读取不完整，请重试");
+  }
+  const items: { id: string; name: string }[] = [];
+  // Keep explicit null separate from an omitted field for last-folder removal.
+  if (rows == null && feed) return {
+    items,
+    kind: root.folder_list === null || body.folder_list === null ? "null" as const : "omitted" as const,
   };
+  if (!Array.isArray(rows)) throw new JmRequestError("收藏夹资料读取不完整，请重试");
+  const ids = new Set<number>();
+  for (const row of rows) {
+    const item = toStringMap(row);
+    const id = optionalJmCount(item.FID);
+    const name = typeof item.name === "string" ? item.name.trim() : "";
+    if (id === null || ids.has(id) || (id !== 0 && !name)) {
+      throw new JmRequestError("收藏夹资料读取不完整，请重试");
+    }
+    ids.add(id);
+    if (id !== 0) items.push({ id: String(id), name });
+  }
+  return { items, kind: "list" as const };
+}
+
+function jmSelectedFavoriteIds(payload: JmFavoriteFolderPayload) {
+  if (payload.comicIds !== undefined && !Array.isArray(payload.comicIds)) {
+    throw new JmRequestError("作品编号无效");
+  }
+  const selected = payload.comicIds ?? (payload.comicId === undefined ? [] : [payload.comicId]);
+  const ids = Array.from(selected, optionalJmCount);
+  if (ids.some((id) => !id)) throw new JmRequestError("作品编号无效");
+  return [...new Set(ids.map(String))];
+}
+
+function jmFavoriteFolderId(value: unknown) {
+  const id = optionalJmCount(value);
+  if (!id) throw new JmRequestError("收藏夹编号无效");
+  return String(id);
+}
+
+function isJmFolderTransportFailure(error: unknown) {
+  return axios.isAxiosError(error) && !error.response && (isTransientError(error) ||
+    (error.name === "TypeError" &&
+      /^(?:Failed to (?:send HTTP request|parse HTTP response headers|read HTTP response body bytes)|发送 HTTP 请求失败|解析 HTTP 响应头失败|读取 HTTP 响应体字节失败)/i.test(error.message)));
+}
+
+async function writeJmFavoriteFolder(
+  request: JmFavoriteRequest,
+  type: "add" | "edit" | "del" | "move",
+  folderId: string,
+  folderName: string,
+  comicIds: string[] = [],
+) {
+  let reply: unknown;
+  try {
+    reply = await request("/favorite_folder", {
+      method: "POST",
+      multipartForm: true,
+      formData: {
+        type, folder_id: folderId, folder_name: folderName, aid: comicIds.join(","),
+      },
+    });
+  } catch (error) {
+    // A dropped response can follow a committed write. Check only state and
+    // never resend the form. Cancellations and explicit refusals still fail.
+    if (!isJmFolderTransportFailure(error)) throw error;
+    return false;
+  }
+  const root = toStringMap(reply);
+  const body = toStringMap(root.data);
+  const status = "status" in body ? body.status : root.status;
+  const canVerifyWithoutReceipt = type !== "del" && status === undefined &&
+    !resolveServerMessage(body, "") && !resolveServerMessage(root, "");
+  // A missing receipt can be resolved by the verified directory or membership.
+  // An explicit refusal never proceeds to readback.
+  if (status !== "ok" && !canVerifyWithoutReceipt) {
+    throw new JmRequestError("禁漫未确认收藏夹操作，请打开收藏夹查看");
+  }
+  return status === "ok";
+}
+
+async function verifyJmFavoriteFolderMembership(
+  request: JmFavoriteRequest,
+  folderId: string,
+  comicIds: string[],
+) {
+  const pending = new Set(comicIds);
+  const seen = new Set<string>();
+  // Moving may preserve the original favorite timestamp. Follow the server's
+  // pagination until the exact selection is confirmed or the read budget ends.
+  const deadline = Date.now() + 15_000;
+  for (let page = 1; pending.size > 0 && page <= 50 && Date.now() < deadline; page++) {
+    const result = await request("/favorite", {
+      method: "GET", params: { page, folder_id: folderId, o: "mr" },
+    });
+    const feed = readJmFavoriteFeed(toStringMap(result), page, folderId);
+    if (!feed) break;
+    const previousSize = seen.size;
+    for (const row of feed.list) {
+      const id = String(optionalJmCount(toStringMap(row).id));
+      seen.add(id);
+      pending.delete(id);
+    }
+    if (seen.size === previousSize ||
+        (feed.total === null ? feed.list.length < 20 : page * 20 >= feed.total)) break;
+  }
+  return pending.size === 0;
 }
 
 async function moveFavoriteToFolder(payload: JmFavoriteFolderPayload = {}) {
-  const comicId = String(payload.comicId ?? "").trim();
-  const folderId = String(payload.folderId ?? "").trim();
-  const folderName = String(payload.folderName ?? "").trim();
-  const id = optionalJmCount(comicId);
-  const target = optionalJmCount(folderId);
-  if (!id || !target) {
+  const comicIds = jmSelectedFavoriteIds(payload);
+  const folderId = jmFavoriteFolderId(payload.folderId);
+  if (comicIds.length === 0) {
     throw new Error("作品或收藏夹编号无效");
   }
-
-  const request = await openJmFavoriteRequest(payload);
-  await request("/favorite_folder", {
-    method: "POST",
-    formData: {
-      type: "move",
-      folder_id: folderId,
-      folder_name: folderName,
-      aid: comicId,
-    },
+  const folderName = typeof payload.folderName === "string" ? payload.folderName.trim() : "";
+  return runJmFavoriteFolderChange(payload, async (request) => {
+    await writeJmFavoriteFolder(request, "move", folderId, folderName, comicIds);
+    if (!await verifyJmFavoriteFolderMembership(request, folderId, comicIds)) {
+      throw new JmRequestError("暂时无法确认已移入收藏夹，请打开目标收藏夹查看");
+    }
+    return { ok: true };
   });
+}
 
-  // The move response has no known receipt identifying both work and folder.
-  // Look for positive membership in the selected folder with bounded reads.
-  for (let page = 1; page <= 2; page++) {
-    const result = toStringMap(await request("/favorite", {
-      method: "GET", params: { page, folder_id: folderId, o: "mr" },
-    }));
-    const folder = Array.isArray(result.list) ? result : toStringMap(result.data);
-    const rows = folder.list;
-    if (!Array.isArray(rows)) break;
-    if (rows.some((row) => optionalJmCount(toStringMap(row).id) === id)) return { ok: true };
-    const total = optionalJmCount(folder.total);
-    if (rows.length < 20 || (total !== null && total <= page * 20)) break;
+const pendingJmFolderChanges = new Set<number>();
+type JmFavoriteFolders = Awaited<ReturnType<typeof readJmFavoriteFolders>>;
+type JmFolderDirectoryScope = { revision: number; serial: number; base: string };
+type JmFolderDirectory = JmFolderDirectoryScope & {
+  request: JmFavoriteRequest;
+  before: JmFavoriteFolders;
+  checkedAt: number;
+};
+let jmFolderChangeSerial = 0;
+let jmFolderDirectoryRead: (JmFolderDirectoryScope & {
+  readScope?: string;
+  task: Promise<JmFolderDirectory>;
+}) | undefined;
+let jmFolderDirectory: JmFolderDirectory | undefined;
+let jmFolderPreflight: {
+  id: string;
+  folderId: string;
+  directory: JmFolderDirectory;
+} | undefined;
+const jmFolderPreflightMaxAgeMs = 5000;
+const jmFolderDirectoryMaxAgeMs = 15000;
+
+function jmFolderDirectoryScope(): JmFolderDirectoryScope {
+  return { revision: currentSessionRevision(), serial: jmFolderChangeSerial, base: Config.baseUrl };
+}
+
+function sameJmFolderScope(a: JmFolderDirectoryScope | undefined, b: JmFolderDirectoryScope) {
+  return a !== undefined && a.revision === b.revision && a.serial === b.serial && a.base === b.base;
+}
+
+function recentJmFolderDirectory(current: JmFolderDirectoryScope, maxAge: number) {
+  const cached = jmFolderDirectory;
+  if (!cached || !sameJmFolderScope(cached, current)) return;
+  const age = Date.now() - cached.checkedAt;
+  if (age >= 0 && age <= maxAge) return cached;
+}
+
+function readJmFolderDirectory(reuseRecent: boolean, options: JmFolderReadOptions = {}) {
+  const scope = jmFolderDirectoryScope();
+  if (pendingJmFolderChanges.has(scope.revision)) {
+    // This read may overlap a write. Do not lend its directory to the next save.
+    return (async () => {
+      const request = await openJmFavoriteRequest({});
+      const before = await readJmFavoriteFolders(request, options);
+      return { ...scope, request, before, checkedAt: Date.now() };
+    })();
   }
-  throw new JmRequestError("暂时无法确认已移入收藏夹，请打开目标收藏夹查看");
+  const cached = reuseRecent ? recentJmFolderDirectory(scope, jmFolderDirectoryMaxAgeMs) : undefined;
+  if (cached) return cached.request.assertActive().then(() => cached);
+  const pending = jmFolderDirectoryRead;
+  if (!options.freshRead && pending && pending.readScope === options.readScope &&
+      sameJmFolderScope(pending, scope)) return pending.task;
+  const task = openJmFavoriteRequest({}).then(async (request) => {
+    const before = await readJmFavoriteFolders(request, options);
+    const directory = { ...scope, request, before, checkedAt: Date.now() };
+    if (before.kind !== "omitted" && jmFolderDirectoryRead?.task === task &&
+        sameJmFolderScope(scope, jmFolderDirectoryScope())) {
+      jmFolderDirectory = directory;
+    }
+    return directory;
+  }).finally(() => {
+    if (jmFolderDirectoryRead?.task === task) jmFolderDirectoryRead = undefined;
+  });
+  jmFolderDirectoryRead = { ...scope, readScope: options.readScope, task };
+  return task;
+}
+
+async function prepareJmFavoriteFolderChange(payload: { folderId?: string } = {}) {
+  const folderId = payload.folderId == null ? "" : jmFavoriteFolderId(payload.folderId);
+  const scope = jmFolderDirectoryScope();
+  if (pendingJmFolderChanges.has(scope.revision)) throw new JmRequestError("正在更新收藏夹，请稍后重试");
+  const directory = await readJmFolderDirectory(true);
+  const { before } = directory;
+  if (!sameJmFolderScope(scope, jmFolderDirectoryScope()) || before.kind === "omitted" ||
+      (folderId && !before.items.some((folder) => folder.id === folderId))) {
+    throw new JmRequestError("收藏夹资料读取不完整，请重试");
+  }
+  const id = hostRuntime.uuidv4();
+  jmFolderPreflight = { id, folderId, directory };
+  return { preflightId: id };
+}
+
+function jmFolderPreflightIsFresh(checkedAt: number) {
+  const age = Date.now() - checkedAt;
+  return age >= 0 && age <= jmFolderPreflightMaxAgeMs;
+}
+
+async function runJmFavoriteFolderChange<T>(
+  payload: JmFavoriteFolderPayload,
+  operation: (request: JmFavoriteRequest, before?: JmFavoriteFolders) => Promise<T>,
+  expectedFolderId?: string,
+) {
+  const scope = jmFolderDirectoryScope();
+  const { revision } = scope;
+  if (pendingJmFolderChanges.has(revision)) throw new JmRequestError("正在更新收藏夹，请稍后重试");
+  pendingJmFolderChanges.add(revision);
+  const prepared = jmFolderPreflight;
+  jmFolderPreflight = undefined;
+  const cached = recentJmFolderDirectory(scope, jmFolderDirectoryMaxAgeMs);
+  const pending = jmFolderDirectoryRead;
+  jmFolderChangeSerial++;
+  jmFolderDirectory = undefined;
+  try {
+    if (payload.useJwt !== false && !payload.jwtToken) {
+      if (prepared && payload.preflightId === prepared.id && expectedFolderId === prepared.folderId &&
+          sameJmFolderScope(prepared.directory, scope) && jmFolderPreflightIsFresh(prepared.directory.checkedAt)) {
+        const { request, before } = prepared.directory;
+        await request.assertActive();
+        if (jmFolderPreflightIsFresh(prepared.directory.checkedAt)) return await operation(request, before);
+      }
+      if (expectedFolderId !== undefined && payload.reportFolderFailure === true) {
+        const directory = cached ?? (pending && sameJmFolderScope(pending, scope) ? await pending.task : undefined);
+        if (directory && directory.before.kind !== "omitted") {
+          await directory.request.assertActive();
+          return await operation(directory.request, directory.before);
+        }
+      }
+    }
+    return await operation(await openJmFavoriteRequest(payload));
+  } finally {
+    pendingJmFolderChanges.delete(revision);
+  }
+}
+
+async function changeJmFavoriteFolder(
+  type: "add" | "edit" | "del",
+  payload: JmFavoriteFolderPayload,
+) {
+  const folderId = type === "add" ? "" : jmFavoriteFolderId(payload.folderId);
+  const folderName = typeof payload.folderName === "string" ? payload.folderName.trim() : "";
+  if (type !== "del" && !folderName) throw new JmRequestError("请输入收藏夹名称");
+  const comicIds = type === "add" ? jmSelectedFavoriteIds(payload) : [];
+  let attemptedWrite = false;
+  let folderCount: number | undefined;
+  return runJmFavoriteFolderChange(payload, async (request, prepared) => {
+    const { items: before, kind: beforeKind } = prepared ?? await readJmFavoriteFolders(request);
+    if (beforeKind === "list") folderCount = before.length;
+    const current = before.find((folder) => folder.id === folderId);
+    if (type !== "add" && !current) throw new JmRequestError("收藏夹已不存在，请刷新后重试");
+    const wantedName = folderName.normalize();
+    if (type === "edit" && current?.name.normalize() === wantedName) {
+      return { ok: true, folder: current, folders: before };
+    }
+    if (type !== "del" && before.some((folder) =>
+      folder.id !== folderId && folder.name.normalize() === wantedName)) {
+      throw new JmRequestError("已存在同名收藏夹");
+    }
+
+    attemptedWrite = true;
+    const acknowledged = await writeJmFavoriteFolder(
+      request, type, folderId, type === "del" ? current?.name ?? "" : folderName, comicIds,
+    );
+    const unconfirmed = "暂时无法确认收藏夹更新，请刷新收藏夹查看";
+    if (type === "del") {
+      const { items: after, kind: afterKind } = await readJmFavoriteFolders(request);
+      const lastFolderRemoved = acknowledged && before.length === 1 && afterKind === "null";
+      if ((!lastFolderRemoved && afterKind !== "list") || after.some((folder) => folder.id === folderId)) {
+        throw new JmRequestError(unconfirmed);
+      }
+      return { ok: true, folders: after };
+    }
+
+    if (!acknowledged && beforeKind === "omitted") {
+      throw new JmRequestError(unconfirmed);
+    }
+    // A replica can still return the directory from before the write.
+    // Give the same account and route a short window to publish the new state.
+    const deadline = Date.now() + 8500;
+    let confirmation: { folder: JmFavoriteFolders["items"][number]; folders: JmFavoriteFolders["items"] } | undefined;
+    for (const delay of [0, 550, 1100]) {
+      if (delay) await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      const remaining = deadline - Date.now();
+      if (remaining < 300) break;
+      try {
+        const { items: folders } = await readJmFavoriteFolders(request, {
+          folderReadbackTimeoutMs: Math.min(remaining, 3500),
+        });
+        const matching = folders.filter((folder) => folder.name.normalize() === wantedName);
+        if (!matching.length) continue;
+        const folder = matching[0]!;
+        if (matching.length !== 1 ||
+            (type === "edit" ? folder.id !== folderId : before.some((previous) => previous.id === folder.id))) break;
+        confirmation = { folder, folders };
+        break;
+      } catch (error) {
+        if ((!isTransientError(error) && !isJmFolderTransportFailure(error)) ||
+            (error instanceof JmRequestError && (error.status === 429 || error.retryAfter !== undefined))) throw error;
+      }
+    }
+    if (!confirmation) throw new JmRequestError(unconfirmed);
+    const { folder, folders: after } = confirmation;
+    if (comicIds.length === 0) return { ok: true, folder, folders: after };
+
+    // The server can create the folder without assigning the submitted works.
+    // Report the verified folder even if membership could not be read.
+    let membershipVerified = false;
+    try {
+      membershipVerified = await verifyJmFavoriteFolderMembership(request, folder.id, comicIds);
+    } catch (_) {
+      await request.assertActive();
+    }
+    return { ok: true, folder, folders: after, membershipVerified };
+  }, type === "del" ? undefined : folderId).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "";
+    if (payload.reportFolderFailure !== true || error instanceof SessionChangedError ||
+        message.startsWith('{"type":"unauthorized",')) throw error;
+    const reason = message === "收藏夹已达上限" ? "limit" :
+      message === "已存在同名收藏夹" ? "duplicate" :
+      message === "收藏夹已不存在，请刷新后重试" ? "missing" : "unavailable";
+    const phase = reason === "limit" ? "rejected" : attemptedWrite ? "unconfirmed" : "notSubmitted";
+    throw new Error(JSON.stringify({
+      type: "jm_folder_change", phase, reason,
+      ...(reason === "limit" && folderCount !== undefined ? { folderCount } : {}),
+    }));
+  });
+}
+
+async function createFavoriteFolder(payload: JmFavoriteFolderPayload = {}) {
+  return changeJmFavoriteFolder("add", payload);
+}
+
+async function renameFavoriteFolder(payload: JmFavoriteFolderPayload = {}) {
+  return changeJmFavoriteFolder("edit", payload);
+}
+
+async function deleteFavoriteFolder(payload: JmFavoriteFolderPayload = {}) {
+  return changeJmFavoriteFolder("del", payload);
 }
 
 function buildJmUserCover(photo: unknown): string {
@@ -4083,6 +4705,7 @@ async function getWeekRankingData(payload: JmWeekRankingPayload = {}) {
   const raw = await jmRequest({
     path,
     method: "GET",
+    readScope: payload.__breezeReadScope,
     params: { date, type, page },
     cache: payload.refresh !== true,
     useJwt: payload.useJwt ?? true,
@@ -4144,8 +4767,8 @@ async function selectDownloadChapter(payload: JmChapterPayload, chapterId: strin
   if (typeof apiSetting !== "string" || typeof imageSetting !== "string") {
     throw new Error("下载线路设置暂不可用，请重试");
   }
-  const apiPin = apiSetting.trim();
-  const imagePin = imageSetting.trim();
+  const apiPin = fixedJmEndpoint(apiSetting.trim());
+  const imagePin = fixedJmEndpoint(imageSetting.trim());
   if (apiPin && imagePin) return null;
   const requestedId = optionalJmCount(chapterId);
   if (!requestedId) throw new Error("下载章节编号无效");
@@ -4481,6 +5104,8 @@ export default {
   getUserProfileDetails,
   checkInToday,
   getCheckinStatus,
+  getJmAccountCollection,
+  setJmAccountCollection,
   getNotifications,
   getNotificationUnreadCount,
   markNotificationRead,
@@ -4511,12 +5136,17 @@ export default {
   getCommentFeed,
   postComment,
   postCommentReply,
-  toggleLike,
   toggleFavorite,
+  getSiteWatchHistory,
   listFavoriteFolders,
   moveFavoriteToFolder,
+  prepareJmFavoriteFolderChange,
+  createFavoriteFolder,
+  renameFavoriteFolder,
+  deleteFavoriteFolder,
   getWeekRankingData,
   searchComic,
+  getJmSearchDiscovery,
   getChapter,
   getReadSnapshot,
   fetchImageBytes,

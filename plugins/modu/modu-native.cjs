@@ -4,9 +4,45 @@
 function createCmsVideoPlugin(config) {
 const {id: ID, home: HOME, apis, pageSize, capabilities} = config;
 const cache = new Map();
+const detailReads = new Map();
+
+function beginDetailRead(ids) {
+  const owner = Symbol();
+  for (const id of ids) detailReads.set(id, owner);
+  return owner;
+}
+function rememberDetail(id, item, owner) {
+  if (detailReads.get(id) !== owner) return;
+  cache.delete(id);
+  cache.set(id, {at: Date.now(), item});
+  if (cache.size > 32) cache.delete(cache.keys().next().value);
+}
+function endDetailRead(ids, owner) {
+  for (const id of ids) {
+    if (detailReads.get(id) === owner) detailReads.delete(id);
+  }
+}
 let categoryCache = null;
 let categoryPending = null;
 const pageCache = new Map();
+const pageReads = new Map();
+let responseCacheEpoch = 0;
+
+async function syncResponseCache() {
+  let epoch;
+  try {
+    epoch = await globalThis.bridge?.call('cache.response_generation');
+  } catch { /* Older hosts omit generations. */ }
+  if (Number.isSafeInteger(epoch) && epoch > responseCacheEpoch) {
+    responseCacheEpoch = epoch;
+    cache.clear();
+    detailReads.clear();
+    pageCache.clear();
+    pageReads.clear();
+    categoryCache = categoryPending = null;
+  }
+  return responseCacheEpoch;
+}
 
 function text(value, limit = 500) {
   return (typeof value === 'string' || typeof value === 'number' ? String(value) : '')
@@ -124,42 +160,59 @@ function normalize(raw, detail = false) {
   };
 }
 async function request(params = {}) {
-  // Only source aliases whose current JSON identity was checked are configured.
-  // They are API failovers, never extra media lines.
-  for (let attempt = 0; attempt < Math.min(apis.length, 2); attempt++) {
-    const url = new URL(apis[attempt]);
-    for (const [key,value] of Object.entries(params)) {
-      if (value !== '' && value !== null && value !== undefined) url.searchParams.set(key,String(value));
+  // Aliases share a source and its backoff. They are never extra media lines.
+  const deadline = Date.now() + 15000;
+  let failure = new Error('资源接口暂不可用，请稍后重试');
+  for (const api of apis.slice(0, 2)) {
+    const remaining = Math.min(10000, deadline - Date.now());
+    if (remaining <= 0) break;
+    const url = new URL(api);
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== '' && value !== null && value !== undefined) url.searchParams.set(key, String(value));
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
+    const timer = setTimeout(() => controller.abort(), remaining);
     try {
-      const response = await fetch(url.href, {signal:controller.signal,timeout:10000,
-        headers:{Accept:'application/json,text/plain,*/*'}});
-      if (!response.ok) throw new Error('transport');
+      const response = await fetch(url.href, {signal: controller.signal, timeout: remaining,
+        headers: {Accept: 'application/json,text/plain,*/*'}});
+      if (!response.ok) {
+        const after = String(response.headers?.get?.('retry-after') ?? '').trim();
+        const safe = /^\d{1,10}$|^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(after);
+        failure = new Error(`HTTP ${response.status}${safe ? ` Retry-After: ${after}` : ''}`);
+        if (response.status === 429 || safe) break;
+        continue;
+      }
       const body = await response.text();
-      if (body.length > 2500000) throw new Error('size');
+      if (Date.now() >= deadline || controller.signal.aborted) {
+        failure = new Error('Network request timed out');
+        continue;
+      }
+      if (body.length > 2500000) continue;
       const json = JSON.parse(body);
-      if (integer(json.code) !== 1 || !Array.isArray(json.list)) throw new Error('shape');
-      return json;
+      if (integer(json.code) === 1 && Array.isArray(json.list)) return json;
     } catch (_) {
-      if (attempt + 1 >= Math.min(apis.length,2)) throw new Error('资源接口暂不可用，请稍后重试');
-    } finally { clearTimeout(timer); }
+      if (controller.signal.aborted) failure = new Error('Network request timed out');
+    } finally {
+      clearTimeout(timer);
+    }
   }
-  throw new Error('资源接口未配置');
+  throw failure;
 }
-async function categories() {
+async function categories(epoch) {
   if (categoryCache && Date.now() - categoryCache.at < 300000) return categoryCache.value;
   if (categoryPending) return categoryPending;
-  categoryPending = (async () => {
+  const pending = categoryPending = (async () => {
     const result = await request();
     const value = (Array.isArray(result.class) ? result.class : []).slice(0, 300).map(x => ({
       id: String(integer(x.type_id)), parentId: String(integer(x.type_pid)), name: text(x.type_name, 100),
     })).filter(x => x.id !== '0' && x.name);
     if (!value.length) throw new Error('暂时无法读取分类');
-    categoryCache = {at: Date.now(), value}; return value;
+    if (await syncResponseCache() === epoch) categoryCache = {at: Date.now(), value};
+    return value;
   })();
-  try { return await categoryPending; } finally { categoryPending = null; }
+  try { return await pending; } finally {
+    if (categoryPending === pending) categoryPending = null;
+  }
 }
 function normalizedPage(raw) {
   const items = [], seen = new Set();
@@ -198,7 +251,8 @@ async function getLibrary(args = {}) {
   const hours = args.recentHours === 24 ? 24 : '';
   if (typeId && !/^[1-9][0-9]*$/.test(typeId)) throw new Error('无效分类');
   if (year && !/^(19|20)[0-9]{2}$/.test(year)) throw new Error('无效年份');
-  const types = await categories();
+  const epoch = await syncResponseCache();
+  const types = await categories(epoch);
   if (query && ['none','website'].includes(capabilities.search)) throw new Error(capabilities.search==='website'?'请使用官网搜索入口':'源站不支持关键词检索，请使用分类与年份');
   if (typeId && !types.some(x => x.id === typeId)) throw new Error('分类已变更，请刷新');
   const leaves = typeId ? directTypes(types, typeId) : [];
@@ -229,9 +283,19 @@ async function getLibrary(args = {}) {
     const existing = pageCache.get(key);
     if (args.refresh !== true && existing && Date.now() - existing.at < 45000) stream.data = existing.data;
     else {
-      stream.data = normalizedPage(await request({ac:'detail',pg:stream.page,t:stream.type,year,wd:query,h:hours}));
-      pageCache.set(key,{at:Date.now(),data:stream.data});
-      if(pageCache.size>64)pageCache.delete(pageCache.keys().next().value);
+      const owner = Symbol();
+      pageReads.set(key, owner);
+      try {
+        stream.data = normalizedPage(await request({ac:'detail',pg:stream.page,t:stream.type,year,wd:query,h:hours}));
+        if (stream.data.page !== stream.page) throw new Error('资源分页返回不一致');
+        if (await syncResponseCache() === epoch && pageReads.get(key) === owner) {
+          pageCache.delete(key);
+          pageCache.set(key, {at: Date.now(), data: stream.data});
+          if (pageCache.size > 64) pageCache.delete(pageCache.keys().next().value);
+        }
+      } finally {
+        if (pageReads.get(key) === owner) pageReads.delete(key);
+      }
     }
     if(stream.data.page!==stream.page)throw new Error('资源分页返回不一致');
   }
@@ -241,9 +305,16 @@ async function getLibrary(args = {}) {
   while (output.length < pageSize) {
     if (++scanned > 2000) throw new Error('分类内容变化过多，请刷新');
     const exhausted = streams.filter(x=>x.offset>=x.data.items.length && x.page<x.data.pageCount);
-    if(exhausted.length)await mapLimit(exhausted,async x=>{x.page++;x.offset=0;await read(x);});
+    if (exhausted.length) {
+      await mapLimit(exhausted, async stream => {
+        stream.page++;
+        stream.offset = 0;
+        await read(stream);
+      });
+      continue;
+    }
     const candidates=streams.filter(x=>x.offset<x.data.items.length);
-    if(!candidates.length)break;
+    if (!candidates.length) break;
     candidates.sort((a,b)=>{
       const x=a.data.items[a.offset],y=b.data.items[b.offset];
       return y.updatedAt.localeCompare(x.updatedAt) || Number(y.id)-Number(x.id);
@@ -251,22 +322,31 @@ async function getLibrary(args = {}) {
     const stream=candidates[0],item=stream.data.items[stream.offset++];
     if(!seen.has(item.id)){seen.add(item.id);output.push(item);}
   }
-  return {source:ID,data:{items:output,categories:types,page,pageCount:Math.ceil(total/pageSize),total,
-    nextCursor:{version:1,signature,page,streams:streams.map(x=>({type:x.type,page:x.page,offset:x.offset})),seen:[...seen]}}};
+  const hasMore = streams.some(x=>x.offset<x.data.items.length || x.page<x.data.pageCount);
+  return {source:ID,data:{items:output,categories:types,page,
+    pageCount:hasMore ? Math.max(page + 1, Math.ceil(total/pageSize)) : page,
+    total:hasMore ? Math.max(total, seen.size) : seen.size, totalKnown:!hasMore,
+    nextCursor:hasMore ? {version:1,signature,page,streams:streams.map(x=>({type:x.type,page:x.page,offset:x.offset})),seen:[...seen]} : null}};
 }
 async function getItem(args = {}) {
   requireClient(args);
+  const epoch = await syncResponseCache();
   const id = itemId(args.id), existing = cache.get(id);
   if (args.refresh !== true && existing && Date.now() - existing.at < 60000) {
     return {source: ID, data: existing.item};
   }
-  const result = await request({ac: 'detail', ids: id});
-  const row = result.list.find(x => String(x.vod_id) === id);
-  if (!row) throw new Error('这部影片已不可用');
-  const item = normalize(row, true);
-  cache.set(id, {at: Date.now(), item});
-  if (cache.size > 32) cache.delete(cache.keys().next().value);
-  return {source: ID, data: item};
+  if (args.refresh === true) cache.delete(id);
+  const owner = beginDetailRead([id]);
+  try {
+    const result = await request({ac: 'detail', ids: id});
+    const row = result.list.find(x => String(x.vod_id) === id);
+    if (!row) throw new Error('这部影片已不可用');
+    const item = normalize(row, true);
+    if (await syncResponseCache() === epoch) rememberDetail(id, item, owner);
+    return {source: ID, data: item};
+  } finally {
+    endDetailRead([id], owner);
+  }
 }
 async function getSession(args = {}) {
   const {data: item} = await getItem({clientProtocol:args.clientProtocol,id: args.id, refresh: args.refresh === true});
@@ -281,19 +361,32 @@ async function getItems(args = {}) {
   requireClient(args);
   if (!Array.isArray(args.ids) || !args.ids.length || args.ids.length > 20) throw new Error('每次可检查1至20部影片');
   const ids = [...new Set(args.ids.map(itemId))];
-  const raw = await request({ac:'detail',ids:ids.join(',')});
-  const items = [], seen = new Set();
-  for (const row of raw.list) {
-    if (!ids.includes(String(row.vod_id)) || seen.has(String(row.vod_id))) continue;
-    const item = normalize(row, true); seen.add(item.id); items.push(item);
-    cache.set(item.id, {at:Date.now(),item});
+  const epoch = await syncResponseCache();
+  const owner = beginDetailRead(ids);
+  try {
+    const raw = await request({ac: 'detail', ids: ids.join(',')});
+    const mayRemember = await syncResponseCache() === epoch;
+    const items = [], seen = new Set();
+    for (const row of raw.list) {
+      if (!ids.includes(String(row.vod_id)) || seen.has(String(row.vod_id))) continue;
+      const item = normalize(row, true);
+      seen.add(item.id);
+      items.push(item);
+      if (mayRemember) rememberDetail(item.id, item, owner);
+    }
+    return {source: ID, data: {items, missingIds: ids.filter(id => !seen.has(id))}};
+  } finally {
+    endDetailRead(ids, owner);
   }
-  while (cache.size > 32) cache.delete(cache.keys().next().value);
-  return {source:ID,data:{items,missingIds:ids.filter(id=>!seen.has(id))}};
 }
 function getInfo() {
+  const distribution = config.releaseSeries === 1
+    ? {releaseSeries: 1, npmName: '', requirements: {version: 1, capabilities: {videoLibraryProtocol: 2}}}
+    : {};
+  const updatePath = config.releaseSeries === 1 ? `v1/${config.key}.json` : `${config.key}.json`;
   return {name:config.name,uuid:ID,version:config.version,home:'https://github.com/kl5212840-lang/Breeze-plugins',
-    websiteUrl:HOME,iconUrl:config.iconUrl,updateUrl:`https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/${config.key}.json`,
+    websiteUrl:HOME,iconUrl:config.iconUrl,updateUrl:`https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/${updatePath}`,
+    ...distribution,
     describe:config.description,
     function:[{id:'library',title:'片库',action:{type:'openVideoLibrary',payload:{
       source:ID,title:config.name,url:HOME,protocol:2,nativeSearch:capabilities.search !== 'none',capabilities,
@@ -307,7 +400,7 @@ return {getInfo,getLibrary,getItem,getItems,getSession,getSettingsBundle};
 }
 
 
-const config = {"key":"modu","id":"b27083a4-a643-462a-8204-e6f42c19a5b9","name":"魔都资源","version":"0.1.3","home":"https://www.mdzyapi.com/","apis":["https://www.mdzyapi.com/api.php/provide/vod/"],"pageSize":20,"capabilities":{"search":"full","year":true,"recent":true},"iconUrl":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAIKADAAQAAAABAAAAIAAAAACshmLzAAAFDklEQVRYCe2WS2gdVRjHv5k8mtYQ02ollBKKIAqFIlVc+ciiEbXFoi60VTQFK7pQF8GKhBhEK6VSiaikIKUQFz4LDYRSRFC6iFXaNCKUtoi6kBBsjdcQYm5y5xx/35k5M3Nfyd3rwJ/vvOb8/9/jnBmR//oTNByASStipVsi6QG3gFCM/ColmaB9SXoD0/BeuYWNCZiyzZC9BF6BrAtIDvOIGGXuoDwYTOf2bqi5uoAfbQebHwcPQ6RCBCvOqhBtx4J+we4LS9YExvZKZLcEkW0NIztD+wvaZ4vPtlVFaXUBU1Y9fy/ncZ7UkzsbRDKvpEFkgAgWWMC4se/QPvTP82uXkJw+Ydqq1Ziy3ZC/mnrrQ69+VEArAJJ20Jq06etYMh7ZQeaeqqRZWYCRXRBtct5XEFYKEEOR5gCZ66tN0EwEhq4bnu/Mi6gv4LwNqfp7qokS7zUaiSgX5ozIEZL32KaidL3dTET25gU05ztlbUPBCd7X8xwHdc6F2Mpv2B/AT4B8S3tgZSv2LnAzcGKwIdHo7Tg8d3TuQIfu7EjUlj/n8J4XwWYnIOdtWTEaOSvWHiRSEzaQQrhs9ASEFJ1hXMk6we3gZbAL6NgW0AbhgpJWp+C8Xcf4ATb9PhERh7q8ACGQ02CnfSQch7itqWj2cqSOMzYWWHuM49dHajrAt+Ax8CIoQK7HWgW4pzwFk0xa+YwFO7Dxma+dAjyXPU3FqCCflp4gt0fwuAuLh+zr8i597HMNnKQ/wPqjkF8hgh8iUJ2cVQVZBCZd0emZfwA0p5WfD78XoyJ3BwXev5tcfwTppji/aa415xrum8BzrDmB95wm+zX9fqDc7skEiGxDZT/kccjr20U2ONn0SQkS2Y13evaTIqtjI3sva8aQp4JOwZNe2ZkAI49D3rmaADaYY820u0IpJiWPQ24L2GFQSvqVorZTF0//NbTeKJIA5FJgpMeR+2Lz1keCfny9ShsbtSuJekUUZrXqsV8S5jdo/5ysSyPJXNK2/RsGZ+tcRFqZ6UJeSM65F6WbqLdAye8vPdlCWzSnt1KAW3njBQRoRNZRZH6ts4lYbWsKelibPvkUnEsLT4VoBPI2CzXn3L7WMrrUtfRMqxT3rbnGV+5SWIxU0BAE3czHAtyHiHZmtTDvSNlpZMcwkjEI+0DV8eOleMPM6uXyzZpjiwN8fi9CwEfL7idqjzrRabTSqKk4B+bTO0CFZAIIJ5NfgYf8Jmr9izXsbYydgHQJNNNW71Kh8R5aoLA4xMXKmstK7J8sBfcFi4R9kMUz/iUtJpc/H9IcQY6Mz6878yl5bq5y7A/2Pu3J1WYCtLcjmGTBToRcjGsgzh9F5oToF64KiagGhOr1PXj1yMbflco/5QJ01IiK0F/MQ2AKzLhjpsfQpwQdrp1YFat9CJJw0/djxh3RafZ8m9MxqhT5Z8VfsvDzKAxLRq/ZCxTajblqzipbI1BKch/bCdadYUyP3ALtC9hTVw9vnMkT+/aKAnRRy8fLeq6/Y6NtGn4uoYy8uj1PFPYUBjvHuXBE74M/37rBc9W02SmoOc0gXoD3wQiecESJcwVc+A3/x4YiFjuuW82+uaHejmXj1TVQNi2yzGXD12wUknfBgpJVAkHTeKvkHxReX1+xw8rdVVPgX187sqBCtpOK/eBOcqxfQQrUnsHzkb8Hrq+ZY/9+PduwAL9B+/C8Vrre+Xr+F/m3K/vP9+v+t41G4F+SZd7nf/BxpAAAAABJRU5ErkJggg==","lineLabels":{"aosika":"奥斯卡","mdu":"魔都","modu":"魔都"},"description":"分类片库、详情与原生播放，本机收藏与续播。需配套支持视频协议 2 的 Breeze。","iconSourceUrl":"https://www.mdzyapi.com/favicon.ico"};
+const config = {"key":"modu","id":"b27083a4-a643-462a-8204-e6f42c19a5b9","name":"魔都资源","version":"0.1.2","releaseSeries":1,"home":"https://www.mdzyapi.com/","apis":["https://www.mdzyapi.com/api.php/provide/vod/"],"pageSize":20,"capabilities":{"search":"full","year":true,"recent":true},"iconUrl":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAIKADAAQAAAABAAAAIAAAAACshmLzAAAFDklEQVRYCe2WS2gdVRjHv5k8mtYQ02ollBKKIAqFIlVc+ciiEbXFoi60VTQFK7pQF8GKhBhEK6VSiaikIKUQFz4LDYRSRFC6iFXaNCKUtoi6kBBsjdcQYm5y5xx/35k5M3Nfyd3rwJ/vvOb8/9/jnBmR//oTNByASStipVsi6QG3gFCM/ColmaB9SXoD0/BeuYWNCZiyzZC9BF6BrAtIDvOIGGXuoDwYTOf2bqi5uoAfbQebHwcPQ6RCBCvOqhBtx4J+we4LS9YExvZKZLcEkW0NIztD+wvaZ4vPtlVFaXUBU1Y9fy/ncZ7UkzsbRDKvpEFkgAgWWMC4se/QPvTP82uXkJw+Ydqq1Ziy3ZC/mnrrQ69+VEArAJJ20Jq06etYMh7ZQeaeqqRZWYCRXRBtct5XEFYKEEOR5gCZ66tN0EwEhq4bnu/Mi6gv4LwNqfp7qokS7zUaiSgX5ozIEZL32KaidL3dTET25gU05ztlbUPBCd7X8xwHdc6F2Mpv2B/AT4B8S3tgZSv2LnAzcGKwIdHo7Tg8d3TuQIfu7EjUlj/n8J4XwWYnIOdtWTEaOSvWHiRSEzaQQrhs9ASEFJ1hXMk6we3gZbAL6NgW0AbhgpJWp+C8Xcf4ATb9PhERh7q8ACGQ02CnfSQch7itqWj2cqSOMzYWWHuM49dHajrAt+Ax8CIoQK7HWgW4pzwFk0xa+YwFO7Dxma+dAjyXPU3FqCCflp4gt0fwuAuLh+zr8i597HMNnKQ/wPqjkF8hgh8iUJ2cVQVZBCZd0emZfwA0p5WfD78XoyJ3BwXev5tcfwTppji/aa415xrum8BzrDmB95wm+zX9fqDc7skEiGxDZT/kccjr20U2ONn0SQkS2Y13evaTIqtjI3sva8aQp4JOwZNe2ZkAI49D3rmaADaYY820u0IpJiWPQ24L2GFQSvqVorZTF0//NbTeKJIA5FJgpMeR+2Lz1keCfny9ShsbtSuJekUUZrXqsV8S5jdo/5ysSyPJXNK2/RsGZ+tcRFqZ6UJeSM65F6WbqLdAye8vPdlCWzSnt1KAW3njBQRoRNZRZH6ts4lYbWsKelibPvkUnEsLT4VoBPI2CzXn3L7WMrrUtfRMqxT3rbnGV+5SWIxU0BAE3czHAtyHiHZmtTDvSNlpZMcwkjEI+0DV8eOleMPM6uXyzZpjiwN8fi9CwEfL7idqjzrRabTSqKk4B+bTO0CFZAIIJ5NfgYf8Jmr9izXsbYydgHQJNNNW71Kh8R5aoLA4xMXKmstK7J8sBfcFi4R9kMUz/iUtJpc/H9IcQY6Mz6878yl5bq5y7A/2Pu3J1WYCtLcjmGTBToRcjGsgzh9F5oToF64KiagGhOr1PXj1yMbflco/5QJ01IiK0F/MQ2AKzLhjpsfQpwQdrp1YFat9CJJw0/djxh3RafZ8m9MxqhT5Z8VfsvDzKAxLRq/ZCxTajblqzipbI1BKch/bCdadYUyP3ALtC9hTVw9vnMkT+/aKAnRRy8fLeq6/Y6NtGn4uoYy8uj1PFPYUBjvHuXBE74M/37rBc9W02SmoOc0gXoD3wQiecESJcwVc+A3/x4YiFjuuW82+uaHejmXj1TVQNi2yzGXD12wUknfBgpJVAkHTeKvkHxReX1+xw8rdVVPgX187sqBCtpOK/eBOcqxfQQrUnsHzkb8Hrq+ZY/9+PduwAL9B+/C8Vrre+Xr+F/m3K/vP9+v+t41G4F+SZd7nf/BxpAAAAABJRU5ErkJggg==","lineLabels":{"aosika":"奥斯卡","mdu":"魔都","modu":"魔都"},"description":"分类片库、详情与原生播放，本机收藏与续播。需配套支持视频协议 2 的 Breeze。","iconSourceUrl":"https://www.mdzyapi.com/favicon.ico"};
 config.detailPath = id => `/vod/${id}/`;
 config.webPlayback = (_id,_sid,_nid,url) => ['https://www.modujiexi66.com/?url='+url];
 module.exports = createCmsVideoPlugin(config);

@@ -3,6 +3,7 @@ export type BikaRequestPayload = {
   method?: string;
   /** Per-read budget for optional follow-up requests. */
   timeoutMs?: number;
+  readScope?: string;
   body?: unknown;
   cache?: boolean;
   /** Internal response shape, relative to the upstream data object. */
@@ -21,10 +22,12 @@ export type BikaRequestPayload = {
 
 export type ComicDetailPayload = {
   comicId?: string;
+  refresh?: boolean;
   extern?: Record<string, unknown>;
 };
 
 export type BikaSearchPayload = {
+  __breezeReadScope?: string;
   keyword?: string;
   page?: number;
   extern?: Record<string, unknown>;
@@ -43,12 +46,14 @@ export type BikaReadSnapshotPayload = {
 };
 
 export type BikaHomePayload = {
+  __breezeReadScope?: string;
   refresh?: boolean;
   extern?: Record<string, unknown>;
   imageQuality?: string;
 };
 
 export type BikaRankingPayload = {
+  __breezeReadScope?: string;
   refresh?: boolean;
   days?: string;
   type?: string;
@@ -70,6 +75,7 @@ export type BikaLoginPayload = {
 };
 
 export type BikaFavoritePayload = {
+  __breezeReadScope?: string;
   page?: number;
   extern?: Record<string, unknown>;
   imageQuality?: string;

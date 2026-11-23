@@ -212,6 +212,23 @@ test("reported page count takes precedence over a stale chapter count", async ()
   );
 });
 
+test("manual detail refresh bypasses the chapter page cache and stores the new directory", async () => {
+  chapterCount = 40;
+  const first = await getComicDetail({ comicId: "offline-comic" });
+  assert.equal(first.data.normal.eps.length, 40);
+  chapterCount = 41;
+  reportedPages = 2;
+  requested.length = 0;
+  const fresh = await getComicDetail({ comicId: "offline-comic", refresh: true });
+  assert.equal(fresh.data.normal.eps.length, 41);
+  assert.deepEqual(requested.filter(url => url.includes("/eps?")), [
+    "/comics/offline-comic/eps?page=1",
+    "/comics/offline-comic/eps?page=2",
+  ]);
+  const reused = await getComicDetail({ comicId: "offline-comic" });
+  assert.equal(reused.data.normal.eps.length, 41);
+});
+
 test("chapter metadata discovers later pages when detail count is missing", async () => {
   chapterCount = 41;
   detailChapterCount = 0;

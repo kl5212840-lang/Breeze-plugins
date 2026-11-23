@@ -1,23 +1,5 @@
 import type { InternalAxiosRequestConfig } from "axios";
 
-export type JmLikeStage = {
-  http?: number;
-  result: "login-required" | "http-rejected" | "business-rejected" | "unreadable" | "readable" | "transport";
-};
-
-export type JmLikeDiagnostic = {
-  submit?: JmLikeStage;
-  readback?: JmLikeStage;
-  verify?: {
-    result: "confirmed" | "unconfirmed";
-    work: "match" | "mismatch" | "unknown";
-    likedType: string;
-    liked: "true" | "false" | "unknown";
-    total: "present" | "invalid" | "missing";
-    totalChange: "changed" | "unchanged" | "unknown";
-  };
-};
-
 export type RequestPayload = {
   path?: string;
   url?: string;
@@ -25,12 +7,14 @@ export type RequestPayload = {
   params?: Record<string, unknown>;
   data?: unknown;
   formData?: Record<string, unknown>;
+  multipartForm?: boolean;
   cache?: boolean;
   comicFollow?: boolean;
-  comicLike?: boolean;
-  likeDiagnostic?: () => JmLikeDiagnostic;
   comicFavorite?: boolean;
+  folderReadbackTimeoutMs?: number;
+  freshRead?: boolean;
   readOnlyProfile?: boolean;
+  readScope?: string;
   useJwt?: boolean;
   jwtToken?: string;
 };
@@ -40,12 +24,12 @@ export type JmMeta = {
   cacheEnabled: boolean;
   cacheKey?: string;
   comicFollow?: boolean;
-  comicLike?: boolean;
-  likeDiagnostic?: () => JmLikeDiagnostic;
   comicFavorite?: boolean;
+  favoriteFolderCreate?: boolean;
   readOnlyProfile?: boolean;
   useJwt: boolean;
   requestJwt?: string;
+  assertScopedRequest?: () => Promise<void>;
   fromCache?: boolean;
   sessionRevision?: number;
 };

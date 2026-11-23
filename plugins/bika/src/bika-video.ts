@@ -1,5 +1,6 @@
 /** Public bidobido video modules. Never use the authenticated comic client here. */
 import { BIKA_PLUGIN_ID as SOURCE } from "./bika-identity";
+import { httpFailureEvidence, safeRetryAfter } from "../../shared/transient-retry";
 const HOMES = {
   movie: "https://adult-movie.bidobido.xyz/",
   animate: "https://adult-animate.bidobido.xyz/",
@@ -130,7 +131,9 @@ async function readPublic(url: string): Promise<unknown> {
     headers: { Accept: "application/json" },
     timeout: 10000,
   } as RequestInit);
-  if (!response.ok) throw new Error("视频接口暂不可用");
+  if (!response.ok) {
+    throw new Error(httpFailureEvidence(response.status, safeRetryAfter(response.headers.get("retry-after"))));
+  }
   const body = await response.text();
   if (body.length > 2500000) throw new Error("视频数据过大");
   return JSON.parse(body);

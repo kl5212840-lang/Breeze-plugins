@@ -12,26 +12,14 @@ import {
   assertCurrentSession,
   currentSessionRevision,
 } from "./state";
-import type { JmLikeDiagnostic, JmLikeStage, JmMeta, JmRequestConfig } from "./types";
+import type { JmMeta, JmRequestConfig } from "./types";
 import { getHost, md5Hex, nowTs } from "./utils";
+import { httpFailureEvidence, safeRetryAfter } from "../../shared/transient-retry";
 
 const JM_PLUGIN_ID = "6886291b-f524-441c-844b-c2efae9899a9";
 
 export function buildUnauthorizedError(message = "登录过期，请重新登录"): Error {
   return new Error(JSON.stringify({ type: "unauthorized", source: JM_PLUGIN_ID, message }));
-}
-
-export class JmLikeUnconfirmedError extends JmRequestError {
-  constructor(diagnostic?: JmLikeDiagnostic) {
-    const message = "暂时无法确认点赞状态，请重新打开作品详情查看";
-    super(diagnostic ? JSON.stringify({ type: "comic_like_unconfirmed", message, diagnostic }) : message);
-  }
-}
-
-export class JmLikeRejectedError extends JmRequestError {
-  constructor(message: string, diagnostic?: JmLikeDiagnostic) {
-    super(JSON.stringify({ type: "comic_like_rejected", message, diagnostic }));
-  }
 }
 
 function isLoginRequest(url: unknown): boolean {
@@ -63,45 +51,6 @@ export function hasJmMembershipGate(decoded: unknown): boolean {
   });
 }
 
-export function recordJmLikeStage(
-  diagnostic: JmLikeDiagnostic | undefined,
-  stage: "submit" | "readback",
-  result: JmLikeStage["result"],
-  status?: number,
-) {
-  const http = status !== undefined && Number.isInteger(status) && status >= 100 && status <= 599
-    ? status : undefined;
-  if (diagnostic) diagnostic[stage] = { http, result };
-  const line = `[jm.like] ${stage} http=${http ?? "unknown"} result=${result}`;
-  if (result === "readable") console.info(line);
-  else console.warn(line);
-}
-
-function validateJmLikeResponse(envelope: unknown, decoded: unknown, status: number, method: string, diagnostic?: JmLikeDiagnostic) {
-  const levels = [envelope, decoded, (decoded as { data?: unknown } | null)?.data];
-  const messages = levels.map((level) => resolveServerMessage(level, ""));
-  const stage = method === "GET" ? "readback" : "submit";
-  const httpRejected = status < 200 || status >= 300;
-  if (status === 401 || levels.some(hasJmMembershipGate) ||
-      levels.some((level) => Number((level as { code?: unknown } | null)?.code) === 401)) {
-    recordJmLikeStage(diagnostic, stage, "login-required", status);
-    throw buildUnauthorizedError();
-  }
-  if (httpRejected || levels.some(jmRejectedResponse)) {
-    const result = httpRejected ? "http-rejected" : "business-rejected";
-    recordJmLikeStage(diagnostic, stage, result, status);
-    if (method === "GET") throw new JmLikeUnconfirmedError(diagnostic);
-    const fallback = httpRejected ? `服务器响应异常 (${status || "unknown"})` : "点赞未成功";
-    const message = messages.find((message) => message) || fallback;
-    throw diagnostic ? new JmLikeRejectedError(message, diagnostic) : new JmRequestError(message);
-  }
-  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
-    recordJmLikeStage(diagnostic, stage, "unreadable", status);
-    throw new JmLikeUnconfirmedError(diagnostic);
-  }
-  recordJmLikeStage(diagnostic, stage, "readable", status);
-}
-
 function jmRejectedResponse(level: unknown) {
   if (level === false) return true;
   if (!level || typeof level !== "object" || Array.isArray(level)) return false;
@@ -112,16 +61,44 @@ function jmRejectedResponse(level: unknown) {
     ok === false || success === false;
 }
 
-function validateJmFavoriteResponse(envelope: unknown, decoded: unknown, status: number) {
+function validateJmFavoriteResponse(
+  envelope: unknown,
+  decoded: unknown,
+  status: number,
+  reading: boolean,
+  creatingFolder: boolean,
+  retryAfter?: string,
+) {
   const levels = [envelope, decoded, (decoded as { data?: unknown } | null)?.data];
   if (status === 401 || levels.some(hasJmMembershipGate) ||
       levels.some((level) => Number((level as { code?: unknown } | null)?.code) === 401)) {
     throw buildUnauthorizedError();
   }
-  if (levels.some((level) => /已[满滿]/.test(resolveServerMessage(level, "")))) {
+  const rejected = status < 200 || status >= 300 || levels.some(jmRejectedResponse);
+  if (creatingFolder && rejected && levels.some((level) => {
+    const message = resolveServerMessage(level, "");
+    return /(?:[资資]料|收藏|文件)[夹夾]/.test(message) &&
+      /已[满滿]|上限|最多|限[额額]/.test(message) &&
+      !/名称|名稱|名字|字数|字數|字元|字符/.test(message);
+  })) {
+    throw new JmRequestError("收藏夹已达上限");
+  }
+  if (!reading && levels.some((level) => /已[满滿]/.test(resolveServerMessage(level, "")))) {
     throw new JmRequestError("收藏数已达上限");
   }
-  if (status < 200 || status >= 300 || levels.some(jmRejectedResponse)) {
+  if (rejected) {
+    if (reading) {
+      const code = status >= 400 && status < 600 ? status : levels
+        .map((level) => Number((level as { code?: unknown } | null)?.code))
+        .find((code) => Number.isInteger(code) && code >= 400 && code < 600);
+      if (code !== undefined) {
+        // The host owns bounded, visibility-aware read recovery. Keep status
+        // evidence for it, without exposing a response body or retrying writes.
+        throw new JmRequestError(httpFailureEvidence(code, retryAfter),
+          code === 408 || code === 425 || code === 429 || code >= 500, code, retryAfter);
+      }
+      throw new JmRequestError("Invalid response");
+    }
     throw new JmRequestError("禁漫未确认收藏操作，请重新打开作品查看");
   }
 }
@@ -140,24 +117,19 @@ export function createJmClient() {
     const revision = meta?.sessionRevision ?? currentSessionRevision();
     assertCurrentSession(revision);
 
-    const envelope = meta?.comicLike || meta?.comicFavorite ? await readJmJsonEnvelope(response.data) : null;
+    const envelope = meta?.comicFavorite ? await readJmJsonEnvelope(response.data) : null;
     const decoded = await decodeResponsePayload(
       envelope ?? response.data,
       meta?.ts || nowTs(),
     );
     const status = Number(response.status || 0);
+    const retryAfter = safeRetryAfter(response.headers?.["retry-after"]);
     assertCurrentSession(revision);
 
-    if (meta?.comicLike) {
-      // Decrypting string data can discard outer error fields. Check both
-      // layers without importing a returned token into the current session.
-      validateJmLikeResponse(envelope, decoded, status, String(cfg.method).toUpperCase(), meta.likeDiagnostic?.());
-      response.data = decoded;
-      return response;
-    }
-
     if (meta?.comicFavorite) {
-      validateJmFavoriteResponse(envelope, decoded, status);
+      validateJmFavoriteResponse(
+        envelope, decoded, status, String(cfg.method).toUpperCase() === "GET", meta.favoriteFolderCreate === true, retryAfter,
+      );
       response.data = decoded;
       return response;
     }
@@ -185,18 +157,21 @@ export function createJmClient() {
         decoded,
         `服务器响应异常 (${status || "unknown"})`,
       );
+      if (status === 408 || status === 425 || status === 429 || status >= 500) {
+        throw new JmRequestError(httpFailureEvidence(status, retryAfter), true, status, retryAfter);
+      }
       if (isLoginRequest(cfg.url)) {
         if (status === 401 || looksLikeCredentialError(serverMsg)) {
           throw new JmRequestError(serverMsg || "账号或密码错误");
         }
-        throw new JmRequestError(serverMsg || "登录失败", status === 429 || status >= 500);
+        throw new JmRequestError(serverMsg || "登录失败");
       }
       if (status === 401 || serverMsg === "請先登入會員") {
         const error = buildUnauthorizedError("登录过期，请重新登录");
         assertCurrentSession(revision);
         throw error;
       }
-      throw new JmRequestError(serverMsg, status === 429 || status >= 500);
+      throw new JmRequestError(serverMsg);
     }
 
     if (isLoginRequest(cfg.url)) {
@@ -299,6 +274,7 @@ export function createJmClient() {
     }
 
     cfg.__jmMeta = meta;
+    if (meta.assertScopedRequest) await meta.assertScopedRequest();
     assertCurrentSession(revision);
     return cfg;
   });

@@ -72,6 +72,15 @@ test("built search preserves legitimate empty and legacy wrapped comic rows", as
   }
 });
 
+test("built search continues full pages without totals and rejects repeated offsets", async () => {
+  const list = Array.from({ length: 20 }, (_, index) => ({ path_word: `fixture-${index}`, name: "Fixture" }));
+  await withSearchResponse({ code: 200, results: { list, offset: 0, limit: 20 } }, async () => {
+    const response = await plugin.searchComic({ keyword: "fixture" });
+    assert.equal(response.data.paging.hasReachedMax, false);
+    await assert.rejects(plugin.searchComic({ keyword: "fixture", page: 2 }), /分页返回不一致/);
+  });
+});
+
 test("built search keeps non-success business responses as failures", async () => {
   await withSearchResponse(
     { code: 503, message: "fixture failure", results: { list: [] } },

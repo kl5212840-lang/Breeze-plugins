@@ -352,6 +352,34 @@ test("only the selected and approved origin receives the existing token after a 
     { token: "fixture-token" },
   ));
 
+test("speed-first downloads resolve the fastest compatible route even when an anonymous mirror won", () =>
+  fixture(
+    (url, request) => {
+      assert.equal(url.hostname, chosen);
+      assert.equal(url.pathname, exactPath);
+      if (!request.headers.has("authorization")) return gate(403, "请先登录后查看");
+      assert.equal(request.headers.get("authorization"), "Token fixture-token");
+      return manifest();
+    },
+    async (calls, _cacheReads, config) => {
+      config["network.autoRoute.v1"] = "热辣漫画线路1";
+      config["network.speed.v1"] = {
+        version: 1, probeVersion: 4, revision: "download", measuredAt: Date.now(),
+        context: { choice: "auto-speed", platform: "3" },
+        results: [
+          { choice: "热辣漫画线路1", host: "mapi.hotmangasd.com", ok: true, ms: 10, status: 200 },
+          { choice: "大陆Copy4000", host: chosen, ok: true, ms: 100, status: 200 },
+        ],
+      };
+      const { chapter } = (await plugin.getChapter(requestDownload())).data;
+      assert.equal(chapter.id, chapterId);
+      assert.equal((chapter.extern.downloadRoute as { apiHost: string }).apiHost, chosen);
+      assert.deepEqual(hosts(calls), [chosen, chosen]);
+      assert.equal(calls[0]!.headers.has("authorization"), false);
+    },
+    { choice: "auto-speed", token: "fixture-token" },
+  ));
+
 test("login, explicit removal, restrictions and throttling keep their original boundary", async () => {
   for (const [code, message, kind, reason] of [
     [403, "请先登录后查看", "unauthorized", undefined],

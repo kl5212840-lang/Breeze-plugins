@@ -37,8 +37,8 @@ export function toFriendlyError(err: unknown): Error {
   return new Error(toFriendlyNetworkError(err));
 }
 export class JmRequestError extends RetryableRequestError {
-  constructor(message: string, retryable = false) {
-    super(message, retryable);
+  constructor(message: string, retryable = false, status?: number, retryAfter?: string) {
+    super(message, retryable, status, retryAfter);
     this.name = "JmRequestError";
   }
 }

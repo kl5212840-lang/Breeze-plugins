@@ -1,10 +1,30 @@
 'use strict';
 const ID=omoConfig.id, HOME=omoConfig.home;
 const details=new Map(), genreCache=new Map();
+const detailReads = new Map();
 let topicCache=null, helperCache=null;
 const playerTemplates=new Map();
 const mediaReferrerPolicies=new Map();
 const unavailableParsers=new Map();
+let responseCacheEpoch = 0;
+
+async function syncResponseCache() {
+  let epoch;
+  try {
+    epoch = await globalThis.bridge?.call('cache.response_generation');
+  } catch { /* Older hosts omit generations. */ }
+  if (Number.isSafeInteger(epoch) && epoch > responseCacheEpoch) {
+    responseCacheEpoch = epoch;
+    details.clear();
+    detailReads.clear();
+    genreCache.clear();
+    playerTemplates.clear();
+    mediaReferrerPolicies.clear();
+    unavailableParsers.clear();
+    topicCache = helperCache = null;
+  }
+  return responseCacheEpoch;
+}
 const types=[['1','日漫'],['2','国漫'],['5','动画'],['24','剧场'],['4','特摄'],['3','美漫']];
 const days=['周一','周二','周三','周四','周五','周六','周日'];
 const ranks=[['dayhot','日榜'],['weekhot','周榜'],['monthhot','月榜'],['allhot','总榜']];
@@ -55,17 +75,25 @@ async function request(url,options={}){
   // 8-second timeouts must not abort an otherwise valid manual episode choice.
   const timeout=options.timeout||8000;
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);
-  let status=0;
+  let status=0,retryAfter='';
   try{const r=await networkFetch(url,{signal:controller.signal,timeout,credentials:'omit',headers:{Accept:'text/html,application/javascript,*/*'}},options.networkContext);
-    status=r.status;if(!r.ok)throw new Error('http');const body=await r.text();if(body.length>2500000)throw new Error('size');return body;
+    status=r.status;
+    if(!r.ok){
+      const after=String(r.headers?.get?.('retry-after')??'').trim();
+      if(/^\d{1,10}$|^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(after))retryAfter=after;
+      throw new Error('http');
+    }
+    const body=await r.text();if(body.length>2500000)throw new Error('size');return body;
   }catch(error){
     const reason=status>=400?'（HTTP '+status+'）':/timeout|timed out|abort/i.test(String(error))?'（连接超时）':'';
-    const failure=new Error(label+'暂未响应'+reason+'，请重试或换一条播放线路');
+    const failure=new Error(label+'暂未响应'+reason+'，请重试或换一条播放线路'+
+      (retryAfter?' Retry-After: '+retryAfter:''));
     if(error?.stack)failure.stack+='\nCaused by: '+String(error.stack);
     throw failure;
   }finally{clearTimeout(timer);}
 }
 async function topics(networkContext){
+  const epoch = await syncResponseCache();
   if(topicCache&&Date.now()-topicCache.at<300000)return topicCache.values;
   try{const dom=parsePublicHtml(await request(new URL('/topic',HOME).href,{networkContext})),seen=new Set(),values=[];
     for(const n of nodes(dom,n=>n.tag==='a'&&/^\/topicdetail-\d+\.html$/.test(n.attrs.href||''))){
@@ -76,7 +104,8 @@ async function topics(networkContext){
       if(previous){if(coverUrl)previous.coverUrl=coverUrl;continue;}
       seen.add(id);values.push({id:'topic:'+id,parentId:'topics',name,coverUrl});
     }
-    if(values.length)topicCache={at:Date.now(),values};return values;
+    if (values.length && await syncResponseCache() === epoch) topicCache = {at: Date.now(), values};
+    return values;
   }catch(_){return topicCache?.values||[];}
 }
 function updateGenres(snapshot){
@@ -94,6 +123,7 @@ function updateGenres(snapshot){
   for(const [type,values]of groups)genreCache.set(type,[...values.values()]);
 }
 async function categories(snapshot,networkContext){
+  await syncResponseCache();
   updateGenres(snapshot);
   const seasonal=await topics(networkContext);
   const seen=new Set(seasonal.map(x=>x.id));
@@ -178,23 +208,42 @@ async function getLibrary(args={}){
     if(!['下一页','尾页'].includes(text(link.label)))continue;
     const url=pageUrl(link.href),n=Number(new URL(url).pathname.match(/-(\d+)---\.html$/)?.[1]||new URL(url).pathname.match(/\/type\/\d+-(\d+)\.html$/)?.[1]);
     if(n>pageCount)pageCount=n;
-    if(text(link.label)==='下一页'&&url!==requested.url&&(!n||n>requested.page))nextUrl=url;
+    if(text(link.label)==='下一页'&&url!==requested.url&&(!n||n===requested.page+1))nextUrl=url;
   }
-  if(nextUrl)pageCount=Math.max(pageCount,requested.page+1);
   for(const value of snapshot.pageText||[]){const m=text(value).match(/^(\d+)\s*\/\s*(\d+)$/);
-    if(m&&Number(m[1])===requested.page&&Number(m[2])>=requested.page&&Number(m[2])<=10000)pageCount=Number(m[2]);}
+    if(m&&Number(m[1])===requested.page&&Number(m[2])>=requested.page&&Number(m[2])<=10000)pageCount=Math.max(pageCount,Number(m[2]));}
+  pageCount=nextUrl&&requested.page<10000?Math.min(10000,Math.max(pageCount,requested.page+1)):requested.page;
+  if(pageCount===requested.page)nextUrl='';
   const cats=await categories(snapshot,args.networkContext),current=cats.find(x=>x.id===requested.type);
   return {source:ID,data:{items,categories:cats,page:requested.page,pageCount,total:items.length,totalKnown:false,
     heading:current?.name||'发现',description:text(snapshot.topicDescription,1500),
     nextCursor:nextUrl?{version:1,page:requested.page,signature:requested.signature,nextUrl}:null}};
 }
 async function getItem(args={}){
-  requireClient(args);const id=workId(args.id),old=details.get(id);
+  requireClient(args);
+  const epoch = await syncResponseCache();
+  const id=workId(args.id),old=details.get(id);
   const snapshot=args.browserSnapshot;
   if(!snapshot&&args.refresh!==true&&old&&Date.now()-old.at<60000)return {source:ID,data:old.item};
   if(snapshot&&(snapshot.kind!=='public-detail'||snapshot.url!==detailUrl(id)||snapshot.verification===true||
       typeof snapshot.html!=='string'||snapshot.html.length>2000000))throw new Error('作品详情需要重新读取，请重试');
-  const source=snapshot?snapshot.html:await request(detailUrl(id),{networkContext:args.networkContext}),dom=parsePublicHtml(source);
+  if (snapshot || args.refresh === true) details.delete(id);
+  const owner = Symbol();
+  detailReads.set(id, owner);
+  try {
+    const item = await loadItem(id, snapshot, args.networkContext);
+    if (await syncResponseCache() === epoch && detailReads.get(id) === owner) {
+      details.delete(id);
+      details.set(id, {at: Date.now(), item});
+      if (details.size > 32) details.delete(details.keys().next().value);
+    }
+    return {source: ID, data: item};
+  } finally {
+    if (detailReads.get(id) === owner) detailReads.delete(id);
+  }
+}
+async function loadItem(id, snapshot, networkContext) {
+  const source=snapshot?snapshot.html:await request(detailUrl(id),{networkContext}),dom=parsePublicHtml(source);
   const title=nodeText(nodes(dom,n=>n.tag==='h1')[0]);if(!title||/安全验证/.test(title))throw new Error('作品详情暂不可用');
   const labels=new Map();
   for(const n of nodes(dom,n=>n.tag==='a'&&/^#playlist\d+$/.test(n.attrs.href||'')))labels.set(n.attrs.href.slice(9),nodeText(n).replace(/\d+$/,'').trim());
@@ -251,8 +300,7 @@ async function getItem(args={}){
     genres:field('类型'),area:field('地区'),year:field('年份'),language:field('语言'),remarks:field('状态'),
     directors:field('导演')==='未知'?'':field('导演'),actors:text(actorNames,3000),updatedAt:field('更新'),
     finished:/完结/.test(field('状态')),vodId,credits,related,discussionUrl:discussion,lines};
-  details.set(id,{at:Date.now(),item});if(details.size>32)details.delete(details.keys().next().value);
-  return {source:ID,data:item};
+  return item;
 }
 function publicPlayerUrl(raw,base){
   const value=https(raw,base);if(!value)throw new Error('播放器返回了不可用地址');
@@ -348,11 +396,15 @@ function playerTemplateValue(script,values){
   throw new Error('播放器模板暂未支持');
 }
 async function playerFrame(player,context,item,episode,refresh=false,networkContext){
+  const epoch = await syncResponseCache();
   const from=String(player.from||'');
   if(!/^[A-Za-z0-9_-]{1,64}$/.test(from))throw new Error('源站播放器标识无效');
   const url=new URL('/static/player/'+from+'.js',HOME).href,old=playerTemplates.get(url);
   const script=!refresh&&old&&Date.now()-old.at<60000?old.body:await request(url,{label:'播放器配置',networkContext});
-  playerTemplates.set(url,{at:Date.now(),body:script});if(playerTemplates.size>16)playerTemplates.delete(playerTemplates.keys().next().value);
+  if (await syncResponseCache() === epoch) {
+    playerTemplates.set(url, {at: Date.now(), body: script});
+    if (playerTemplates.size > 16) playerTemplates.delete(playerTemplates.keys().next().value);
+  }
   const html=playerTemplateValue(script,{
     encodedPairs:encodedPlayerPairs(script,player,context,item),
     'MacPlayer.PlayUrl':sourcePlayUrl(player),'MacPlayer.PlayLinkNext':player.link_next||'',
@@ -373,8 +425,13 @@ function playerHelperUrl(html,frame){
   if(candidates.length!==1)throw new Error('播放器URL解析脚本暂未识别，请在网页继续');
   return candidates[0];
 }
-async function helper(url,refresh=false,networkContext){if(!refresh&&helperCache&&helperCache.url===url&&Date.now()-helperCache.at<300000)return helperCache.body;
-  const body=await request(url,{label:'解析脚本',networkContext});helperCache={url,at:Date.now(),body};return body;}
+async function helper(url, refresh=false, networkContext) {
+  const epoch = await syncResponseCache();
+  if (!refresh && helperCache?.url === url && Date.now() - helperCache.at < 300000) return helperCache.body;
+  const body = await request(url, {label:'解析脚本',networkContext});
+  if (await syncResponseCache() === epoch) helperCache = {url, at: Date.now(), body};
+  return body;
+}
 function rawHlsUrl(player){
   try{const raw=sourcePlayUrl(player);if(raw.length>4096||!/^https:\/\//i.test(raw))return '';
     const value=publicPlayerUrl(raw,HOME),url=new URL(value);
@@ -422,6 +479,7 @@ async function getSession(args={}){
   // Refresh resolves fresh media tokens, not an anonymous copy of the detail.
   // Once a browser-backed detail expires, ask the host for the same public
   // page in its existing session. The host permits only one such round trip.
+  const epoch = await syncResponseCache();
   const work=workId(args.id),cached=details.get(work);
   if(args.browserDetailTransport===true&&!args.browserSnapshot&&(!cached||Date.now()-cached.at>=60000)){
     return {source:ID,data:{browserDetailRequest:{url:detailUrl(work)}}};
@@ -458,15 +516,17 @@ async function getSession(args={}){
     if(args.refresh!==true&&(unavailableParsers.get(parserRequest)||0)>Date.now())throw new Error('播放解析服务暂未响应');
     try{iframe=await request(frame,{label:'播放解析服务',timeout:18000,networkContext:args.networkContext});unavailableParsers.delete(parserRequest);}
     catch(error){
-      if(/连接超时/.test(error.message)){unavailableParsers.set(parserRequest,Date.now()+30000);
+      if (/连接超时/.test(error.message) && await syncResponseCache() === epoch) {unavailableParsers.set(parserRequest,Date.now()+30000);
         if(unavailableParsers.size>16)unavailableParsers.delete(unavailableParsers.keys().next().value);}
       throw error;
     }
     let media;
     // Keep only the public no-referrer policy for later explicit same-episode
     // recovery; never retain iframe URLs, signed tokens, cookies or account data.
-    mediaReferrerPolicies.set(episode.watchUrl,noMediaReferrer(iframe));
-    if(mediaReferrerPolicies.size>64)mediaReferrerPolicies.delete(mediaReferrerPolicies.keys().next().value);
+    if (await syncResponseCache() === epoch) {
+      mediaReferrerPolicies.set(episode.watchUrl, noMediaReferrer(iframe));
+      if (mediaReferrerPolicies.size > 64) mediaReferrerPolicies.delete(mediaReferrerPolicies.keys().next().value);
+    }
     if(/\burl:\s*playData\(/.test(iframe)){
       const url=playerHelperUrl(iframe,frame);
       try{media=await unwrapPublicPlayerUrl(await helper(url,false,args.networkContext),iframe);}catch(_){media=await unwrapPublicPlayerUrl(await helper(url,true,args.networkContext),iframe);}
@@ -492,7 +552,8 @@ function getInfo(){
     capabilities:omoConfig.capabilities,catalogFnPath:'getLibrary',detailFnPath:'getItem',playbackFnPath:'getSession',batchDetailFnPath:'getItems'};
   return {name:omoConfig.name,uuid:ID,version:omoConfig.version,home:'https://github.com/kl5212840-lang/Breeze-plugins',websiteUrl:HOME,
   routing:{version:1,siteOrigins:[new URL(HOME).origin],mediaHosts:'runtime'},
-  iconUrl:omoConfig.iconUrl,updateUrl:'https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/omofun.json',
+  iconUrl:omoConfig.iconUrl,updateUrl:'https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/omofun.json',
+  releaseSeries:1,npmName:'',requirements:{version:1,capabilities:{videoLibraryProtocol:2}},
   describe:'动漫片库、完整搜索、分类筛选、周更专题与原生多线路播放。本机收藏与续播；需配套支持视频协议2的Breeze。',
   function:[{id:'library',title:'发现',action:{type:'openVideoLibrary',payload}}]};}
 function getSettingsBundle(){return {source:ID,data:{mediaType:'video',canLogin:false,canShowUserInfo:false,values:{},sections:[]}};}

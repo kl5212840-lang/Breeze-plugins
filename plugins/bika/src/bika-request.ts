@@ -6,9 +6,12 @@ import { loadAppChannel } from "./bika-network";
 import { assertBikaImageQuality, loadBikaImageQuality, normalizeBikaImageQuality } from "./bika-image-quality";
 import { assertBikaAuthRevision, BikaAccountChangedError, currentBikaAuthRevision } from "./bika-auth-session";
 import { loadPluginSetting } from "./plugin-config";
-import { isTransientError } from "../../shared/transient-retry";
+import { httpFailureEvidence, isTransientError, safeRetryAfter } from "../../shared/transient-retry";
 import { BIKA_PLUGIN_ID } from "./bika-identity";
 import { toStringMap } from "./bika-utils";
+import { responseCacheGeneration } from "../../shared/response-cache";
+
+const requestCacheOwners = new Map<string, symbol>();
 
 function toUpperMethod(method: unknown): string {
   const value = String(method || "GET").trim();
@@ -20,8 +23,9 @@ function assertReadResponse(response: unknown, arrayPath?: readonly string[]) {
   const code = envelope.code == null ? 200 : Number(envelope.code);
   if (code === 401) throw buildUnauthorizedError(BIKA_PLUGIN_ID, "登录过期，请重新登录");
   if (code === 403) throw new Error("哔咔当前请求没有访问权限");
-  if (code === 429) throw new Error("哔咔请求过于频繁（429）");
-  if (code >= 500 && code <= 599) throw new Error("哔咔服务暂时无法响应");
+  if (code === 429 || (code >= 500 && code <= 599)) {
+    throw new Error(`哔咔暂时无法响应（${httpFailureEvidence(code)}）`);
+  }
   if (code !== 200 || !response || typeof response !== "object" || Array.isArray(response)) {
     throw new Error("哔咔返回的数据格式错误");
   }
@@ -39,6 +43,7 @@ export async function bikaRequest(payload: BikaRequestPayload = { url: "" }) {
     : normalizeBikaImageQuality(payload.imageQuality);
   const method = toUpperMethod(payload.method);
   const useCache = Boolean(payload.cache && method === "GET");
+  const cacheGeneration = useCache ? await responseCacheGeneration() : undefined;
   const loadAuthorization = async () => String(await loadPluginSetting("auth.authorization", "")).trim();
   const authorization = payload.authorization ?? (useCache ? await loadAuthorization() : undefined);
   const resolvedPayload: BikaRequestPayload = { ...payload, imageQuality, authorization };
@@ -70,6 +75,11 @@ export async function bikaRequest(payload: BikaRequestPayload = { url: "" }) {
     }
   }
 
+  const readScope = method === "GET" || method === "HEAD" ? resolvedPayload.readScope : undefined;
+  const fetchOptions = {
+    ...(resolvedPayload.lineSnapshot !== undefined ? { redirect: "error" } : {}),
+    ...(readScope ? { breezeReadScope: readScope } : {}),
+  };
   const requestConfig: Record<string, unknown> = {
     url: resolvedPayload.url,
     method,
@@ -77,7 +87,7 @@ export async function bikaRequest(payload: BikaRequestPayload = { url: "" }) {
     __bikaChannel: channel,
     __bikaImageQuality: imageQuality,
     __bikaLine: line,
-    ...(resolvedPayload.lineSnapshot !== undefined ? { fetchOptions: { redirect: "error" } } : {}),
+    ...(readScope || resolvedPayload.lineSnapshot !== undefined ? { fetchOptions } : {}),
     ...(resolvedPayload.lineSnapshot !== undefined && method === "GET"
       ? { headers: { "Cache-Control": "no-cache" } } : {}),
     ...(resolvedPayload.authorization !== undefined ? { __bikaAuthorization: resolvedPayload.authorization } : {}),
@@ -92,16 +102,26 @@ export async function bikaRequest(payload: BikaRequestPayload = { url: "" }) {
       typeof requestBody === "string" ? requestBody : JSON.stringify(requestBody);
   }
 
-  const response = await client.request(requestConfig);
-  await assertBikaLine(line);
-  if (method === "GET") await assertBikaImageQuality(imageQuality);
-  if (cacheKey) {
-    await assertCacheAuthorization();
-    assertReadResponse(response.data, resolvedPayload.cacheArray);
-    // Storage is optional. A correct remote result remains usable on disk error.
-    await writeCache(cacheKey, response.data).catch(() => {});
+  const owner = Symbol();
+  if (cacheKey) requestCacheOwners.set(cacheKey, owner);
+  try {
+    const response = await client.request(requestConfig);
+    await assertBikaLine(line);
+    if (method === "GET") await assertBikaImageQuality(imageQuality);
+    if (cacheKey) {
+      await assertCacheAuthorization();
+      assertReadResponse(response.data, resolvedPayload.cacheArray);
+      if (requestCacheOwners.get(cacheKey) === owner) {
+        // Storage is optional. A correct remote result remains usable on disk error.
+        await writeCache(cacheKey, response.data, cacheGeneration).catch(() => {});
+      }
+    }
+    return response.data;
+  } finally {
+    if (cacheKey && requestCacheOwners.get(cacheKey) === owner) {
+      requestCacheOwners.delete(cacheKey);
+    }
   }
-  return response.data;
 }
 
 function knownBikaCoverMirror(cover: URL): string | null {
@@ -138,6 +158,7 @@ export async function fetchImageBytes({
   const mirror = knownBikaCoverMirror(target);
   const budget = Math.max(0, timeoutMs) || 30000;
   const started = Date.now();
+  const remainingBudget = () => budget - Math.max(0, Date.now() - started);
   const requestImage = (imageUrl: string, timeout = budget, restricted = false) =>
     axios.get(imageUrl, {
       headers: { Host: new URL(imageUrl).host },
@@ -151,7 +172,7 @@ export async function fetchImageBytes({
       }),
     });
   const requestKnownCoverMirror = async () => {
-    const remaining = budget - (Date.now() - started);
+    const remaining = remainingBudget();
     if (!mirror || remaining <= 0) return null;
     try {
       const response = await requestImage(mirror, Math.min(10000, remaining), true);
@@ -173,7 +194,9 @@ export async function fetchImageBytes({
       ["s3.picacomic.com", "storage.diwodiwo.xyz"].includes(target.host)) {
       const fallback = new URL(targetUrl);
       fallback.host = "img.picacomic.com";
-      response = await requestImage(fallback.toString());
+      const remaining = remainingBudget();
+      if (remaining <= 0) throw Object.assign(new Error("Image request timed out"), { code: "ETIMEDOUT" });
+      response = await requestImage(fallback.toString(), remaining);
     }
   } catch (error) {
     // Do not propagate an AxiosError carrying the full image URL and headers.
@@ -184,12 +207,14 @@ export async function fetchImageBytes({
     }
     throw new Error("Unsupported image response");
   }
+  if (remainingBudget() <= 0) throw new Error("Image request timed out");
   if (response.status < 200 || response.status >= 300) {
-    if ([403, 404, 408, 422, 500, 502, 503, 504].includes(response.status)) {
+    const retryAfter = safeRetryAfter(response.headers?.["retry-after"]);
+    if (retryAfter === undefined && [403, 404, 408, 422, 500, 502, 503, 504].includes(response.status)) {
       const recovered = await requestKnownCoverMirror();
       if (recovered) return recovered;
     }
-    throw new Error(`图片请求失败（HTTP ${response.status}）`);
+    throw new Error(httpFailureEvidence(response.status, retryAfter));
   }
   return new Uint8Array(response.data);
 }

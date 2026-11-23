@@ -209,9 +209,8 @@ test("settings separate concise labels from explanations without changing values
         ["api.platform", "请求标识", "saveSettings"],
       ],
     );
-    assert.match(fields[0].description ?? "", /目录、公开详情和章节列表.*测速通过后，再选耗时最短的线路.*详情和首批章节.*封面和账号各自连接/);
-    assert.match(fields[1].description ?? "", /默认用 1.*测速沿用当前值.*账号请求固定用 1/);
-    assert.ok(fields[1].description?.includes("客户端"));
+    assert.equal(fields[0].description, "可用优先在账号线路不可用时，会为公开阅读使用已测通的线路。");
+    assert.equal(fields[1].description, undefined);
     assert.deepEqual(
       fields[1].options?.map((o) => o.value),
       ["1", "2", "3", "4", "5", "", " "],

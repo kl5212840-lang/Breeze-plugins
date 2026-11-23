@@ -22,6 +22,12 @@ export const COPY_API_ROUTES: Readonly<Record<string, string>> = {
 };
 
 export const COPY_DEFAULT_CHOICE = "大陆专线2";
+export const COPY_AUTO_CHOICE = "auto";
+export const COPY_AUTO_SPEED_CHOICE = "auto-speed";
+
+export function isCopyAutoChoice(value: string) {
+  return value === COPY_AUTO_CHOICE || value === COPY_AUTO_SPEED_CHOICE;
+}
 
 export function isCopyRouteChoice(value: string) {
   return Object.prototype.hasOwnProperty.call(COPY_API_ROUTES, value);

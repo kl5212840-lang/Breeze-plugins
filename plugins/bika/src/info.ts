@@ -5,6 +5,7 @@ import { BIKA_PLUGIN_ID } from "./bika-identity";
 export { BIKA_PLUGIN_ID } from "./bika-identity";
 
 export type BikaPluginInfo = InfoContract & {
+  releaseSeries: 1;
   breezeVideoModules: ReturnType<typeof bikaVideoAction>[];
   breezeExperience: {
     aggregateMedia: string;
@@ -85,12 +86,13 @@ export function buildManifestInfo(): BikaPluginInfo {
     name: "哔咔漫画+",
     uuid: BIKA_PLUGIN_ID,
     iconUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugin-bika-personal/main/assets/logo_round.webp",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/plugins/bika/assets/logo_round.webp",
     describe: "独立更新的哔咔漫画插件",
-    version: "0.1.32",
+    version: "0.2.1",
+    releaseSeries: 1,
     updateUrl:
-      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/bika.json",
-    home: "https://github.com/kl5212840-lang/Breeze-plugin-bika-personal",
+      "https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/bika.json",
+    home: "https://github.com/kl5212840-lang/Breeze-plugins/tree/main/plugins/bika",
     npmName: "",
     breezeVideoModules: [bikaVideoAction("https://adult-movie.bidobido.xyz/"), bikaVideoAction("https://adult-animate.bidobido.xyz/")],
     breezeExperience: {

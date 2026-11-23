@@ -51,7 +51,7 @@ function fixture(
     async fetch(input: Request | string, init?: RequestInit) {
       const request = input instanceof Request ? input : new Request(input, init);
       requests.push(new URL(request.url).pathname);
-      return new Response(JSON.stringify(respond(request)), {
+      return new Response(JSON.stringify(await respond(request)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -101,6 +101,139 @@ test("the actual compiled JM login and clearing use only the synthetic network a
   assert.equal(f.settings.get("auth.jwt"), profile.jwttoken, JSON.stringify(result));
   await f.plugin.clearPluginSession();
   assert.equal(f.settings.get("auth.jwt"), "");
+});
+
+test("compiled JM folder refresh requests a fresh directory while an old read is still pending", async () => {
+  const started = deferred();
+  const finishOldRead = deferred();
+  const f = fixture(async () => {}, async (request) => {
+    assert.equal(request.method, "GET");
+    assert.equal(new URL(request.url).origin, "https://www.cdnhjk.net");
+    assert.equal(request.headers.get("authorization"), "Bearer fixture-token");
+    assert.equal(request.headers.get("cookie"), "AVS=fixture-avs");
+    const revalidate = request.headers.get("cache-control") === "no-cache";
+    if (f.requests.length === 1) {
+      started.resolve();
+      await finishOldRead.promise;
+    }
+    return { code: 200, data: { total: 0, list: [], folder_list: [
+      { FID: "321", name: revalidate ? "设备二重命名" : "原名称" },
+    ] } };
+  });
+  f.settings.set("auth.userInfo", { ...profile, s: "fixture-avs" });
+  f.settings.set("auth.jwt", profile.jwttoken);
+  const old = f.plugin.getCloudFavoriteFilterBundle();
+  await started.promise;
+  const fresh = f.plugin.getCloudFavoriteFilterBundle({ refresh: true });
+  try {
+    await setImmediate();
+    assert.deepEqual(f.requests, ["/favorite", "/favorite"]);
+    await fresh;
+  } finally {
+    finishOldRead.resolve();
+  }
+  const [before, after] = await Promise.all([old, fresh]);
+  assert.equal(before.scheme.fields[0].options[1].label, "原名称");
+  assert.equal(after.scheme.fields[0].options[1].label, "设备二重命名");
+
+  const { preflightId } = await f.plugin.prepareJmFavoriteFolderChange({ folderId: "321" });
+  const result = await f.plugin.renameFavoriteFolder({
+    folderId: "321", folderName: "设备二重命名", preflightId,
+  });
+  assert.equal(result.folder.name, "设备二重命名");
+  assert.deepEqual(f.requests, ["/favorite", "/favorite"]);
+});
+
+test("compiled JM sends a folder create as the official multipart form with the matching session", async () => {
+  let created = false;
+  const f = fixture(async () => {}, async (request) => {
+    assert.equal(request.headers.get("authorization"), "Bearer fixture-token");
+    assert.equal(request.headers.get("cookie"), "AVS=fixture-avs");
+    assert.equal(request.redirect, "error");
+    if (request.method === "POST") {
+      assert.equal(new URL(request.url).pathname, "/favorite_folder");
+      assert.match(request.headers.get("content-type") ?? "", /^multipart\/form-data; boundary=/);
+      assert.deepEqual(Object.fromEntries(await request.formData()), {
+        type: "add",
+        folder_id: "",
+        folder_name: "收藏夹样例",
+        aid: "",
+      });
+      created = true;
+      return { code: 200, data: { status: "ok" } };
+    }
+    return { code: 200, data: {
+      total: 0, list: [],
+      folder_list: created ? [{ FID: "321", name: "收藏夹样例" }] : null,
+    } };
+  });
+  f.settings.set("auth.userInfo", { ...profile, s: "fixture-avs" });
+  f.settings.set("auth.jwt", profile.jwttoken);
+  const result = await f.plugin.createFavoriteFolder({ folderName: "收藏夹样例" });
+  assert.equal(result.ok, true);
+  assert.equal(result.folder.id, "321");
+  assert.deepEqual(f.requests, ["/favorite", "/favorite_folder", "/favorite"]);
+});
+
+test("compiled JM accepts a late new folder only after two independent reads of the same account", async () => {
+  let posts = 0;
+  let readsAfterWrite = 0;
+  const f = fixture(async () => {}, (request) => {
+    assert.equal(request.headers.get("authorization"), "Bearer fixture-token");
+    if (request.method === "POST") {
+      posts++;
+      return { code: 200, data: {} };
+    }
+    if (posts) {
+      readsAfterWrite++;
+      assert.equal(request.headers.get("cache-control"), "no-cache");
+    }
+    return { code: 200, data: { total: 0, list: [], folder_list:
+      readsAfterWrite < 2 ? [] : [{ FID: "321", name: "编译版新增" }],
+    } };
+  });
+  f.settings.set("auth.jwt", profile.jwttoken);
+  const result = await f.plugin.createFavoriteFolder({ folderName: "编译版新增" });
+  assert.equal(result.folder.id, "321");
+  assert.equal(posts, 1);
+  assert.deepEqual(f.requests, ["/favorite", "/favorite_folder", "/favorite", "/favorite"]);
+});
+
+test("compiled JM reports a rejected folder create at the folder limit without re-posting", async () => {
+  const f = fixture(async () => {}, (request) => {
+    if (request.method === "POST") {
+      return { code: 200, data: { code: 400, msg: "資料夾數量已達上限" } };
+    }
+    return { code: 200, data: { total: 0, list: [], folder_list: null } };
+  });
+  f.settings.set("auth.jwt", profile.jwttoken);
+  await assert.rejects(
+    f.plugin.createFavoriteFolder({ folderName: "收藏夹样例" }),
+    /收藏夹已达上限/,
+  );
+  assert.deepEqual(f.requests, ["/favorite", "/favorite_folder"]);
+});
+
+test("compiled JM reuses an editing-time check and returns only typed folder-limit data", async () => {
+  const f = fixture(async () => {}, (request) => request.method === "POST"
+    ? { code: 200, data: { code: 400, msg: "資料夾數量已達上限" } }
+    : { code: 200, data: { total: 0, list: [], folder_list: [
+      { FID: 0 }, { FID: "32", name: "私有收藏夹名称" },
+    ] } });
+  f.settings.set("auth.jwt", profile.jwttoken);
+  const { preflightId } = await f.plugin.prepareJmFavoriteFolderChange();
+  assert.deepEqual(f.requests, ["/favorite"]);
+  f.requests.length = 0;
+  await assert.rejects(f.plugin.createFavoriteFolder({
+    preflightId, folderName: "另外一个", reportFolderFailure: true,
+  }), (error: unknown) => {
+    const message = (error as Error).message;
+    assert.deepEqual(JSON.parse(message), {
+      type: "jm_folder_change", phase: "rejected", reason: "limit", folderCount: 1,
+    });
+    return true;
+  });
+  assert.deepEqual(f.requests, ["/favorite_folder"]);
 });
 
 test("compiled JM profile verification uses the configured origin without password, redirects or session writes", async () => {

@@ -55,8 +55,9 @@ test('declares a native catalog action', () => {
   assert.equal(info.function[0].action.type, 'openVideoCatalog');
   assert.deepEqual(manifest, info);
   assert.equal(info.uuid, '1e600cff-8ebe-4517-8aa4-6678aec46424');
-  assert.equal(info.version, '0.11.6');
-  assert.equal(info.updateUrl, 'https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/hanime.json');
+  assert.equal(info.version, require('./package.json').version);
+  assert.equal(info.releaseSeries, 1);
+  assert.equal(info.updateUrl, 'https://raw.githubusercontent.com/kl5212840-lang/Breeze-plugins/main/updates/v1/hanime.json');
   assert.deepEqual(info.function[0].action.payload.tabs.map((item) => item.title),
     ['推荐', '排行', '订阅', '我的']);
   assert.equal(info.function[0].action.payload.nativeAccount, true);
@@ -171,6 +172,7 @@ test('search paging follows only first-party result pages', () => {
       pagination: [
         { href: '/search?query=sample&page=1', label: '1' },
         { href: '/search?query=sample&page=3', label: '3' },
+        { href: '/search?query=unrelated&page=3', label: '3' },
         { href: 'https://evil.test/search?page=4', label: '4' },
       ],
     },
@@ -179,7 +181,7 @@ test('search paging follows only first-party result pages', () => {
   assert.equal(result.data.sections.length, 0);
   assert.equal(result.data.videos[0].id, '42');
   assert.equal(result.data.paging.totalPages, 3);
-  assert.match(result.data.paging.nextUrl, /page=3/);
+  assert.equal(result.data.paging.nextUrl, 'https://hanime1.me/search?query=sample&page=3');
   assert.equal(result.data.paging.previousUrl,
     'https://hanime1.me/search?query=sample&page=1');
 });

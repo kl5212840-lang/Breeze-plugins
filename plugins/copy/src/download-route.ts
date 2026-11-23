@@ -117,6 +117,7 @@ export async function readCopyDownloadChapter(
   request: CopyPublicRequest,
   deadline: number,
   loadTrustedToken?: () => Promise<string>,
+  preferredPath: "chapter" | "chapter2" = "chapter2",
 ) {
   const urlFor = (chapterPath: string) =>
     new URL(
@@ -133,7 +134,7 @@ export async function readCopyDownloadChapter(
     if (Date.now() >= deadline) throw new CopyFollowError("network");
     return exactChapter(comicId, chapterId, data.results);
   };
-  let path = "chapter2";
+  let path = preferredPath;
   try {
     try {
       return await fetchChapter(path, request);
@@ -142,7 +143,7 @@ export async function readCopyDownloadChapter(
       // response (e.g. explicitly removed) keeps its original meaning.
       if (!(error instanceof CopyFollowError) || !error.retryable || error.status !== 404)
         throw error;
-      path = "chapter";
+      path = path === "chapter2" ? "chapter" : "chapter2";
       return await fetchChapter(path, request);
     }
   } catch (error) {

@@ -31,6 +31,35 @@ test('parent aggregation includes direct parent records and its descendants', as
   } finally {global.fetch=original;}
 });
 
+test('merged categories continue through consecutive empty pages before declaring exhaustion', async () => {
+  const original = global.fetch;
+  const requested = [];
+  const classes = [
+    {type_id:7,type_pid:0,type_name:'parent'},
+    {type_id:10,type_pid:7,type_name:'child'},
+  ];
+  global.fetch = async raw => {
+    const url = new URL(raw);
+    const type = url.searchParams.get('t');
+    const page = Number(url.searchParams.get('pg') ?? 1);
+    if (type === '10') requested.push(page);
+    const list = type === '10' && page === 3 ? [row(101,10)] : [];
+    return {ok:true,text:async()=>JSON.stringify({
+      code:1,page,pagecount:type === '10' ? 3 : 1,total:type === '10' ? 1 : 0,
+      list,class:classes,
+    })};
+  };
+  try {
+    const result = (await plugin().getLibrary({clientProtocol:2,typeId:'7'})).data;
+    assert.deepEqual(requested,[1,2,3]);
+    assert.deepEqual(result.items.map(item=>item.id),['101']);
+    assert.equal(result.total,1);
+    assert.equal(result.totalKnown,true);
+    assert.equal(result.pageCount,1);
+    assert.equal(result.nextCursor,null);
+  } finally { global.fetch = original; }
+});
+
 test('media token refresh preserves the episode identity and ignores trailing separators', async () => {
   const original = global.fetch;
   let token='old';
@@ -46,6 +75,38 @@ test('media token refresh preserves the episode identity and ignores trailing se
     await assert.rejects(p.getSession({clientProtocol:2,id:'42',episodeId:'missing'}),/已不可用/);
   } finally {global.fetch=original;}
 });
+
+for (const [name, create] of [
+  ['CMS', plugin],
+  ['Modu bundle', () => require('../modu/modu-native.cjs')],
+  ['iKun bundle', () => require('../ikun/ikun-native.cjs')],
+]) {
+  test(name + ' does not republish a late detail response after refresh', async () => {
+    const original = global.fetch;
+    const response = token => ({ok:true,text:async()=>JSON.stringify({code:1,list:[row(42,10,'Episode',token)]})});
+    let finishOld;
+    let count = 0;
+    let started;
+    const dispatched = new Promise(resolve => { started = resolve; });
+    global.fetch = () => ++count === 1
+      ? new Promise(resolve => { finishOld = resolve; started(); })
+      : Promise.resolve(response('new'));
+    try {
+      const source = create();
+      const request = {clientProtocol: 2, id: '42'};
+      const old = source.getItem(request);
+      await dispatched;
+      await source.getItem({...request, refresh: true});
+      finishOld(response('old'));
+      await old;
+      const playback = await source.getSession(request);
+      assert.equal(new URL(playback.data.sources[0].url).searchParams.get('token'), 'new');
+      assert.equal(count, 2);
+    } finally {
+      global.fetch = original;
+    }
+  });
+}
 
 test('old clients fail before a network request instead of ignoring capabilities', async () => {
   await assert.rejects(plugin().getLibrary({}),/更新配套/);

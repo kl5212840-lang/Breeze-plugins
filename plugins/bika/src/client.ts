@@ -4,12 +4,13 @@ import { loadPluginSetting } from "./plugin-config";
 import { BIKA_PLUGIN_ID } from "./info";
 import { loadAppChannel, normalizeAppChannel } from "./bika-network";
 import { assertBikaImageQuality, BikaImageQualityChangedError, loadBikaImageQuality, normalizeBikaImageQuality, type BikaImageQuality } from "./bika-image-quality";
-import { isTransientError, RetryableRequestError } from "../../shared/transient-retry";
+import { httpFailureEvidence, isTransientError, RetryableRequestError, safeRetryAfter } from "../../shared/transient-retry";
 import { BikaAccountChangedError } from "./bika-auth-session";
+import { writeResponseCache } from "../../shared/response-cache";
 
 export class BikaRequestError extends RetryableRequestError {
-  constructor(message: string, retryable: boolean, readonly status?: number) {
-    super(message, retryable);
+  constructor(message: string, retryable: boolean, status?: number, retryAfter?: string) {
+    super(message, retryable, status, retryAfter);
     this.name = "BikaRequestError";
   }
 }
@@ -88,11 +89,11 @@ function deepClone<T>(input: T): T {
   return structuredClone(input);
 }
 
-export async function writeCache(cacheKey: string, data: unknown) {
-  await cache.set(toCacheStorageKey(cacheKey), {
+export async function writeCache(cacheKey: string, data: unknown, generation?: number) {
+  await writeResponseCache(toCacheStorageKey(cacheKey), {
     expireAt: Date.now() + CACHE_TTL_MS,
     data: deepClone(data),
-  } satisfies CacheEntry);
+  } satisfies CacheEntry, generation);
 }
 
 function isCacheEntry(v: unknown): v is CacheEntry {
@@ -107,15 +108,7 @@ export async function readCache(cacheKey: string): Promise<unknown | undefined> 
   const entry = (await cache.get(key, undefined)) as CacheEntry | undefined;
 
   if (!entry) return undefined;
-  if (!isCacheEntry(entry)) {
-    await cache.delete(key);
-    return undefined;
-  }
-
-  if (entry.expireAt <= Date.now()) {
-    await cache.delete(key);
-    return undefined;
-  }
+  if (!isCacheEntry(entry) || entry.expireAt <= Date.now()) return undefined;
 
   return deepClone(entry.data);
 }
@@ -331,6 +324,7 @@ bikaClient.interceptors.response.use(
       response?: {
         data?: { code?: number; message?: string; error?: string };
         status?: number;
+        headers?: Record<string, unknown>;
       };
     };
     const data = e?.response?.data;
@@ -345,10 +339,13 @@ bikaClient.interceptors.response.use(
     // Axios errors retain config, headers and request bodies (including login
     // credentials). Only a safe message may cross the plugin/runtime boundary.
     const status = e?.response?.status;
+    const retryAfter = safeRetryAfter(e?.response?.headers?.["retry-after"]);
     const retryable = e?.code !== "ERR_CANCELED" && (
-      status === undefined ? isTransientError(error) : status === 408 || status === 429 || status >= 500
+      status === undefined ? isTransientError(error) : status === 408 || status === 425 || status === 429 || status >= 500
     );
-    throw new BikaRequestError(mapNetworkError(error, retryable), retryable, status);
+    const message = status !== undefined && retryable
+      ? httpFailureEvidence(status, retryAfter) : mapNetworkError(error, retryable);
+    throw new BikaRequestError(message, retryable, status, retryAfter);
   },
 );
 

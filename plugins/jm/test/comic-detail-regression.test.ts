@@ -144,10 +144,21 @@ test("search sends the selected author or tag scope without changing ordinary re
   response = { content: [], total: 0 };
   const schema = await plugin.getAdvancedSearchScheme({ extern: { main_tag: "3" } });
   assert.deepEqual(
-    schema.scheme.fields.find((field) => field.key === "main_tag")?.options?.map((option) => option.value),
-    [0, 2, 3],
+    schema.scheme.fields.find((field) => field.key === "search_type")?.options?.map((option) => option.value),
+    ["site", "work", "author", "tag", "character"],
   );
   assert.equal(schema.data.values.main_tag, 3);
+  assert.equal(schema.data.values.search_type, "tag");
+  assert.equal(schema.data.values.y, "");
+  assert.equal(schema.data.values.m, "");
+  const sort = schema.scheme.fields.find((field) => field.key === "sortBy")?.options;
+  assert.equal(sort?.find((option) => option.value === 1)?.label, "最新");
+  assert.equal(sort?.find((option) => option.value === 5)?.label, "从旧到新");
+  const dateFields = schema.scheme.fields.filter((field) => field.key === "y" || field.key === "m");
+  assert.deepEqual(dateFields.map((field) => Reflect.get(field, "optionLayout")), ["menu", "menu"]);
+  assert.equal(Reflect.get(dateFields[1]!, "requiresOption"), "y");
+  assert.equal(Reflect.get(await plugin.getInfo(), "breezeExperience").jmSearchDiscoveryFunction,
+    "getJmSearchDiscovery");
 
   for (const [keyword, scope, expected] of [
     ["fixture", undefined, undefined],
@@ -165,14 +176,104 @@ test("search sends the selected author or tag scope without changing ordinary re
   }
 });
 
-test("detail author and tag actions retain their exact search scope", async () => {
-  response = { ...full, author: ["fixture author"] };
+test("JM search sends official modes and dates without changing legacy scope requests", async () => {
+  response = { code: 200, data: { content: [], total: 0 } };
+  for (const mode of ["site", "work", "author", "tag", "character"]) {
+    await plugin.searchComic({
+      keyword: "example",
+      page: 2,
+      extern: { search_type: mode, main_tag: 2, y: "2020", m: "03", sortBy: 5 },
+    });
+    assert.deepEqual(requests[requests.length - 1]?.params, {
+      search_query: "example", page: 2, o: "old", search_type: mode, y: 2020, m: 3,
+    });
+  }
+  await plugin.searchComic({ keyword: "123", extern: { search_type: "character" } });
+  assert.match(requests[requests.length - 1]?.url ?? "", /\/search$/);
+  assert.equal(requests[requests.length - 1]?.params.search_type, "character");
+
+  await plugin.searchComic({ keyword: "example", extern: {
+    search_type: "unsupported", main_tag: 3, y: 2016, m: 13,
+  } });
+  assert.deepEqual(requests[requests.length - 1]?.params, {
+    search_query: "example", page: 1, o: "", main_tag: 3,
+  });
+  await plugin.searchComic({ keyword: "example", extern: { search_type: "site", y: "", m: 5 } });
+  assert.deepEqual(requests[requests.length - 1]?.params, {
+    search_query: "example", page: 1, o: "", search_type: "site",
+  });
+});
+
+test("JM public lists continue a short page while the source reports more rows", async () => {
+  response = { code: 200, data: { content: [full], total: 81 } };
+  const first = await plugin.searchComic({ keyword: "fixture", page: 1 });
+  assert.equal(first.data.paging.hasReachedMax, false);
+  const last = await plugin.searchComic({ keyword: "fixture", page: 2 });
+  assert.equal(last.data.paging.hasReachedMax, true);
+
+  response = { content: [full], total: 81 };
+  assert.equal((await plugin.getRankingData({ page: 1 })).data.hasReachedMax, false);
+  assert.equal((await plugin.getRankingData({ page: 2 })).data.hasReachedMax, true);
+  response = { list: [full], total: 28 };
+  assert.equal((await plugin.getPromoteListData({ page: 1 })).data.hasReachedMax, false);
+  assert.equal((await plugin.getPromoteListData({ page: 2 })).data.hasReachedMax, true);
+});
+
+test("JM earliest ordering uses available publication dates while retaining every result", async () => {
+  response = { code: 200, data: { content: [
+    { id: 51, name: "later", adddate: "2025-06-28" },
+    { id: 52, name: "earlier", adddate: "2020-03-10" },
+    { id: 53, name: "same day", adddate: "2020-03-10" },
+    { id: 54, name: "unknown" },
+  ], total: 4 } };
+  const result = await plugin.searchComic({ keyword: "example", extern: { sortBy: 5 } });
+  assert.deepEqual(result.data.items.map((item) => item.id), ["52", "53", "51", "54"]);
+  assert.equal(result.data.paging.total, 4);
+});
+
+test("JM search discovery keeps one available section when the other fails", async () => {
+  settings.set("auth.jwt", "private-fixture-token");
+  responseFor = (request) => request.url?.endsWith("/hot_tags")
+    ? { status: 200, data: { code: 200, data: [" first ", "first", "second"] } }
+    : { status: 200, data: [{ ...full }, { ...full }, { id: 1, name: "" }] };
+  const discovery = await plugin.getJmSearchDiscovery();
+  assert.deepEqual(discovery.data.topics, ["first", "second"]);
+  assert.equal(discovery.data.topicStatus, "ready");
+  assert.equal(discovery.data.recommendationStatus, "ready");
+  assert.deepEqual(discovery.data.items.map(({ id, title }) => [id, title]), [["51", full.name]]);
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.method === "get"));
+  assert.ok(requests.every((request) => !request.headers.get("Authorization")));
+  assert.equal(settingReads.includes("auth.jwt"), false);
+  assert.deepEqual(tokenWrites, []);
+
+  responseFor = (request) => request.url?.endsWith("/hot_tags")
+    ? { status: 503, data: {} }
+    : { status: 200, data: { code: 200, data: [] } };
+  assert.deepEqual((await plugin.getJmSearchDiscovery()).data, {
+    topics: [], items: [], topicStatus: "unavailable", recommendationStatus: "ready",
+  });
+});
+
+test("detail metadata opens the matching source search scope", async () => {
+  response = { ...full, author: ["fixture author"], works: ["fixture work"], actors: ["fixture actor"] };
   const { data: { normal } } = await plugin.getComicDetail({ comicId: "51" });
-  for (const [type, mode] of [["author", 2], ["tags", 3]] as const) {
+  response = { content: [], total: 0 };
+  for (const [type, mode, keyword, mainTag] of [
+    ["author", "author", "fixture author", 2],
+    ["tags", "tag", "fixture tag", 3],
+    ["works", "work", "fixture work", undefined],
+    ["actors", "character", "fixture actor", undefined],
+  ] as const) {
     const action = normal.comicInfo.metadata.find((item) => item.type === type)?.value[0]?.onTap;
     assert.equal(action?.type, "openSearch");
-    const payload = action?.payload as { extern?: Record<string, unknown> } | undefined;
-    assert.equal(payload?.extern?.main_tag, mode);
+    const payload = action?.payload as { keyword: string; extern?: Record<string, unknown> };
+    assert.equal(payload.keyword, keyword);
+    assert.equal(payload.extern?.main_tag, mainTag);
+    await plugin.searchComic(payload);
+    assert.deepEqual(requests[requests.length - 1]?.params, {
+      search_query: keyword, page: 1, o: "", search_type: mode,
+    });
   }
 });
 
@@ -185,6 +286,21 @@ test("album object-data envelope retains description, tags and explicit counts",
   assert.equal(normal.comicInfo.metadata.find((item) => item.type === "tags")?.value[0]?.name, "fixture tag");
   assert.equal(normal.totalViews, 123);
   assert.equal(normal.totalComments, 3);
+});
+
+test("publication date never substitutes for the update timestamp in detail or ID lookup", async () => {
+  const addtime = String(Date.parse("2020-03-09T17:00:00Z") / 1000);
+  const updateTime = "2025-11-22T18:00:00.000Z";
+  response = { ...full, id: 151, addtime };
+  let detail = (await plugin.getComicDetail({ comicId: "151" })).data.normal;
+  assert.equal(detail.comicInfo.titleMeta.some((item) => item.name === "发布：2020-03-10"), true);
+  assert.equal(detail.comicInfo.titleMeta.some((item) => item.name.startsWith("更新：")), false);
+  assert.equal((await plugin.searchComic({ keyword: "JM151" })).data.items[0]?.updatedAt, "");
+
+  response = { ...full, id: 151, addtime, update_at: Date.parse(updateTime) / 1000 };
+  detail = (await plugin.getComicDetail({ comicId: "151" })).data.normal;
+  assert.equal(detail.comicInfo.titleMeta.some((item) => item.name === "更新：2025-11-23"), true);
+  assert.equal((await plugin.searchComic({ keyword: "JM151" })).data.items[0]?.updatedAt, updateTime);
 });
 
 test("missing or invalid optional metrics stay unknown; explicit zero remains known", async () => {
@@ -251,228 +367,16 @@ test("album metadata in the wrapper fills only absent nested fields, with explic
   assert.equal((normal.extern.metricAvailability as any).totalViews, false);
 });
 
-const likePayload = { comicId: "51", currentLiked: false };
-
-test("album like sends one form POST and reads the same session and album for the exact total", async () => {
-  settings.set("auth.jwt", "fixture-member-session");
-  responseFor = (request) => request.method === "post"
-    ? { status: 200, data: { code: 200, data: { code: 200, jwttoken: "unrelated-token" } } }
-    : { status: 200, data: { code: 200, data: { ...full, liked: true, likes: "14" } } };
-
-  assert.deepEqual(await plugin.toggleLike(likePayload), { liked: true, verified: true, totalLikes: 14 });
+test("work likes remain visible with no write capability", async () => {
+  response = { ...full, liked: true, likes: "14" };
+  const { data: { normal } } = await plugin.getComicDetail({ comicId: "51" });
+  assert.equal(normal.allowLike, false);
+  assert.equal(normal.totalLikes, 14);
+  assert.equal(normal.isLiked, true);
+  assert.equal("toggleLike" in plugin, false);
   assert.deepEqual(requests.map((request) => [request.method, new URL(request.url!).pathname]), [
-    ["post", "/like"],
     ["get", "/album"],
   ]);
-  assert.equal(requests[0]?.data, "id=51");
-  assert.equal(requests[0]?.headers.getContentType(), "application/x-www-form-urlencoded");
-  assert.deepEqual(requests[1]?.params, { id: "51" });
-  assert.ok(requests.every((request) => request.headers.get("Authorization") === "Bearer fixture-member-session"));
-  assert.ok(requests.every((request) => request.maxRedirects === 0));
-  assert.ok(requests.every((request) => (request as InternalAxiosRequestConfig & {
-    fetchOptions?: { redirect?: string };
-  }).fetchOptions?.redirect === "manual"));
-  assert.deepEqual(tokenWrites, []);
-
-  const reopened = (await plugin.getComicDetail({ comicId: "51" })).data.normal;
-  assert.equal(reopened.isLiked, true);
-  assert.equal(reopened.totalLikes, 14);
-  assert.equal(reopened.extern.canUnlike, false);
-});
-
-test("album like confirms explicit liked while preserving a genuine zero or omitting an unknown total", async () => {
-  for (const [likes, expected] of [
-    ["0", { liked: true, verified: true, totalLikes: 0 }],
-    ["invalid", { liked: true, verified: true }],
-  ] as const) {
-    responseFor = (request) => request.method === "post"
-      ? { status: 200, data: {} }
-      : { status: 200, data: { ...full, liked: true, likes } };
-    assert.deepEqual(await plugin.toggleLike(likePayload), expected);
-  }
-});
-
-test("an unreadable or lost like receipt permits one same-session album read without replaying the write", async () => {
-  settings.set("auth.jwt", "fixture-member-session");
-  const postReplies = [
-    () => ({ status: 204, data: null }),
-    () => ({ status: 200, data: "unreadable fixture reply" }),
-    () => { throw new AxiosError("Network Error", "ERR_NETWORK"); },
-    () => { throw AxiosError.from(new TypeError("Failed to read HTTP response body bytes")); },
-  ];
-  for (const postReply of postReplies) {
-    requests.length = 0;
-    responseFor = (request) => request.method === "post"
-      ? postReply()
-      : { status: 200, data: { ...full, liked: true, likes: "14" } };
-    assert.deepEqual(await plugin.toggleLike(likePayload), { liked: true, verified: true, totalLikes: 14 });
-    assert.deepEqual(requests.map((request) => [request.method, new URL(request.url!).pathname]), [
-      ["post", "/like"],
-      ["get", "/album"],
-    ]);
-    assert.ok(requests.every((request) => request.headers.get("Authorization") === "Bearer fixture-member-session"));
-    assert.deepEqual(requests[1]?.params, { id: "51" });
-    assert.deepEqual(tokenWrites, []);
-  }
-});
-
-test("a lost like receipt with no matching liked read stays unconfirmed", async () => {
-  responseFor = (request) => {
-    if (request.method === "post") throw new AxiosError("Network Error", "ERR_NETWORK");
-    return { status: 200, data: { ...full, liked: false, likes: "14" } };
-  };
-  await assert.rejects(plugin.toggleLike(likePayload), /无法确认点赞状态/);
-  assert.deepEqual(requests.map((request) => request.method), ["post", "get"]);
-});
-
-test("a transport failure while reading the album reports unconfirmed status", async () => {
-  responseFor = (request) => {
-    if (request.method === "get") throw new AxiosError("Network Error", "ERR_NETWORK");
-    return { status: 200, data: { code: 200 } };
-  };
-  await assert.rejects(plugin.toggleLike(likePayload), /无法确认点赞状态/);
-  assert.deepEqual(requests.map((request) => request.method), ["post", "get"]);
-});
-
-test("like diagnostics record stages and safe field classifications only", async (t) => {
-  const lines: string[] = [];
-  for (const level of ["info", "warn"] as const) {
-    t.mock.method(console, level, (line: string) => { lines.push(line); });
-  }
-  settings.set("auth.jwt", "private-fixture-token");
-  const secret = "https://private.example/fixture-account";
-  const readbacks = [
-    {
-      read: () => ({ status: 200, data: { id: 51, liked: false, likes: 4321, message: secret } }),
-      expected: ["readback http=200 result=readable",
-        "verify result=unconfirmed work=match likedType=boolean liked=false total=present totalChange=unchanged"],
-    },
-    {
-      read: () => ({ status: 200, data: { id: 51, liked: "1", likes: secret } }),
-      expected: ["readback http=200 result=readable",
-        "verify result=unconfirmed work=match likedType=string liked=unknown total=invalid totalChange=unknown"],
-    },
-    {
-      read: () => ({ status: 200, data: { id: 700001, account: secret } }),
-      expected: ["readback http=200 result=readable",
-        "verify result=unconfirmed work=mismatch likedType=missing liked=unknown total=missing totalChange=unknown"],
-    },
-    {
-      read: () => ({ status: 503, data: { message: secret } }),
-      expected: ["readback http=503 result=http-rejected"],
-    },
-    {
-      read: () => ({ status: 200, data: { code: 500, message: secret } }),
-      expected: ["readback http=200 result=business-rejected"],
-    },
-    {
-      read: () => { throw new AxiosError(secret, "ERR_NETWORK"); },
-      expected: ["readback http=unknown result=transport"],
-    },
-    {
-      read: () => ({ status: 200, data: { id: 51, liked: "true", likes: 4322, message: secret } }),
-      expected: ["readback http=200 result=readable",
-        "verify result=confirmed work=match likedType=string liked=true total=present totalChange=changed"],
-      confirmed: true,
-    },
-  ];
-  for (const { read, expected, confirmed } of readbacks) {
-    lines.length = 0;
-    requests.length = 0;
-    responseFor = (request) => request.method === "post"
-      ? { status: 200, data: { code: 200, message: secret } }
-      : read();
-    const action = plugin.toggleLike({ ...likePayload, previousTotalLikes: 4321, includeLikeDiagnostic: true });
-    if (confirmed) {
-      assert.deepEqual(await action, { liked: true, verified: true, totalLikes: 4322, likeDiagnostic: {
-        submit: { http: 200, result: "readable" },
-        readback: { http: 200, result: "readable" },
-        verify: { result: "confirmed", work: "match", likedType: "string", liked: "true", total: "present", totalChange: "changed" },
-      } });
-    } else {
-      await assert.rejects(action, (error: Error) => {
-        assert.doesNotMatch(error.message, /private\.example|private-fixture-token|fixture-account|700001|4321/);
-        const failure = JSON.parse(error.message);
-        assert.equal(failure.type, "comic_like_unconfirmed");
-        assert.deepEqual(failure.diagnostic.submit, { http: 200, result: "readable" });
-        assert.equal(failure.diagnostic.readback.result, expected[0]?.split("result=")[1]);
-        return true;
-      });
-    }
-    assert.deepEqual(requests.map((request) => request.method), ["post", "get"]);
-    assert.deepEqual(lines.filter((line) => line.startsWith("[jm.like]")),
-      ["submit http=200 result=readable", ...expected].map((line) => `[jm.like] ${line}`));
-  }
-  lines.length = 0;
-  requests.length = 0;
-  responseFor = () => ({ status: 403, data: { code: 403, message: "fixture rejection" } });
-  await assert.rejects(plugin.toggleLike({ ...likePayload, includeLikeDiagnostic: true }), (error: Error) => {
-    assert.deepEqual(JSON.parse(error.message), {
-      type: "comic_like_rejected", message: "fixture rejection",
-      diagnostic: { submit: { http: 403, result: "http-rejected" } },
-    });
-    return true;
-  });
-  assert.deepEqual(requests.map((request) => request.method), ["post"]);
-  assert.deepEqual(lines, ["[jm.like] submit http=403 result=http-rejected"]);
-});
-
-test("album like cannot infer success from an unrelated, unliked or incomplete readback", async () => {
-  for (const album of [
-    { ...full, liked: false, likes: "10" },
-    { ...full, likes: "10" },
-    { ...full, liked: true, id: 52 },
-  ]) {
-    responseFor = (request) => request.method === "post"
-      ? { status: 200, data: { code: 200 } }
-      : { status: 200, data: album };
-    await assert.rejects(plugin.toggleLike(likePayload), /点赞状态/);
-  }
-});
-
-test("album like surfaces explicit business rejections without a second request", async () => {
-  for (const rejected of [
-    { code: 400, msg: "fixture rejection", data: '{"code":200}' },
-    { code: 200, data: { code: 200, status: "error", msg: "fixture rejection" } },
-  ]) {
-    requests.length = 0;
-    responseFor = () => ({ status: 200, data: rejected });
-    await assert.rejects(plugin.toggleLike(likePayload), /fixture rejection/);
-    assert.equal(requests.length, 1);
-  }
-});
-
-test("album like maps HTTP and application membership failures to the login flow", async () => {
-  for (const status of [200, 401, 403]) {
-    requests.length = 0;
-    responseFor = () => ({ status, data: { code: 200, data: { errorMsg: "請先登入會員" } } });
-    await assert.rejects(plugin.toggleLike(likePayload), (error: Error) => JSON.parse(error.message).type === "unauthorized");
-    assert.equal(requests.length, 1);
-  }
-});
-
-test("album like does not repeat a rejected POST and cannot unlike", async () => {
-  responseFor = () => ({ status: 307, data: null });
-  await assert.rejects(plugin.toggleLike(likePayload), /307/);
-  assert.equal(requests.length, 1);
-  await assert.rejects(plugin.toggleLike({ ...likePayload, currentLiked: true }), /取消点赞/);
-  assert.equal(requests.length, 1);
-});
-
-test("album like stops after logout while the POST is in flight", async () => {
-  settings.set("auth.jwt", "fixture-member-session");
-  let notifyPostStarted!: () => void;
-  const started = new Promise<void>((resolve) => { notifyPostStarted = resolve; });
-  let completePost!: (reply: FixtureReply) => void;
-  const pending = new Promise<FixtureReply>((resolve) => { completePost = resolve; });
-  responseFor = () => { notifyPostStarted(); return pending; };
-
-  const like = plugin.toggleLike(likePayload);
-  await started;
-  await plugin.clearPluginSession();
-  completePost({ status: 200, data: { code: 200 } });
-  await assert.rejects(like, /会话已变更/);
-  assert.equal(requests.length, 1);
 });
 
 test("JM list metrics distinguish real zero from absent and malformed counts", async () => {
