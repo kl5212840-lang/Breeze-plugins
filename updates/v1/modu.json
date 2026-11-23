@@ -1,7 +1,12 @@
 {
   "releaseSeries": 1,
-  "scriptSha256": "73c1d157ac5b6a40a534c47f148040e0c48f2d4fa71eb804c96ef9c930f7fc28",
-  "migrationFrom": [],
+  "scriptSha256": "d4a839f01b1c31a7847628d6d199a1e88c096a3ecac4b84c3527e68867549f9e",
+  "migrationFrom": [
+    {
+      "version": "0.1.2",
+      "scriptSha256": "8df26a93794ba428501b38a6527103cd2c7b260d0a1d4273a541f12a9b5480c2"
+    }
+  ],
   "requirements": {
     "version": 1,
     "capabilities": {
@@ -9,15 +14,15 @@
     }
   },
   "uuid": "b27083a4-a643-462a-8204-e6f42c19a5b9",
-  "tag_name": "v0.1.1",
-  "name": "魔都资源 v0.1.1",
-  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.14",
+  "tag_name": "v0.1.2",
+  "name": "魔都资源 v0.1.2",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.23",
   "assets": [
     {
-      "name": "Modu-native-v0.1.1.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.14/Modu-native-v0.1.1.cjs",
-      "size": 19785
+      "name": "Modu-native-v0.1.2.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.23/Modu-native-v0.1.2.cjs",
+      "size": 22253
     }
   ],
-  "sha256": "1ef1795e2a66cf64020017f9e1974e3b84efe1bd9251f444f5a1402fae03eb59"
+  "sha256": "2f566bda9e800cdc554896b596e360a64a03faaa13100ba2913b275203c6f252"
 }

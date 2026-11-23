@@ -1,6 +1,6 @@
 {
   "releaseSeries": 1,
-  "scriptSha256": "f99738439fab5bb73b35b5535402aa48fd871c516a03a8833c9d9407b8dddb6c",
+  "scriptSha256": "37bfdaf3eaed554843faa10b5f76266013bdf61afd75b93c7bf43c8ffb7d46e5",
   "migrationFrom": [
     {
       "version": "0.11.4",
@@ -13,18 +13,22 @@
     {
       "version": "0.11.6",
       "scriptSha256": "14eca59937fef5c0a65c88549406d84cc5061bdd9b882e21a4d9e2c01b719235"
+    },
+    {
+      "version": "0.2.1",
+      "scriptSha256": "ea021ea8a29e75dde76d31017f322ba88f15cda7df83e8b91a9ae4f36b160ed2"
     }
   ],
   "uuid": "1e600cff-8ebe-4517-8aa4-6678aec46424",
-  "tag_name": "v0.2.0",
-  "name": "Hanime1 v0.2.0",
-  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.14",
+  "tag_name": "v0.2.1",
+  "name": "Hanime1 v0.2.1",
+  "html_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/tag/plugins-2026.11.23",
   "assets": [
     {
-      "name": "Hanime1-native-v0.2.0.cjs",
-      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.14/Hanime1-native-v0.2.0.cjs",
-      "size": 167409
+      "name": "Hanime1-native-v0.2.1.cjs",
+      "browser_download_url": "https://github.com/kl5212840-lang/Breeze-plugins/releases/download/plugins-2026.11.23/Hanime1-native-v0.2.1.cjs",
+      "size": 167044
     }
   ],
-  "sha256": "359566cf77f010951db98364b2e4484baed4e28e459adf7776b3156df5878419"
+  "sha256": "167a6146e0d8666a719a7a32b9be71ed0af0bc6dcb73968067e906915af7abb8"
 }
