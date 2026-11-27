@@ -6,6 +6,7 @@ const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { brotliCompressSync, constants } = require('node:zlib');
 
 const root = path.resolve(__dirname, '..');
 const repository = 'kl5212840-lang/Breeze-plugins';
@@ -76,10 +77,10 @@ async function prepare(baseRef, tag, currentAssets, output, keys) {
     assert.deepEqual(index.requirements, manifest.requirements);
     assert.deepEqual(index.migrationFrom, manifest.migrationFrom);
 
-    const [previousAsset] = index.assets;
-    assert.equal(index.assets.length, 1, `${key}: expected one previous CJS`);
     const versionSuffix = `-v${manifest.version}.cjs`;
-    assert.ok(previousAsset.name.endsWith(versionSuffix));
+    const previousScripts = index.assets.filter(({ name }) => name.endsWith(versionSuffix));
+    assert.equal(previousScripts.length, 1, `${key}: expected one previous CJS`);
+    const [previousAsset] = previousScripts;
     assert.ok(previousAsset.name === path.basename(previousAsset.name));
     const previousBytes = fs.readFileSync(path.join(currentAssets, previousAsset.name));
     assert.equal(previousBytes.length, previousAsset.size);
@@ -103,17 +104,28 @@ async function prepare(baseRef, tag, currentAssets, output, keys) {
 
     const sha = sha256(bytes);
     const scriptSha256 = sha256(bytes.toString('utf8').trim());
+    const attachments = [{ name, bytes, sha }];
+    const compressed = brotliCompressSync(bytes, {
+      params: {
+        [constants.BROTLI_PARAM_MODE]: constants.BROTLI_MODE_TEXT,
+        [constants.BROTLI_PARAM_QUALITY]: 11,
+      },
+    });
+    if (compressed.length < bytes.length) {
+      attachments.push({ name: `${name}.br`, bytes: compressed, sha: sha256(compressed) });
+    }
     Object.assign(manifest, { version, scriptSha256 });
     const indexUpdate = {
       ...index, sha256: sha, scriptSha256, tag_name: `v${version}`,
       name: `${candidate.info.name} v${version}`,
       html_url: `https://github.com/${repository}/releases/tag/${tag}`,
-      assets: [{
-        name, browser_download_url: `https://github.com/${repository}/releases/download/${tag}/${name}`,
-        size: bytes.length,
-      }],
+      assets: attachments.map((asset) => ({
+        name: asset.name,
+        browser_download_url: `https://github.com/${repository}/releases/download/${tag}/${asset.name}`,
+        size: asset.bytes.length,
+      })),
     };
-    prepared.push({ key, name, version, bytes, sha, scriptSha256, file, indexUpdate });
+    prepared.push({ key, name, version, attachments, sha, scriptSha256, file, indexUpdate });
   }
 
   fs.mkdirSync(output);
@@ -124,13 +136,16 @@ async function prepare(baseRef, tag, currentAssets, output, keys) {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, json(value));
   };
-  for (const { name, bytes, file, indexUpdate } of prepared) {
-    fs.writeFileSync(path.join(attachments, name), bytes);
+  for (const { file, indexUpdate } of prepared) {
     writeMetadata(file, indexUpdate);
+  }
+  const files = prepared.flatMap((release) => release.attachments);
+  for (const { name, bytes } of files) {
+    fs.writeFileSync(path.join(attachments, name), bytes);
   }
   writeMetadata(catalogFile, catalog);
   fs.writeFileSync(path.join(attachments, 'SHA256SUMS.txt'),
-    prepared.map(({ sha, name }) => `${sha}  ${name}\n`).join(''));
+    files.map(({ sha, name }) => `${sha}  ${name}\n`).join(''));
   console.log(json({ base, tag, plugins: prepared.map(({ key, name, version, sha, scriptSha256 }) => ({
     key, version, name, sha256: sha, scriptSha256,
   })) }).trimEnd());

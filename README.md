@@ -16,4 +16,4 @@
 
 ## 维护发布
 
-公开版本按各插件在 `catalog/v1` 和 `updates/v1` 的已发布版本递增。构建后用 `script/prepare-next-release.cjs` 核对上一次线上附件、版本和 UUID，再生成新附件及索引。附件上传并回读校验后更新商城。
+公开版本按各插件在 `catalog/v1` 和 `updates/v1` 的已发布版本递增。构建后用 `script/prepare-next-release.cjs` 核对上一次公开 CJS、版本和 UUID，再生成新附件及索引。脚本会在压缩后体积更小时附加 `.cjs.br` 供商店优先下载。附件上传并回读校验后更新商店。
