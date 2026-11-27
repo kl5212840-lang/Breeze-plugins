@@ -1,0 +1,8 @@
+{
+  "copy": {
+    "inputVersion": "0.2.2",
+    "sha256": "59e701eee2bfca2616e466239e52b0144bcca1dd4db4088b1a6bf3f3ceeb3708",
+    "source": "Breeze b2524 acceptance package"
+  },
+  "base": "d37b81abc477544d57b4d023304dcbb132304715"
+}

@@ -89,7 +89,9 @@ test('video settings use the existing persistent plugin config bridge', async ()
     assert.equal(settings.data.values['video.defaultMode'], 'native');
     assert.equal(settings.data.values['video.parseTimeoutSeconds'], '45');
     assert.equal(settings.data.values['video.refreshExpiredSources'], false);
-    assert.equal(settings.scheme.sections[0].fields.length, 4);
+    assert.deepEqual(settings.scheme.sections[0].fields.map(field => field.key), [
+      'video.preferredSource', 'video.refreshExpiredSources', 'video.hideAdvertisements',
+    ]);
     assert.equal(settings.data.values['video.hideAdvertisements'], true);
   } finally { delete globalThis.bridge; }
   const defaults = await getSettingsBundle();
